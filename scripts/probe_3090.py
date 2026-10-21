@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
 
 PROBE_FORMAT_VERSION = 1
+GPU_TELEMETRY_INTERVAL_SECONDS = 0.25
 FORBIDDEN_TRAIN_COMPONENTS = {"test", "tests", "valid", "validation", "val"}
 THREAD_ENV_KEYS = (
     "OMP_NUM_THREADS",
@@ -74,8 +75,13 @@ for _key in THREAD_ENV_KEYS:
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
 import torch  # noqa: E402
+
+from gpu_telemetry import GpuTelemetrySampler, unavailable_summary  # noqa: E402
 
 from diffpeak.data.splits import load_split_entries, sample_id_from_image_path  # noqa: E402
 from diffpeak.engine import STAGE_ORDER, DiffPeakEngine  # noqa: E402
@@ -691,7 +697,12 @@ def environment_info(args: argparse.Namespace) -> Dict[str, Any]:
         "source_sha256": {
             str(path.relative_to(ROOT)): sha256_file(path)
             for path in sorted((ROOT / "diffpeak").rglob("*.py"))
-        } | {"scripts/probe_3090.py": sha256_file(Path(__file__).resolve())},
+        } | {
+            "scripts/probe_3090.py": sha256_file(Path(__file__).resolve()),
+            "scripts/gpu_telemetry.py": sha256_file(
+                Path(__file__).resolve().with_name("gpu_telemetry.py")
+            ),
+        },
         "argv": list(sys.argv),
         "threading": {
             "torch_num_threads": int(torch.get_num_threads()),
@@ -886,12 +897,38 @@ def _phase_summary(
     return summary
 
 
+def _selected_cuda_uuid(device: Any) -> Optional[str]:
+    """Best-effort authoritative UUID of the selected CUDA device.
+
+    Used only by GPU telemetry: torch knows which physical GPU backs the
+    logical device even when CUDA's enumeration order differs from nvidia-smi.
+    """
+    try:
+        index = getattr(device, "index", None)
+        if index is None:
+            index = torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(int(index))
+        raw = getattr(properties, "uuid", None)
+    except Exception:  # pragma: no cover - CPU/driver edge cases
+        return None
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if text.startswith("GPU-") or text.startswith("MIG-"):
+        return text
+    return "GPU-" + text
+
+
 def run_phase(
     engine: Any,
     stage: str,
     updates: int,
     phase: str,
     raw: RawLog,
+    *,
+    output_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Run one bounded phase through the exact real engine epoch method.
 
@@ -902,6 +939,12 @@ def run_phase(
     groups and is translated into batches by :func:`_phase_batches`. The
     loader is rebuilt per phase, so worker startup is included in that phase's
     dataloader timing.
+
+    On a real CUDA device, best-effort ``nvidia-smi`` sampling runs only around
+    this phase's training loop, in its own thread and raw JSONL file. It is
+    stopped in a ``finally`` so initialization and validation can never leak
+    into the measurement samples, and any telemetry failure is recorded rather
+    than raised.
     """
     accumulation_steps = max(1, int(getattr(engine, "accumulation_steps", 1)))
     batch_size = max(1, int(getattr(engine, "train_cfg", {}).get("batch_size", 1)))
@@ -912,6 +955,33 @@ def run_phase(
     )
     device = getattr(engine, "device", torch.device("cpu"))
     is_cuda = getattr(device, "type", str(device)) == "cuda"
+    output_root = (
+        Path(output_dir).resolve()
+        if output_dir is not None
+        else Path(raw.path).resolve().parent
+    )
+
+    telemetry: Optional[GpuTelemetrySampler] = None
+    telemetry_summary = unavailable_summary(
+        "not_cuda" if not is_cuda else "empty_phase",
+        interval_seconds=GPU_TELEMETRY_INTERVAL_SECONDS,
+    )
+    if is_cuda and budget > 0:
+        try:
+            telemetry = GpuTelemetrySampler(
+                output_root / f"gpu_telemetry_{phase}.jsonl",
+                device=device,
+                device_uuid=_selected_cuda_uuid(device),
+                interval=GPU_TELEMETRY_INTERVAL_SECONDS,
+            )
+            telemetry.start()
+            telemetry_summary = telemetry.summary()
+        except Exception as exc:
+            telemetry = None
+            telemetry_summary = unavailable_summary(
+                f"telemetry_setup_failed: {type(exc).__name__}: {exc}",
+                interval_seconds=GPU_TELEMETRY_INTERVAL_SECONDS,
+            )
 
     if is_cuda:
         torch.cuda.synchronize(device)
@@ -919,13 +989,24 @@ def run_phase(
     amp_before = scaler_state(engine)
     raw.event(phase + "_start", updates=updates, batch_budget=budget)
     started = time.perf_counter()
-    if stage == "D":
-        stats = engine._train_epoch_grpo(stage, 0, loader)
-    else:
-        stats = engine._train_epoch_supervised(stage, 0, loader)
-    if is_cuda:
-        torch.cuda.synchronize(device)
-    elapsed = time.perf_counter() - started
+    try:
+        if stage == "D":
+            stats = engine._train_epoch_grpo(stage, 0, loader)
+        else:
+            stats = engine._train_epoch_supervised(stage, 0, loader)
+        if is_cuda:
+            torch.cuda.synchronize(device)
+        elapsed = time.perf_counter() - started
+    finally:
+        # The sampling thread must be closed with the phase, even on OOM.
+        if telemetry is not None:
+            try:
+                telemetry_summary = telemetry.stop()
+            except Exception as exc:  # pragma: no cover - defensive
+                telemetry_summary = unavailable_summary(
+                    f"telemetry_stop_failed: {type(exc).__name__}: {exc}",
+                    interval_seconds=GPU_TELEMETRY_INTERVAL_SECONDS,
+                )
     amp_after = scaler_state(engine)
 
     peak_memory = None
@@ -939,6 +1020,7 @@ def run_phase(
         peak_memory, {"before": amp_before, "after": amp_after},
         applicable_metrics=_applicable_metric_keys(stage, engine, stats),
     )
+    summary["gpu_telemetry"] = telemetry_summary
     raw.event(phase + "_end", **summary)
     return summary
 
@@ -1132,10 +1214,16 @@ def run_session(args: argparse.Namespace) -> int:
         engine._prepare_stage(stage, 1, total_steps)
 
         phase = "warmup"
-        warmup = run_phase(engine, stage, int(args.warmup_updates), "warmup", raw)
+        warmup = run_phase(
+            engine, stage, int(args.warmup_updates), "warmup", raw,
+            output_dir=output_dir,
+        )
 
         phase = "measure"
-        measurement = run_phase(engine, stage, int(args.measure_updates), "measurement", raw)
+        measurement = run_phase(
+            engine, stage, int(args.measure_updates), "measurement", raw,
+            output_dir=output_dir,
+        )
 
         phase = "parameters"
         parameter_check = parameters_finite(engine)
@@ -1188,6 +1276,12 @@ def run_session(args: argparse.Namespace) -> int:
                 "splits": "splits.json",
                 "raw_log": "raw.jsonl",
                 "validation": "validation.json" if args.validate else None,
+                "gpu_telemetry": {
+                    "warmup": warmup.get("gpu_telemetry", {}).get("raw_jsonl"),
+                    "measurement": measurement.get("gpu_telemetry", {}).get(
+                        "raw_jsonl"
+                    ),
+                },
             },
             "probe": {
                 "warmup_updates": int(args.warmup_updates),

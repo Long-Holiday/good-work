@@ -6,6 +6,22 @@
 
 可执行参数集中于 `configs/3090.yaml`，比较规则见 [实验协议](experimental_protocol.md)。短程筛选不替代完整验证、多种子比较或收敛实验；未实测项保持未确认，不用猜测补齐。
 
+## Vast.ai 四阶段吞吐补测（2026-10-21）
+
+实例57042404：RTX3090 24GB/350W，80GB盘，约$0.243/小时；PyTorch2.8/cu128镜像，使用pytorch conda环境。只传256对train和32对val，SAM2权重现场下载并校验。原扫描88次、有效batch16扫描24次、batch32容量检查6次、D扫描8次，共126次候选运行；其中B batch32两次OOM，其余124次通过有效性检查。证据已回收，实例销毁命令返回0，销毁后实例列表为空。
+
+本地证据：`runs/vastai_57042404/evidence/probe-results/`；原始传回压缩包、远端日志和销毁凭证在其上级目录。以下均workers4、关闭检查点、两次吞吐中位数，单位张/秒（D为影像轨迹组/秒）。
+
+| 阶段 | batch2 | batch4 | batch8 | batch16 | batch32 |
+|---|---:|---:|---:|---:|---:|
+| A | 13.09 | 13.03 | 9.72 | 6.94 | 5.36 |
+| B | 12.19 | 12.78 | 9.95 | 6.92 | OOM×2 |
+| C | 1.805 | 1.912 | 1.975 | 1.919 | 1.724 |
+
+batch2/4/8/16固定有效batch16，32单独有效batch32；不可当作相同优化配置比较。B batch16 allocated22.16GiB，32无法装下；A batch32 allocated15.94GiB、C batch32约20.54GiB，能装下但没有吞吐优势。D固定G4/20步、预热8组测量16组：batch1/2/4/8分别0.1562/0.1807/0.2015/0.2133组/秒，batch8 allocated9.31GiB，相比batch1吞吐提高约36.6%。
+
+原有效batch4扫描：A最佳约13.64张/秒（batch2、workers4，开/关检查点近似）；B最佳12.62（batch2、workers4、关检查点）。C和D的大批次收益比A/B明确；初步复测候选为A batch2、B batch2或4、C batch8、D batch8，均workers4/关检查点。不要直接覆盖正式配置：批次会改变随机流和优化行为，C/D父权重只是短程bootstrap，不代表收敛提示分布；D尚未覆盖100组点成本预热；每候选短测只有64张展示或16轨迹组，DataLoader启动/预取和小数据集热缓存会影响结果。需要在正式父权重、长测量和完整验证下确认。
+
 ## 环境与证据位置
 
 - 连接：`ssh seetacloud2`；授权工作目录 `/root/autodl-tmp/diffpeak-probe-20261021`。
@@ -96,6 +112,63 @@ A 初始探针：16 次更新，52 张测量约 4.68 张/秒，allocated 1,715.5
 | 3e-4 | 0.4500 |
 
 选择 `3e-5` 仅用于 SAM1 后续候选的共同开发父权重。B `3e-5` 的自动验证 IoU 为 0.1583、平均提示点 3,593.72/图，暴露密集峰 CPU 后处理瓶颈。用户要求切换 SAM2 后中止余下 SAM1 筛选；**没有得到 SAM1 C/D 最优参数，更不能继承为 SAM2 最优参数**。
+
+## 可迁移的 A/B/C/D 吞吐探针（租机前准备）
+
+使用 `pytorch` conda 环境。子进程沿用 `sys.executable`，不会切回默认 Python；实际 torch/CUDA 版本由单候选环境记录保存。本地当前环境版本可能高于项目目标 2.8/cu128，不将本地数值当作目标 3090 结果。
+
+只迁移探针子集，无需上传完整3.9GB数据。以下命令固定种子2026，从现有 train/val 划分分别复制256/32对图像掩码到新目录，保存逐文件SHA256和源清单哈希，不读取test：
+
+```bash
+conda run -n pytorch python scripts/prepare_probe_data.py \
+  --output-dir runs/vastai_probe_data_20261021
+```
+
+本地已生成 `runs/vastai_probe_data_20261021/`，图像掩码合计140,632,424字节（约134MiB），共576个数据文件；上传该目录即可。远端运行或本地预演时指定子集路径：
+
+```bash
+conda run -n pytorch python scripts/probe_throughput.py \
+  --data-root runs/vastai_probe_data_20261021/data \
+  --train-split runs/vastai_probe_data_20261021/splits/train.json \
+  --val-split runs/vastai_probe_data_20261021/splits/val.json \
+  --output-dir runs/vastai_3090_subset_throughput --bootstrap --dry-run
+```
+
+子集用于容量/吞吐筛选，不代表完整数据集收敛或质量结论；大batch长程探针可能重复展示这256张训练图，数据缓存也会比完整数据更热。
+
+若使用原始数据路径，先做无训练、无输出目录写入的预演：
+
+```bash
+conda run -n pytorch python scripts/probe_throughput.py \
+  --output-dir runs/vastai_3090_throughput --bootstrap --dry-run
+```
+
+`--config --data-root --sam-checkpoint --train-split --val-split --output-dir` 均可指定；命令自动使用绝对路径，默认输入来自当前项目配置。预演检查完整 manifest 的图像/掩码存在、路径边界和 train/val 不重叠；缺少 SAM2 或显式父权重会列出警告，增加 `--check-inputs` 则将其视为错误。真实执行必须具备全部输入。输出目录已存在时拒绝执行。
+
+`--bootstrap` 用各阶段第一个健康基线候选保存的权重作为下一阶段所有候选的共同父权重，用于新机器的容量探测；父候选失败或有跳步时，不继续用它的权重。**这不是完整训练或效果筛选**，C/D 的提示密度和耗时仍需在正式已训练父权重上复测。有现成权重时优先显式提供 `--init-b A.pt --init-c B.pt --init-d C.pt`，各阶段可通过 `--stages A B C D` 单独执行。
+
+```bash
+# 输入完整后去掉 --dry-run 即执行；默认最长运行 3 小时。
+conda run --no-capture-output -n pytorch python scripts/probe_throughput.py \
+  --sam-checkpoint checkpoints/sam2.1_hiera_base_plus.pt \
+  --output-dir runs/vastai_3090_throughput --bootstrap \
+  --workers 4 8 --batches 1 2 4 --effective-batch 4 \
+  --checkpointing off on --repeats 2 --max-seconds 10800
+```
+
+- A/B/C 分别扫描 micro-batch 1/2/4、累积 4/2/1，固定有效 batch=4；workers 4/8、检查点关/开，每候选重复两次。batch/worker 改动会改变随机流，相同有效 batch 仍需独立确认质量。
+- D 保持 YAML 中 G=4、20步、奖励与更新次数不变，不引入梯度累积。默认比较 batch=1/2，可用 `--d-batches 1` 缩短初筛；预热/测量组数必须整除 batch，避免组预算取整。默认预热2组、测量4组只支持短程容量判断；完整点成本预热用 `--d-warmup-groups 100 --d-measure-groups 28`，并先评估总时限是否足够。
+- 扩大有效 batch 是单独实验，例如 `--effective-batch 8 --batches 1 2 4 8`，不要与固定有效 batch=4 的结果混排。若总时限内未完成所有候选，`completion.json` 标记不完整，退出码非零。
+- `--candidate-timeout` 默认1800秒；超时终止当前子进程并保留日志，然后在剩余总时限内继续。套件通过可见设备集合的协作锁避免同套件重叠运行；运行前仍需确认设备上无其他训练任务。
+- 每阶段按全部重复均健康的候选吞吐中位数排序，保留最小/最大值；无实际优化更新、AMP跳步、非有限指标/参数、train/val子集哈希不一致均不参与推荐。吞吐排名不按利用率百分比排序，也不使用验证 IoU 选父权重。
+- 单候选预热与测量分别记录 `gpu_telemetry_warmup.jsonl` / `gpu_telemetry_measurement.jsonl`，每0.25秒采样选定GPU的利用率、显存占用、功耗和温度；汇总位于各阶段的 `gpu_telemetry.metrics`。不混入初始化或验证。无法可靠映射GPU时明确标记不可用，不猜测多卡序号；采样异常不打断训练。驱动显存占用与torch allocated/reserved峰值含义不同。
+- 输出 `plan.json`、逐候选日志和原始 probe 目录、`suite.jsonl`、`summary.json`、`completion.json`，及独立的 `recommended_A.yaml` 至 `recommended_D.yaml`。推荐配置只覆盖吞吐设置，原始 `configs/3090.yaml` 不变；未测量或失败阶段不导出配置。
+
+本地测试：
+
+```bash
+conda run -n pytorch python -m unittest discover -s tests -p 'test_probe*.py'
+```
 
 ## 探针入口与验收
 
