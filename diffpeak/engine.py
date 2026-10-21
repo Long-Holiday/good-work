@@ -18,6 +18,14 @@
   再逐轨迹、逐步重算并立即 ``backward``，每轮整组重放后更新一次优化器
   （每组执行 ``update_epochs`` 轮，默认 1）。
   因此 ``train.accumulation_steps`` 只作用于 A/B/C；D 的组语义不同。
+* 吞吐参数可按阶段覆盖：``stages.<stage>.batch_size``、
+  ``stages.<stage>.accumulation_steps``、``stages.<stage>.num_workers``。
+  每次 ``run_stage`` 开始时在构建 DataLoader 和优化器/调度器之前解析，
+  未配置的键回退到 ``train``/``data`` 的全局值；阶段之间不会继承覆盖。
+  注意 D 的点成本预热按**已处理的 DataLoader 批次**推进：每个批次计 1 组，
+  即使该批次包含多张影像。因此提高 ``stages.D.batch_size`` 不会减少达到
+  ``point_cost_warmup_steps`` 所需的批次数/更新次数，但每个计数单位会覆盖
+  更多影像；需要按影像口径比较预热进度时应自行换算。
 * GRPO 优势为同图奖励的组内标准化值
   ``(R_i - mean) / max(std, advantage_std_delta)``；组内奖励完全相同时
   优势为零，策略项自动跳过（KL 与扩散锚定仍保留）。
@@ -216,7 +224,11 @@ class DiffPeakEngine:
         if requested_amp and self.device.type != "cuda":
             warnings.warn("非 CUDA 设备上已关闭 AMP。", RuntimeWarning)
 
+        # 吞吐参数的全局默认值；run_stage 会按 stages.<stage> 覆盖后写入
+        # 同名运行时属性。未配置覆盖时行为与旧版本完全一致。
+        self.batch_size = max(1, int(self.train_cfg.get("batch_size", 1)))
         self.accumulation_steps = max(1, int(self.train_cfg.get("accumulation_steps", 1)))
+        self.num_workers = max(0, int(self.data_cfg.get("num_workers", 0)))
         self.heat_weight = float(self.train_cfg.get("heat_weight", 0.1))
         self.aux_weight = float(self.train_cfg.get("aux_weight", 0.2))
         self.cldice_weight = float(self.train_cfg.get("cldice_weight", 0.2))
@@ -349,6 +361,35 @@ class DiffPeakEngine:
         self._val_split_cached = True
         return path
 
+    def _apply_stage_config(self, stage: str) -> None:
+        """解析当前阶段的吞吐覆盖，写回运行时属性。
+
+        必须在构建 DataLoader 与优化器/调度器**之前**调用。每个阶段开始时
+        都从该阶段的配置重新计算：显式键覆盖全局值，缺失键回退到
+        ``train``/``data``，因此上一阶段的覆盖不会泄漏到下一阶段。
+        """
+        stage_cfg = self.stage_cfgs.get(stage, {})
+
+        def effective(key: str, default: Any) -> Any:
+            value = stage_cfg.get(key)
+            return default if value is None else value
+
+        self.batch_size = max(
+            1, int(effective("batch_size", self.train_cfg.get("batch_size", 1)))
+        )
+        self.accumulation_steps = max(
+            1,
+            int(
+                effective(
+                    "accumulation_steps",
+                    self.train_cfg.get("accumulation_steps", 1),
+                )
+            ),
+        )
+        self.num_workers = max(
+            0, int(effective("num_workers", self.data_cfg.get("num_workers", 0)))
+        )
+
     def _build_train_loader(self, epoch: int) -> DataLoader:
         dataset = DeepGlobeDataset(
             **self._dataset_kwargs(self._resolve_train_split(), augment=bool(
@@ -362,12 +403,11 @@ class DiffPeakEngine:
         generator.manual_seed(
             (self.seed + int(epoch) * 1_000_003) % (1 << 63)
         )
-        num_workers = max(0, int(self.data_cfg.get("num_workers", 0)))
         return DataLoader(
             dataset,
-            batch_size=max(1, int(self.train_cfg.get("batch_size", 1))),
+            batch_size=self.batch_size,
             shuffle=True,
-            num_workers=num_workers,
+            num_workers=self.num_workers,
             collate_fn=_collate_samples,
             pin_memory=self.device.type == "cuda",
             drop_last=False,
@@ -1598,6 +1638,9 @@ class DiffPeakEngine:
             raise ValueError(f"未知阶段：{stage}")
         if stage not in self.stage_cfgs:
             raise ValueError(f"配置缺少 stages.{stage}")
+        # 必须在 probe_loader（用于计算调度步数）和 _prepare_stage（构建
+        # 优化器/调度器）之前解析阶段吞吐覆盖。
+        self._apply_stage_config(stage)
         epochs = int(self.stage_cfgs[stage].get("epochs", 0))
         start_epoch = int(start_epoch)
         if epochs <= 0 or start_epoch >= epochs:

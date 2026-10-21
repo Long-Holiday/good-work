@@ -162,6 +162,134 @@ class EnginePipelineTest(unittest.TestCase):
             for name, parameter in continuous.ref_unet.state_dict().items():
                 torch.testing.assert_close(resumed.ref_unet.state_dict()[name], parameter, rtol=0, atol=0)
 
+    def test_stage_throughput_overrides_apply_before_loader_and_scheduler(self):
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "diffpeak.engine.build_models", side_effect=_build_tiny_models
+        ):
+            root = Path(temporary)
+            config = self._make_config(root, samples=5, batch_size=2)
+            config["stages"]["A"].update(
+                batch_size=1, accumulation_steps=2, num_workers=1
+            )
+            config["stages"]["C"].update(
+                batch_size=3, accumulation_steps=3, num_workers=0
+            )
+            engine = self._engine(config)
+            observed = []
+            original_builder = engine._build_train_loader
+
+            def recording_builder(epoch):
+                loader = original_builder(epoch)
+                # 在 loader 真正构建完成后读取运行时属性与 DataLoader 实际值，
+                # 以确认覆盖发生在 loader/scheduler 之前。
+                observed.append(
+                    (
+                        engine.batch_size,
+                        engine.accumulation_steps,
+                        engine.num_workers,
+                        loader.batch_size,
+                        loader.num_workers,
+                    )
+                )
+                return loader
+
+            with patch.object(
+                engine, "_build_train_loader", side_effect=recording_builder
+            ):
+                engine.run_stage("A")
+                a_observed = list(observed)
+                a_steps = engine.scheduler_steps_per_epoch
+                observed.clear()
+
+                engine.run_stage("B")
+                b_observed = list(observed)
+                observed.clear()
+                b_batch_size = engine.batch_size
+                b_accumulation_steps = engine.accumulation_steps
+                b_num_workers = engine.num_workers
+
+                engine.run_stage("C")
+                c_observed = list(observed)
+                c_steps = engine.scheduler_steps_per_epoch
+
+            # A：batch 1、累积 2；5 个样本 -> 5 个微批 -> 3 次优化器步。
+            self.assertTrue(a_observed)
+            for snapshot in a_observed:
+                self.assertEqual(snapshot, (1, 2, 1, 1, 1))
+            self.assertEqual(a_steps, 3)
+
+            # B 没有任何覆盖：完全回退到全局 batch=2 / accum=1 / workers=0，
+            # 证明 A 的覆盖没有泄漏到下一阶段。
+            self.assertTrue(b_observed)
+            for snapshot in b_observed:
+                self.assertEqual(snapshot, (2, 1, 0, 2, 0))
+            self.assertEqual(b_batch_size, 2)
+            self.assertEqual(b_accumulation_steps, 1)
+            self.assertEqual(b_num_workers, 0)
+
+            # C 使用自己的覆盖：batch 3、累积 3；5 个样本 -> 2 个微批 -> 1 步。
+            self.assertTrue(c_observed)
+            for snapshot in c_observed:
+                self.assertEqual(snapshot, (3, 3, 0, 3, 0))
+            self.assertEqual(c_steps, 1)
+
+            # 覆盖只改变运行时属性，不回写用户配置。
+            self.assertEqual(config["train"]["batch_size"], 2)
+            self.assertEqual(config["train"]["accumulation_steps"], 1)
+            self.assertEqual(config["data"]["num_workers"], 0)
+
+    def test_stage_overrides_resume_keeps_checkpoint_schedule(self):
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "diffpeak.engine.build_models", side_effect=_build_tiny_models
+        ):
+            root = Path(temporary)
+            config = self._make_config(root, samples=4, batch_size=1)
+            config["stages"]["A"].update(
+                epochs=1, batch_size=1, accumulation_steps=2, num_workers=0
+            )
+            first = self._engine(config)
+            first.run_stage("A")
+            # 4 个样本、batch=1、累积=2 -> 每个 epoch 2 步。
+            self.assertEqual(first.scheduler_steps_per_epoch, 2)
+            self.assertEqual(first.scheduler_total_steps, 2)
+            checkpoint = read_checkpoint(first.output_dir / "last.pt")
+            self.assertEqual(checkpoint["schedule"]["steps_per_epoch"], 2)
+            self.assertEqual(checkpoint["schedule"]["total_steps"], 2)
+            checkpoint_global_step = int(checkpoint["global_step"])
+
+            # 恢复时改变吞吐覆盖：新 loader 应使用 batch=2/累积=1（按新配置
+            # 会得到 2 步/epoch、总 4 步），但调度必须沿用 checkpoint 的曲线。
+            resume_config = copy.deepcopy(config)
+            resume_config["output_dir"] = str(root / "resume")
+            resume_config["stages"]["A"].update(
+                epochs=2, batch_size=2, accumulation_steps=1
+            )
+            resumed = self._engine(resume_config)
+            observed = []
+            original_builder = resumed._build_train_loader
+
+            def recording_builder(epoch):
+                loader = original_builder(epoch)
+                observed.append((epoch, loader.batch_size, loader.num_workers))
+                return loader
+
+            with patch.object(
+                resumed, "_build_train_loader", side_effect=recording_builder
+            ):
+                resumed.run_stage(
+                    "A", start_epoch=1,
+                    resume_payload=copy.deepcopy(checkpoint),
+                )
+
+            # probe loader 与恢复 epoch 的 loader 都采用阶段覆盖。
+            self.assertEqual(observed, [(1, 2, 0), (1, 2, 0)])
+            self.assertEqual(resumed.scheduler_steps_per_epoch, 2)
+            self.assertEqual(resumed.scheduler_total_steps, 2)
+            # checkpoint 的 2 步 + 新 loader 的 2 个优化器步。
+            self.assertEqual(
+                resumed.global_step, checkpoint_global_step + 2
+            )
+
     def test_logging_scopes_epoch_tags_and_resume_session_isolation(self):
         with tempfile.TemporaryDirectory() as temporary, patch(
             "diffpeak.engine.build_models", side_effect=_build_tiny_models
