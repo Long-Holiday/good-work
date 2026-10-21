@@ -6,17 +6,63 @@
 
 ## 1. 环境与权重（自行安装）
 
-推荐 Linux / WSL2、Python **3.10**、单张 NVIDIA RTX 3090 24GB。PyTorch CUDA wheel 包含运行时；主机需安装支持 CUDA 12.1 的 NVIDIA 驱动，常规使用不需要另装 CUDA toolkit。WSL2 应使用 Windows 侧驱动。
+目标训练环境：**Ubuntu 22.04 / Python 3.12 / PyTorch 2.8.0 / CUDA 12.8 / 单张 NVIDIA RTX 3090 24GB**，对应 `torchvision==0.23.0`。这是目标安装配置，尚未在该服务器上实测；上述 CPU/GPU 测试使用的是另一个环境，见 `requirements-pytorch-tested.txt`。
+
+PyTorch CUDA wheel 包含运行时，常规使用不需要另装 CUDA toolkit。服务器镜像已提供 Python 3.12 和 PyTorch 2.8.0+cu128 时，使用该环境即可，不必再创建环境。若需要隔离环境，可用已有的 conda 创建（Ubuntu 22.04 的系统 Python 默认不是 3.12）：
 
 ```bash
-python3.10 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
-python -m pip install -r requirements.txt
+# 仅在需要新环境时执行
+conda create -n diffpeak python=3.12 -y
+conda activate diffpeak
 ```
 
-固定依赖见 `requirements.txt`。其中 `tensorboard>=2.18,<3` 用于实验日志与 TensorBoard 可视化。不需要 diffusers、transformers、xformers、OpenCV 或自定义 CUDA 编译扩展。原版 SAM API 使用 `segment-anything==1.0`。
+在项目根目录执行安装；PyTorch 使用官方 cu128 索引，其余依赖使用默认 PyPI 索引：
+
+```bash
+nvidia-smi
+python --version
+python -m pip install --upgrade pip
+python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements.txt
+python -m pip check
+```
+
+如可选驱动，建议使用 **570.26 或更新版本**（CUDA 12.8 GA 对应 Linux 驱动）。CUDA 12.x 的 minor compatibility 最低 Linux 驱动为 525.60.13，但旧驱动存在新特性和 PTX 限制，不能仅凭版本下限保证所有算子可运行；已有服务器驱动先用下面的检查确认。`nvidia-smi` 中的 CUDA Version 表示驱动支持的 CUDA 版本，PyTorch 实际使用的运行时看 `torch.version.cuda`。WSL2 应使用 Windows 侧驱动。
+
+安装后检查版本、GPU 运算与 torchvision CUDA 算子：
+
+```bash
+python - <<'PY'
+import sys
+import torch
+import torchvision
+from torchvision.ops import nms
+
+print("Python:", sys.version)
+print("PyTorch:", torch.__version__)
+print("torchvision:", torchvision.__version__)
+print("PyTorch CUDA runtime:", torch.version.cuda)
+assert sys.version_info[:2] == (3, 12)
+assert torch.__version__.split("+")[0] == "2.8.0"
+assert torchvision.__version__.split("+")[0] == "0.23.0"
+assert torch.version.cuda == "12.8"
+assert torch.cuda.is_available(), "CUDA 不可用，请检查 GPU 分配与 NVIDIA 驱动"
+print("GPU:", torch.cuda.get_device_name(0))
+x = torch.randn(256, 256, device="cuda", requires_grad=True)
+(x @ x).sum().backward()
+assert x.grad is not None and torch.isfinite(x.grad).all().item()
+boxes = torch.tensor([[0., 0., 10., 10.], [1., 1., 9., 9.]], device="cuda")
+scores = torch.tensor([0.9, 0.8], device="cuda")
+assert nms(boxes, scores, 0.5).tolist() == [0]
+torch.cuda.synchronize()
+print("CUDA / torchvision 检查通过")
+PY
+
+# 不需要 SAM 权重：验证 GRPO、AMP 与梯度更新的小规模 GPU smoke
+python scripts/gpu_smoke.py
+```
+
+固定依赖见 `requirements.txt`，NumPy 1.26.4 等版本支持 Python 3.12。其中 `tensorboard>=2.18,<3` 用于实验日志与 TensorBoard 可视化。不需要 diffusers、transformers、xformers、OpenCV 或自定义 CUDA 编译扩展。原版 SAM API 使用 `segment-anything==1.0`。
 
 手动从 [SAM 官方仓库](https://github.com/facebookresearch/segment-anything) 获取 ViT-B 权重 `sam_vit_b_01ec64.pth`，放到 `checkpoints/`，或修改 YAML 的 `model.sam_checkpoint`。官方权重地址：
 

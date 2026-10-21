@@ -268,8 +268,8 @@ points = dataset.get_target_points(0)
 `requirements.txt` 给出的版本起点（本任务未执行安装或测试）：
 
 ```text
-Python 3.10
-torch==2.5.1 / torchvision==0.20.1（CUDA 12.1）
+Ubuntu 22.04 / Python 3.12
+torch==2.8.0 / torchvision==0.23.0（CUDA 12.8）
 numpy==1.26.4
 scipy==1.13.1
 scikit-image==0.24.0

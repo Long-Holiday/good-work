@@ -1,7 +1,7 @@
 # 实测环境记录（非推荐安装清单）。2026-10-21 在已有 conda `pytorch` 环境验证：
 # Python 3.11.15，CUDA 13.0（torch 运行时报告 2.14.0+cu130），
 # NVIDIA GeForce RTX 3050 Laptop GPU（约 4 GiB）。
-# 与 requirements.txt（Python 3.10 / torch 2.5.1 cu121）区分；除非要精确复现
+# 与 requirements.txt 的目标训练环境（Python 3.12 / torch 2.8.0 cu128）区分；除非要精确复现
 # 本次测试环境，不建议按本文件盲目降级现有 torch/torchvision/numpy。
 # 版本来自该环境 `pip freeze`，仅保留本项目相关依赖。
 numpy==2.4.6

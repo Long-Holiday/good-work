@@ -1,7 +1,7 @@
-# Python 3.10；先按 README 安装 CUDA 12.1 的 torch/torchvision，再安装此文件。
-# 本文件不触发安装，也不下载 SAM 权重。
-torch==2.5.1
-torchvision==0.20.1
+# 目标训练环境：Ubuntu 22.04 / Python 3.12 / PyTorch 2.8.0 / CUDA 12.8。
+# 先按 README 从 cu128 索引安装 torch/torchvision，再安装此文件；不下载 SAM 权重。
+torch==2.8.0
+torchvision==0.23.0
 numpy==1.26.4
 scipy==1.13.1
 scikit-image==0.24.0
