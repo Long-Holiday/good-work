@@ -1,0 +1,117 @@
+# 实验登记模板，不是 train.py 配置；不要传给 --config。
+# 复制后填写 null 项；完整训练 YAML 另从 configs/3090.yaml 派生。
+# 规则见 experimental_protocol.md；未在 3090 上实测的数据不得填写为实测值。
+protocol:
+  version: protocol_v1_draft
+  status: draft  # 仅全部必填项已确认后改为 frozen
+  frozen_at: null
+  code_commit: null
+  workspace_diff_archive: null
+
+data:
+  dataset_version: null
+  grouping_rule: null
+  duplicate_check_report: null
+  geographic_independence: null
+  split_seed: 42
+  train: {manifest: null, sha256: null, count: null}
+  val: {manifest: null, sha256: null, count: null}
+  test: {manifest: null, sha256: null, count: null}
+  test_previously_used: null
+
+environment:
+  gpu: NVIDIA RTX 3090 24GB
+  gpu_verified: false
+  python: null
+  pytorch: null
+  torchvision: null
+  cuda_runtime: null
+  driver: null
+  dependency_lock: null
+  power_clock_policy: null
+  precision: null
+  tf32_policy: null
+  deterministic_policy: null
+
+experiment:
+  method: null
+  implementation_commit: null
+  factor_under_test: null
+  comparison_track: null  # data_exposure / equal_compute / mechanism / diagnostic
+  backbone: null
+  pretrained_source: null
+  pretrained_sha256: null
+  trainable_modules: null
+  parent_checkpoint: null
+  parent_sha256: null
+  training_config: null
+  training_config_sha256: null
+  training_seeds: [42, 43, 44]
+
+budget:
+  # 以下为候选起点；须先测量再冻结。阶段缩短时总曝光同步改动。
+  stages:
+    A: {epochs: 15, lr: 0.0001}
+    B: {epochs: 60, lr: 0.0001}
+    C: {epochs: 10, lr: 0.00005}
+    D: {epochs: 10, lr: 0.000001}
+  max_dataset_passes: 95
+  abc_micro_batch: 1
+  abc_accumulation: 4
+  d_micro_batch: 1
+  validation_batch: 1
+  num_workers: 4
+  grpo_group_size: 4
+  grpo_update_epochs: 1
+  gpu_hours_cap: null  # 等计算轨道必须预先填写统一 H
+  wall_time_boundary: exclusive_gpu_training_process_including_data_validation_save
+  tuning_candidates_per_method: 3
+  tuning_seed: 2026
+  tuning_budget_per_candidate: null
+  tuning_history_archive: null
+
+selection:
+  metric: macro_iou
+  validation_every_dataset_passes: 5
+  include_final_epoch: true
+  tie_breaker: earliest_checkpoint
+  stage_handoff: stage_best
+  validation_rng_isolated_from_training: null
+  per_sample_eval_seed_algorithm: null
+  evaluation_seed: 2024
+  validation_opportunity_count: null
+
+inference:
+  longest_side: 1024
+  heatmap_size: 256
+  sampling_steps: 20
+  candidates_per_image: 1
+  min_std: 0.02
+  peaks: {sigma: 0.5, h: 0.05, threshold: 0.3, min_distance: 4}
+  segmentation_threshold: 0.5
+  tta: false
+  ensembling: false
+  geometry_restore_rule: null
+  interpolation_rule: null
+  padding_exclusion_verified: null
+  evaluation_space: original_image
+  empty_mask_rule: both_empty_1_otherwise_single_empty_0
+
+pilot:
+  real_sam_checkpoint_verified: false
+  full_resolution_verified: false
+  representative_train_subset_manifest: null
+  per_stage_measurements: null
+  checkpoint_resume_verified: false
+  inference_repeatability_verified: false
+  projected_total_gpu_hours: null
+  approved_configuration_rationale: null
+
+outputs:
+  training_logs: null
+  checkpoints: null
+  per_image_metrics: null
+  summary_metrics: null
+  efficiency_measurements: null
+  failed_runs_and_cost: null
+  deviations_from_protocol: null
