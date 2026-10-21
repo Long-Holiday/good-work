@@ -1,5 +1,18 @@
 # 测试记录
 
+## 实验日志与 TensorBoard 增量验证（2026-10-21）
+
+在已有 `pytorch` conda 环境安装 `tensorboard==2.21.0`，`pip check` 无依赖冲突。
+
+- `conda run -n pytorch python -m pytest -q`：**221 passed、91 subtests passed，9.40 秒**。
+- `conda run -n pytorch python -m unittest discover -s tests -q`：**221 tests，OK，6.858 秒**。
+- 新增日志文件/JSONL/TensorBoard 事件回读、非有限值处理、stdout/stderr、异常/中断状态、初始化失败清理、RNG 隔离、CLI 参数及微型 A–D/resume 会话隔离覆盖。
+- 实际启动本地 TensorBoard HTTP 服务：主页返回 200，scalars tags 接口可读取 `B/train_epoch/loss` 和 `D/train_group/reward`；使用明确标记为 synthetic smoke 的诊断值，**不是模型实验结果**。检查后已关闭服务。
+- `conda run -n pytorch python scripts/gpu_smoke.py`：`passed=true`，exit code 0；仍为模拟 SAM 特征的 CUDA/AMP/GRPO 小型检查，不代表真实 SAM 完整训练。
+- `train.py --help`、`git diff --check` 通过。未下载预训练 SAM 权重，未启动真实 A–D 完整训练，未验证 3090 正式配置。
+
+以下保留 GRPO 迁移时的历史验证记录，其 203 项数量对应日志功能加入前。
+
 ## 当前环境（2026-10-21）
 
 按授权使用已有 `pytorch` conda 环境，并从显式 PyPI 索引安装缺失依赖。未下载 SAM 预训练权重。

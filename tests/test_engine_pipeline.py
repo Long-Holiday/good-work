@@ -15,6 +15,7 @@ from PIL import Image
 from torch import nn
 
 from diffpeak.engine import DiffPeakEngine
+from diffpeak.experiment_logging import ExperimentLogger
 from diffpeak.inference import DEFAULT_CONFIG, read_checkpoint
 from diffpeak.models import ConditionEncoder, ConditionalUNet, GaussianDiffusion
 from diffpeak.prompts import PeakExtractor
@@ -58,12 +59,20 @@ def _build_tiny_models(config, device, sam_checkpoint=None):
     )
 
 
+def _session_records(directory):
+    return [
+        json.loads(line)
+        for line in (directory / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 class EnginePipelineTest(unittest.TestCase):
-    def _make_config(self, root):
+    def _make_config(self, root, samples=2, batch_size=2):
         data = root / "data"
         (data / "train").mkdir(parents=True)
         entries = []
-        for index in range(2):
+        for index in range(samples):
             name = f"{index}_sat.jpg"
             image = np.full((64, 64, 3), 80 + 40 * index, dtype=np.uint8)
             mask = np.zeros((64, 64), dtype=np.uint8)
@@ -79,7 +88,9 @@ class EnginePipelineTest(unittest.TestCase):
         checkpoint = root / "unused.pth"
         checkpoint.write_bytes(b"tiny SAM builder does not read pretrained weights")
         config["model"]["sam_checkpoint"] = str(checkpoint)
-        config["train"].update(amp=False, batch_size=2, accumulation_steps=1, val_limit=1, log_every=100)
+        config["train"].update(
+            amp=False, batch_size=batch_size, accumulation_steps=1, val_limit=1, log_every=100
+        )
         config["rl"].update(group_size=2, point_cost_warmup_steps=2)
         for stage in "ABCD":
             config["stages"][stage].update(epochs=1, lr=1e-4, warmup_steps=1)
@@ -150,6 +161,191 @@ class EnginePipelineTest(unittest.TestCase):
                 torch.testing.assert_close(resumed.unet.state_dict()[name], parameter, rtol=0, atol=0)
             for name, parameter in continuous.ref_unet.state_dict().items():
                 torch.testing.assert_close(resumed.ref_unet.state_dict()[name], parameter, rtol=0, atol=0)
+
+    def test_logging_scopes_epoch_tags_and_resume_session_isolation(self):
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "diffpeak.engine.build_models", side_effect=_build_tiny_models
+        ):
+            root = Path(temporary)
+            config = self._make_config(root, samples=4, batch_size=1)
+            config["train"]["log_every"] = 2
+            config["logging"] = {
+                "tensorboard": False, "log_every": 2, "flush_secs": 1
+            }
+            sessions = root / "sessions"
+            engine = self._engine(config)
+
+            with ExperimentLogger(
+                sessions, config, metadata={"phase": "all-stages"}
+            ) as logger:
+                engine.experiment_logger = logger
+                with patch.object(
+                    logger, "log_scalars", wraps=logger.log_scalars
+                ) as scalars_spy, patch.object(
+                    logger, "event", wraps=logger.event
+                ) as event_spy, patch.object(
+                    logger, "flush", wraps=logger.flush
+                ) as flush_spy:
+                    for stage in "ABCD":
+                        engine.run_stage(stage)
+                full_directory = logger.directory
+            self.assertGreater(scalars_spy.call_count, 0)
+            self.assertGreaterEqual(event_spy.call_count, 4)
+            self.assertGreaterEqual(flush_spy.call_count, 4)
+            first_call = scalars_spy.call_args_list[0]
+            self.assertEqual(set(first_call.kwargs), {"step", "epoch"})
+
+            # 上下文退出后 session_end 必须已落盘，文件句柄已关闭。
+            full_records = _session_records(full_directory)
+            self.assertEqual(full_records[-1]["event"], "session_end")
+            self.assertEqual(full_records[-1]["status"], "completed")
+            metadata = json.loads(
+                (full_directory / "metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["status"], "completed")
+            self.assertEqual(metadata["phase"], "all-stages")
+
+            metrics = [record for record in full_records if record["event"] == "metrics"]
+
+            def scoped(stage, scope):
+                return [
+                    record for record in metrics
+                    if record["stage"] == stage and record["scope"] == scope
+                ]
+
+            # 4 个样本、batch_size=1、log_every=2：记录第 1 批、每 2 批、
+            # 以及末批；1-based index 为 1/2/4。
+            for stage in "ABC":
+                batches = scoped(stage, "train_batch")
+                self.assertEqual([record["step"] for record in batches], [1, 2, 4])
+                self.assertEqual({record["epoch"] for record in batches}, {1})
+                self.assertIn("loss", batches[0]["metrics"])
+                self.assertIn("lr", batches[0]["metrics"])
+
+                epoch_rows = scoped(stage, "train_epoch")
+                self.assertEqual(
+                    [(record["step"], record["epoch"]) for record in epoch_rows],
+                    [(1, 1)],
+                )
+                self.assertIn("loss", epoch_rows[0]["metrics"])
+
+                validation = scoped(stage, "val_epoch")
+                self.assertEqual(
+                    [(record["step"], record["epoch"]) for record in validation],
+                    [(1, 1)],
+                )
+                self.assertIn("iou", validation[0]["metrics"])
+
+                system = scoped(stage, "system")
+                self.assertEqual(
+                    [(record["step"], record["epoch"]) for record in system],
+                    [(1, 1)],
+                )
+                self.assertIn("epoch_seconds", system[0]["metrics"])
+
+            groups = scoped("D", "train_group")
+            self.assertEqual([record["step"] for record in groups], [1, 2, 4])
+            self.assertEqual({record["epoch"] for record in groups}, {1})
+            self.assertIn("reward", groups[0]["metrics"])
+            d_epoch = scoped("D", "train_epoch")
+            self.assertEqual(
+                [(record["step"], record["epoch"]) for record in d_epoch], [(1, 1)]
+            )
+            self.assertIn("reward", d_epoch[0]["metrics"])
+            self.assertEqual(len(scoped("D", "val_epoch")), 1)
+            self.assertIn("epoch_seconds", scoped("D", "system")[0]["metrics"])
+
+            events = [record["event"] for record in full_records]
+            self.assertEqual(events.count("stage_start"), 4)
+            self.assertEqual(events.count("stage_end"), 4)
+            self.assertIn("checkpoint", events)
+
+            # resume 必须创建新 session，旧 session 文件保持不变。
+            resume_config = copy.deepcopy(config)
+            resume_config["stages"]["D"]["epochs"] = 1
+            resume_config["output_dir"] = str(root / "resume_run")
+            before_resume = self._engine(resume_config)
+            with ExperimentLogger(
+                sessions, resume_config, metadata={"phase": "before-resume"}
+            ) as before_logger:
+                before_resume.experiment_logger = before_logger
+                before_resume.run_stage("D")
+                before_directory = before_logger.directory
+            before_text = (before_directory / "metrics.jsonl").read_text(
+                encoding="utf-8"
+            )
+            checkpoint = read_checkpoint(before_resume.output_dir / "last.pt")
+            self.assertEqual(checkpoint["epoch"], 1)
+
+            resume_config["stages"]["D"]["epochs"] = 2
+            after_resume = self._engine(resume_config)
+            with ExperimentLogger(
+                sessions, resume_config, metadata={"phase": "after-resume"}
+            ) as after_logger:
+                after_resume.experiment_logger = after_logger
+                after_resume.run_stage(
+                    "D", start_epoch=1,
+                    resume_payload=copy.deepcopy(checkpoint),
+                )
+                after_directory = after_logger.directory
+
+            self.assertNotEqual(before_directory, after_directory)
+            self.assertEqual(
+                (before_directory / "metrics.jsonl").read_text(encoding="utf-8"),
+                before_text,
+            )
+            before_records = _session_records(before_directory)
+            after_records = _session_records(after_directory)
+            self.assertEqual(
+                [record["phase"] for record in before_records
+                 if record["event"] == "session_start"],
+                ["before-resume"],
+            )
+            self.assertEqual(
+                [record["phase"] for record in after_records
+                 if record["event"] == "session_start"],
+                ["after-resume"],
+            )
+            for records, directory in (
+                (before_records, before_directory),
+                (after_records, after_directory),
+            ):
+                self.assertEqual(records[-1]["event"], "session_end")
+                self.assertEqual(records[-1]["status"], "completed")
+                session_metadata = json.loads(
+                    (directory / "metadata.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(session_metadata["status"], "completed")
+
+            stage_starts = [
+                record for record in after_records
+                if record["event"] == "stage_start"
+            ]
+            self.assertEqual(len(stage_starts), 1)
+            self.assertTrue(stage_starts[0]["resumed"])
+            self.assertEqual(stage_starts[0]["start_epoch"], 1)
+
+            # 新 session 只包含恢复的第二个 epoch，坐标轴继续且不重叠。
+            resumed_groups = [
+                record for record in after_records
+                if record["event"] == "metrics"
+                and record["scope"] == "train_group"
+            ]
+            self.assertEqual(
+                [record["step"] for record in resumed_groups], [5, 6, 8]
+            )
+            self.assertEqual(
+                {record["epoch"] for record in resumed_groups}, {2}
+            )
+            resumed_epoch = [
+                record for record in after_records
+                if record["event"] == "metrics"
+                and record["scope"] == "train_epoch"
+            ]
+            self.assertEqual(
+                [(record["step"], record["epoch"]) for record in resumed_epoch],
+                [(2, 2)],
+            )
 
 
 if __name__ == "__main__":

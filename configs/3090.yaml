@@ -2,6 +2,12 @@
 seed: 42
 output_dir: runs/diffpeak
 
+# CLI 每次启动创建独立日志会话；epoch 指标始终记录，批次/组按间隔采样。
+logging:
+  tensorboard: true
+  log_every: 10
+  flush_secs: 30
+
 data:
   root: DeepGlobe_Road
   train_split: splits/train.json

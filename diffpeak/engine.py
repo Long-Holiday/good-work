@@ -38,6 +38,7 @@ import math
 import os
 import random
 import shutil
+import time
 import warnings
 from contextlib import nullcontext
 from dataclasses import replace
@@ -265,6 +266,7 @@ class DiffPeakEngine:
         self._train_split_cache: Optional[Path] = None
         self._val_split_cache: Optional[Path] = None
         self._val_split_cached = False
+        self.experiment_logger = None
 
         self._validate_peak_target_config()
         # 提前解析划分路径：train 缺失或显式配置的 val 缺失时立即失败；
@@ -741,6 +743,18 @@ class DiffPeakEngine:
     # ------------------------------------------------------------------
     # 训练循环
     # ------------------------------------------------------------------
+    def _log_training_record(
+        self, stage: str, scope: str, record: Mapping[str, Any],
+        epoch: int, index: int, total: int,
+    ) -> None:
+        logger = getattr(self, "experiment_logger", None)
+        if logger is not None and (
+            index == 1 or index == total or index % logger.log_every == 0
+        ):
+            logger.log_scalars(
+                stage, scope, record, step=epoch * total + index, epoch=epoch + 1
+            )
+
     def _train_epoch_supervised(
         self, stage: str, epoch: int, loader: DataLoader
     ) -> Dict[str, float]:
@@ -748,6 +762,7 @@ class DiffPeakEngine:
         records: List[Dict[str, Any]] = []
         optimizer_steps = 0
         skipped_groups = 0
+        batch_index = 0
         for group in _micro_groups(loader, self.accumulation_steps):
             assert self.optimizer is not None and self.scheduler is not None
             assert self.scaler is not None
@@ -772,6 +787,11 @@ class DiffPeakEngine:
                     "points": _scalar(loss_dict.get("points")),
                 }
                 records.append(record)
+                batch_index += 1
+                self._log_training_record(
+                    stage, "train_batch", {**record, "lr": self._current_lr()},
+                    epoch, batch_index, len(loader),
+                )
 
             if had_gradient:
                 # AMP overflow 时 _optimizer_step 返回 False，不推 scheduling。
@@ -818,6 +838,9 @@ class DiffPeakEngine:
             prepared = self._prepare_batch(batch)
             record = self._grpo_group(prepared, epoch)
             records.append(record)
+            self._log_training_record(
+                stage, "train_group", record, epoch, group_index, len(loader)
+            )
             if group_index % self.log_every == 0:
                 print(
                     f"[D] epoch {epoch + 1} group {group_index} "
@@ -1600,8 +1623,26 @@ class DiffPeakEngine:
                 print(f"[{stage}] checkpoint 已在该阶段结束", flush=True)
                 return None
 
+        logger = getattr(self, "experiment_logger", None)
+        if logger is not None:
+            logger.event(
+                "stage_start", stage=stage, start_epoch=start_epoch, epochs=epochs,
+                resumed=resume_payload is not None, global_step=self.global_step,
+                schedule={"total_steps": self.scheduler_total_steps,
+                          "warmup_steps": self.scheduler_warmup_steps,
+                          "min_lr_ratio": self.scheduler_min_lr_ratio,
+                          "learning_rate": self.scheduler_stage_lr},
+                algorithm={"name": self.rl_algorithm, "group_size": self.group_size,
+                           "update_epochs": self.update_epochs, "ppo_clip": self.ppo_clip,
+                           "kl_weight": self.kl_weight, "anchor_weight": self.anchor_weight,
+                           "advantage_std_delta": self.advantage_std_delta,
+                           "point_cost_warmup_steps": self.point_cost_warmup_steps},
+            )
         last_validation: Optional[Dict[str, float]] = None
         for epoch in range(start_epoch, epochs):
+            epoch_started = time.monotonic()
+            if logger is not None and self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
             self._epoch = epoch
             train_loader = self._build_train_loader(epoch)
             if stage == "D":
@@ -1629,6 +1670,22 @@ class DiffPeakEngine:
                 }
             )
             self._write_metrics()
+            if logger is not None:
+                logger.log_scalars(stage, "train_epoch", train_stats, epoch + 1, epoch + 1)
+                if validation is not None:
+                    logger.log_scalars(stage, "val_epoch", validation, epoch + 1, epoch + 1)
+                system_stats = {
+                    "epoch_seconds": time.monotonic() - epoch_started,
+                    "lr_next": self._current_lr(),
+                    "optimizer_step": self.global_step,
+                    "amp_scale": float(self.scaler.get_scale()),
+                }
+                if self.device.type == "cuda":
+                    system_stats["peak_cuda_memory_mb"] = (
+                        torch.cuda.max_memory_allocated(self.device) / 1024**2
+                    )
+                logger.log_scalars(stage, "system", system_stats, epoch + 1, epoch + 1)
+                logger.flush()
 
             # 先更新 best，再写 last；这样 last.pt 中的 best_metric 不会落后，
             # 中断后从 last.pt 恢复不会回退最佳指标跟踪。
@@ -1637,9 +1694,15 @@ class DiffPeakEngine:
             ):
                 self.best_metric = float(score)
                 self.save_best(stage, epoch + 1)
+                if logger is not None:
+                    logger.event("checkpoint", kind="best", stage=stage, epoch=epoch + 1,
+                                 path=str(self.output_dir / "best.pt"), score=self.best_metric)
 
             if (epoch + 1) % self.save_every == 0 or epoch + 1 == epochs:
                 self.save_last(stage, epoch + 1, self.best_metric)
+                if logger is not None:
+                    logger.event("checkpoint", kind="last", stage=stage, epoch=epoch + 1,
+                                 path=str(self.output_dir / "last.pt"))
 
             print(
                 f"[{stage}] epoch {epoch + 1}/{epochs} "
@@ -1664,6 +1727,11 @@ class DiffPeakEngine:
         if self.best_metric is None:
             self._copy_last_to_best()
         self._link_stage_checkpoint(stage)
+        if logger is not None:
+            logger.event("stage_end", stage=stage, epochs=epochs,
+                         checkpoint=str(self.output_dir / f"stage_{stage}.pth"),
+                         best_metric=self.best_metric)
+            logger.flush()
         print(
             f"[{stage}] 完成；last={self.output_dir / 'last.pt'} "
             f"best_metric={self.best_metric}",

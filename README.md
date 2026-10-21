@@ -2,7 +2,7 @@
 
 依据 [`docs/model_grpo.md`](docs/model_grpo.md) 的 GRPO 后训练设计实现：**条件扩散生成双通道提示热图 → h-maxima + 距离 NMS → 道路适配 SAM → 同图组内 GRPO 后训练**。[`docs/model.md`](docs/model.md) 保留为早期 DDPO 设计的形成记录，不再代表当前 D 阶段协议。
 
-> 验证状态：已按授权在已有 `pytorch` conda 环境安装缺失的 PyYAML、scipy、scikit-image、segment-anything、tqdm，并完成本次迁移后的测试：**完整 CPU 测试 203 项通过**（含 GRPO 数学、调度器、引擎诊断、微型 A–D 控制流与 resume 一致性、checkpoint 兼容性，以及真实官方 SAM 模块的随机权重集成测试），**RTX 3050 小规模 GPU smoke 通过**（GRPO 组内优势、AMP、KL、重算轨迹与梯度检查）。未下载 SAM 预训练权重，未启动 A–D 完整训练，也不声称 GRPO 训练效果或 3090 实测结果。3090 24GB 配置仍是未在目标卡上实测的实验起点，不保证完整训推显存、速度或效果。详细环境、命令与未执行范围见 [`docs/testing.md`](docs/testing.md)。
+> 验证状态：已按授权在已有 `pytorch` conda 环境安装缺失的 PyYAML、scipy、scikit-image、segment-anything、tqdm，并完成本次迁移后的测试：**完整 CPU 测试 221 项通过**（含 GRPO 数学、调度器、引擎诊断、微型 A–D 控制流与 resume 一致性、checkpoint 兼容性，以及真实官方 SAM 模块的随机权重集成测试），**RTX 3050 小规模 GPU smoke 通过**（GRPO 组内优势、AMP、KL、重算轨迹与梯度检查）。未下载 SAM 预训练权重，未启动 A–D 完整训练，也不声称 GRPO 训练效果或 3090 实测结果。3090 24GB 配置仍是未在目标卡上实测的实验起点，不保证完整训推显存、速度或效果。TensorBoard 2.21.0 的 SummaryWriter/event accumulator 写读与 `pip check` 已在 `pytorch` 环境通过；尚未在真实 SAM 完整训练中验证日志轮转或曲线。目录、字段与 tag 口径见 [`docs/experiments.md`](docs/experiments.md)。详细环境、命令与未执行范围见 [`docs/testing.md`](docs/testing.md)。
 
 ## 1. 环境与权重（自行安装）
 
@@ -16,7 +16,7 @@ python -m pip install torch==2.5.1 torchvision==0.20.1 --index-url https://downl
 python -m pip install -r requirements.txt
 ```
 
-固定依赖见 `requirements.txt`。不需要 diffusers、transformers、xformers、OpenCV 或自定义 CUDA 编译扩展。原版 SAM API 使用 `segment-anything==1.0`。
+固定依赖见 `requirements.txt`。其中 `tensorboard>=2.18,<3` 用于实验日志与 TensorBoard 可视化。不需要 diffusers、transformers、xformers、OpenCV 或自定义 CUDA 编译扩展。原版 SAM API 使用 `segment-anything==1.0`。
 
 手动从 [SAM 官方仓库](https://github.com/facebookresearch/segment-anything) 获取 ViT-B 权重 `sam_vit_b_01ec64.pth`，放到 `checkpoints/`，或修改 YAML 的 `model.sam_checkpoint`。官方权重地址：
 
@@ -70,6 +70,7 @@ diffpeak/
   losses.py                BCE / Dice / soft-clDice 与辅助损失
   rewards.py               IoU、clDice、可选双向路径代理奖励
   engine.py                阶段冻结、训练、验证与 checkpoint
+  experiment_logging.py    实验会话、JSONL/文本日志、TensorBoard
   inference.py             无标注推理与几何恢复
 train.py / predict.py / evaluate.py
 ```
@@ -112,13 +113,48 @@ python evaluate.py --checkpoint runs/diffpeak/stage_D.pth --split-file splits/va
 python predict.py --checkpoint runs/diffpeak/stage_D.pth --input DeepGlobe_Road/valid --output predictions/valid --save-points
 ```
 
-以上正式训练/完整评估命令需准备 SAM 预训练权重后执行，本次未运行完整训练或评估。已在 `runs/grpo_validation/splits` 生成独立验证用划分，并完成 16 张真实样本的目标回提检查；CPU/GPU 测试与漏峰情况单独记录于 [`docs/testing.md`](docs/testing.md)。`--stage all` 按 A→B→C→D 使用阶段结束权重继续；`stage_X.pth` 为阶段结束完整快照，`last.pt` 为最近保存的完整 epoch，`best.pt` 按当前阶段验证 IoU 选择，会随新阶段重新记录。若希望每阶段使用最佳权重而非末轮权重，分阶段运行并把该阶段 `best.pt` 另存后传给下一阶段 `--init`。建议不同实验使用不同 `output_dir`，不要共享输出目录。
+以上正式训练/完整评估命令需准备 SAM 预训练权重后执行，本次未运行完整训练或评估。已在 `runs/grpo_validation/splits` 生成独立验证用划分，并完成 16 张真实样本的目标回提检查；CPU/GPU 测试与漏峰情况单独记录于 [`docs/testing.md`](docs/testing.md)。`--stage all` 按 A→B→C→D 使用阶段结束权重继续；`stage_X.pth` 为阶段结束完整快照，`last.pt` 为最近保存的完整 epoch，`best.pt` 按当前阶段验证 IoU 选择，会随新阶段重新记录。若希望每阶段使用最佳权重而非末轮权重，分阶段运行并把该阶段 `best.pt` 另存后传给下一阶段 `--init`。建议不同实验使用不同 `output_dir`（或用 `--experiment-name` 隔离），不要共享输出目录。
 
 `predict.py`/`evaluate.py` 省略 `--config` 时使用 checkpoint 内的配置；显式传入 YAML 表示你主动变更协议。checkpoint 保存已解析的数据、划分、SAM 和输出绝对路径；换机器时应显式提供含新路径的配置。恢复以完整 epoch 为单位，不承诺逐 batch 中断恢复。`train.py --resume` 会恢复 checkpoint 的优化器学习率与调度曲线，即使显式传入新 YAML；阶段内恢复应保持 batch size、梯度累积、划分长度和计划 epoch 数不变，变更训练预算请另用 `--init` 启动新实验。`evaluate.py` 的 `--limit` 只用于子集调试，不应与完整验证集结果混用。
 
 默认 batch size 1、梯度累积 4、AMP、U-Net 激活检查点；D 使用 `rl.amp_init_scale=64`，避免联合高维策略梯度配合默认大 scale 时的首批溢出。A/B/C 的有效 batch size 为 4。D 每图 4 条轨迹串行采样，轨迹 CPU 暂存；它的轨迹组与监督 batch 的语义不同。
 
 从旧 DDPO 快照迁移时，使用 `python train.py --config configs/3090.yaml --stage D --init <旧快照>`，显式传入新的 GRPO 配置并只加载模型权重；省略 `--config` 会继承旧快照配置，而不会自动启用本次学习率与预热设置。**不要**把旧 DDPO 快照直接 `--resume` 到 GRPO D。优化器、调度器与 RNG 状态本身可技术性加载，但旧 DDPO 的更新目标与 GRPO 不同，不应沿用其优化器和调度状态；其中冻结的 `ref_unet` 权重仍可复用，旧配置也可能缺少 `rl.algorithm`、`rl.point_cost_warmup_steps` 等键。需要保留旧实验时，请使用独立 `output_dir`。
+
+### 实验日志与 TensorBoard
+
+实验日志已通过文件/事件回读、异常关闭、RNG 隔离与微型 A–D/resume 集成测试；TensorBoard 2.21.0 本地 HTTP 页面及标量接口检查通过。尚未用真实 SAM 权重完整训练验证。
+
+- `--output-dir PATH` 覆盖 YAML `output_dir`，作为输出根目录；`--experiment-name NAME` 在其下建立独立子目录，有效输出目录为 `<output_dir>/NAME`（省略时沿用原 `output_dir`；不与 `--resume` 同用）；`--no-tensorboard` 关闭本次事件写入，其余日志照常。
+- 每次启动（包括每次 `--resume`）都在有效输出目录下新建 `<有效输出目录>/experiments/<UTC时间戳>_<随机ID>/`（例如 `20261021T121500.123456Z_ab12cd34`），其中写入 `config.json`、`metadata.json`、`train.log`（stdout/stderr tee）、`metrics.jsonl`（epoch 与 batch/group 结构化指标）和 `tensorboard/` 事件。`experiments/` 之外的既有 `metrics.json`、`last.pt`、`best.pt`、`stage_X.pth` 保持原位置和用途。
+- YAML 增加：
+
+  ```yaml
+  logging:
+    tensorboard: true
+    log_every: 10
+    flush_secs: 30
+  ```
+
+  `log_every` 控制 batch/group 记录间隔（每轮首批、末批也记录）；训练 epoch 汇总每轮记录，验证按 `train.val_every` 及末轮记录；`flush_secs` 控制 TensorBoard 事件刷新周期（文本与 JSONL 按写入刷新），缺省协议即上例。
+- TensorBoard tag 按阶段独立，例如 `A/train_batch/loss`、`D/train_group/reward`、`A/train_epoch/loss`、`A/val_epoch/iou`、`A/system/epoch_seconds`。epoch 级轴为 1-based；batch/group 轴使用 `epoch_index * len(loader) + index`，其中 `epoch_index` 为该轮从 0 开始的内部序号，`index` 为该 epoch 内从 1 开始的 batch 序号，D 阶段改用 `group_index`。`--resume` 另起 session，`metadata.json` 记录 resume 快照路径、阶段与 epoch，避免把未保存 epoch 的点追加到旧曲线。
+
+```bash
+# 独立实验子目录；有效输出目录为 runs/diffpeak/grpo-baseline
+python train.py --config configs/3090.yaml --stage all --experiment-name grpo-baseline
+
+# 覆盖输出根目录后仍可用实验名隔离
+python train.py --config configs/3090.yaml --stage all --output-dir runs/ablation --experiment-name seed43
+
+# 只关闭 TensorBoard，config/metadata/train.log/metrics.jsonl 仍照常写入
+python train.py --config configs/3090.yaml --stage all --no-tensorboard
+
+# 查看事件
+conda activate pytorch
+tensorboard --logdir runs/diffpeak --port 6006
+```
+
+浏览器打开 `http://localhost:6006`。若使用 `--output-dir` 或 `--experiment-name`，将 `--logdir` 指向对应的有效输出目录（或其 `experiments/`）即可。详细字段、tag 与 resume 隔离口径见 [`docs/experiments.md`](docs/experiments.md)。
 
 ## 5. 扩散、峰值与 RL 协议
 
@@ -154,7 +190,7 @@ D 阶段至少记录终端奖励、组内奖励标准差、无效（零优势）
 ## 7. 测试入口
 
 ```bash
-# 完整 CPU 测试；本次迁移后实测 203 项通过
+# 完整 CPU 测试；实验日志接入后实测 221 项通过
 conda run -n pytorch python -m unittest discover -s tests -v
 
 # GRPO / 调度 / 引擎子集
@@ -167,4 +203,4 @@ conda run -n pytorch python scripts/gpu_smoke.py
 conda run -n pytorch python -m compileall -q diffpeak tests scripts train.py predict.py evaluate.py check_targets.py
 ```
 
-GPU smoke 使用 128² 输入、32² 热图、G=2 和 4 步采样，检查 AMP、GRPO 组内优势（奖励 `[0.4, 0.6]` 得到 `[-1, 1]`）、KL、逐步重算 log-prob、梯度与参数更新，而非完整 SAM 分割效果。本次实测：完整 CPU 测试 203 项 OK；GPU smoke `passed=true`，重算 ratio 最大误差 0，B/D 峰值 allocated 339.51 / 369.08 MiB。该 smoke 不加载真实 SAM 权重，也不替代完整训练。历史范围与未执行项见 [`docs/testing.md`](docs/testing.md)。
+GPU smoke 使用 128² 输入、32² 热图、G=2 和 4 步采样，检查 AMP、GRPO 组内优势（奖励 `[0.4, 0.6]` 得到 `[-1, 1]`）、KL、逐步重算 log-prob、梯度与参数更新，而非完整 SAM 分割效果。本次实测：完整 CPU 测试 221 项 OK；GPU smoke `passed=true`，重算 ratio 最大误差 0，B/D 峰值 allocated 339.51 / 369.08 MiB。该 smoke 不加载真实 SAM 权重，也不替代完整训练。历史范围与未执行项见 [`docs/testing.md`](docs/testing.md)。

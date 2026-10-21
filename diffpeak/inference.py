@@ -93,6 +93,7 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 DEFAULT_CONFIG: Dict[str, Any] = {
     "seed": 42,
     "output_dir": "runs/diffpeak",
+    "logging": {"tensorboard": True, "log_every": 10, "flush_secs": 30},
     "data": {
         "root": "DeepGlobe_Road",
         "train_split": "splits/train.json",

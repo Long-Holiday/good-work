@@ -26,11 +26,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from diffpeak.engine import STAGE_ORDER, DiffPeakEngine
+from diffpeak.experiment_logging import ExperimentLogger
 from diffpeak.inference import (
     config_from_checkpoint,
     find_config_path,
     load_config,
     read_checkpoint,
+    resolve_output_dir,
     seed_everything,
 )
 
@@ -90,6 +92,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="显式覆盖配置中的 seed（默认不覆盖）。",
     )
+    parser.add_argument("--output-dir", type=str, default=None, help="覆盖输出目录（相对于当前工作目录）。")
+    parser.add_argument("--experiment-name", type=str, default=None, help="在输出目录下创建命名实验子目录。")
+    parser.add_argument("--no-tensorboard", action="store_true", help="关闭 TensorBoard，仍保存文本和 JSONL 日志。")
     return parser
 
 
@@ -106,8 +111,32 @@ def main() -> None:
     seed = int(config.get("seed", 42))
     seed_everything(seed, deterministic=bool(config.get("train", {}).get("deterministic", False)))
 
-    engine = DiffPeakEngine(config, device=args.device, config_dir=config_dir)
+    if args.output_dir is not None:
+        config["output_dir"] = str(Path(args.output_dir).expanduser().resolve())
+    if args.experiment_name is not None:
+        name = args.experiment_name.strip()
+        if not name or name in (".", "..") or "/" in name or "\\" in name:
+            parser.error("--experiment-name 必须是非空目录名，不能包含路径分隔符")
+        if args.resume is not None:
+            parser.error("--resume 请直接使用 checkpoint 中的实验目录，或通过 --output-dir 指定目录")
+        config["output_dir"] = str(resolve_output_dir(config, config_dir) / name)
+    if args.no_tensorboard:
+        config.setdefault("logging", {})["tensorboard"] = False
 
+    with ExperimentLogger(
+        resolve_output_dir(config, config_dir), config,
+        metadata={"resume": args.resume, "init": args.init, "requested_stages": args.stage,
+                  "config_source": args.config, "device_requested": args.device},
+    ) as experiment:
+        engine = DiffPeakEngine(config, device=args.device, config_dir=config_dir)
+        engine.experiment_logger = experiment
+        experiment.save_config(engine._resolved_config())
+        experiment.metadata.update(device=str(engine.device), seed=seed)
+        experiment.event("engine_ready", device=str(engine.device), seed=seed)
+        _run_training(parser, args, config, preloaded, engine, experiment)
+
+
+def _run_training(parser, args, config, preloaded, engine, experiment) -> None:
     resume_payload: Optional[Dict[str, Any]] = None
     resume_stage: Optional[str] = None
     resume_epoch = 0
@@ -132,6 +161,10 @@ def main() -> None:
         # 这里不要预加载或删除 payload.models，避免重复加载/破坏严格恢复。
         resume_stage = str(resume_payload.get("stage", "")).upper()
         resume_epoch = int(resume_payload.get("epoch", 0))
+        experiment.metadata.update(resume_stage=resume_stage, resume_epoch=resume_epoch,
+                                   resume_global_step=resume_payload.get("global_step"))
+        experiment.event("resume", checkpoint=args.resume, stage=resume_stage, epoch=resume_epoch,
+                         global_step=resume_payload.get("global_step"))
         if resume_stage not in STAGE_ORDER:
             raise ValueError(f"checkpoint 中的阶段无效：{resume_stage!r}")
 
@@ -145,6 +178,7 @@ def main() -> None:
             selected = list(STAGE_ORDER)
         selected = [stage for stage in selected if STAGE_ORDER.index(stage) >= STAGE_ORDER.index(resume_stage)]
 
+    experiment.metadata["selected_stages"] = selected
     print(
         f"配置来源：{'显式 --config' if args.config is not None else ('checkpoint' if args.resume or args.init else '默认配置')}；"
         f"输出目录：{engine.output_dir}",

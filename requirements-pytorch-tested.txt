@@ -11,6 +11,9 @@ PyYAML==6.0.3
 scikit-image==0.26.0
 scipy==1.17.1
 segment-anything==1.0
+tensorboard==2.21.0
 torch==2.14.0
 torchvision==0.29.0
 tqdm==4.70.1
+# TensorBoard 2.21.0 已在该环境安装；SummaryWriter/event accumulator
+# 写读通过，pip check 无 broken requirements。尚未用于真实 SAM 完整训练验证。
