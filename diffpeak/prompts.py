@@ -1,6 +1,6 @@
 """双通道提示热图的固定峰值提取与回提诊断。
 
-提取流程严格对应 ``docs/model.md``：
+提取流程对应 ``docs/model_grpo.md``：
 
 1. 对每个通道独立做轻度高斯平滑；
 2. 用 h-maxima 得到显著峰区域，并用绝对阈值删除低响应峰；
@@ -9,7 +9,7 @@
 4. 按响应降序执行**同通道**距离 NMS，不设固定点数上限；
 5. 先完成峰值检测，再按 ``valid_sizes`` 过滤右下填充区域，避免填充
    边界参与 NMS 后压掉有效峰；
-6. 正负通道坐标完全重合时，保留分数高者；分数相同时正点优先。
+6. 正负通道坐标完全重合时，保留分数高者；分数相同时双方删除。
 
 坐标约定
 --------
@@ -395,24 +395,23 @@ def _map_and_filter_peaks(
 
 
 def _resolve_cross_channel(peaks: Sequence[_MappedPeak]) -> List[_MappedPeak]:
-    """坐标重合的异类峰只保留分数高者，分数相同时正点优先。
+    """坐标重合的异类峰只保留分数高者，分数相同时双方删除。
 
     重合判定使用热图上的离散像素坐标：检测得到的峰值本来就是整数热图
     坐标，两个通道共享同一网格，因此这是精确的“同坐标”判定；若改用
     SAM 坐标再取整，在热图分辨率高于输入（scale < 1）时可能把相邻的
     不同峰误判为同一点。
     """
-    best_by_key = {}
+    by_key = {}
     for index, peak in enumerate(peaks):
         key = (int(round(peak.x_heat)), int(round(peak.y_heat)))
-        current = best_by_key.get(key)
-        if current is None:
-            best_by_key[key] = index
-            continue
-        other = peaks[current]
-        if (peak.score, peak.label) > (other.score, other.label):
-            best_by_key[key] = index
-    keep = set(best_by_key.values())
+        by_key.setdefault(key, []).append(index)
+    keep = set()
+    for indices in by_key.values():
+        best_score = max(peaks[index].score for index in indices)
+        winners = [index for index in indices if peaks[index].score == best_score]
+        if len({peaks[index].label for index in winners}) == 1:
+            keep.add(winners[0])
     return [peak for index, peak in enumerate(peaks) if index in keep]
 
 

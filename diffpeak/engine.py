@@ -2,10 +2,10 @@
 
 阶段职责
 --------
-* **A**：训练 SAM mask decoder、细节/条件分支与辅助头；提示来自真实目标热图。
+* **A**：只训练 SAM mask decoder；提示来自真实目标热图。
 * **B**：训练扩散 U-Net、条件分支与辅助头；扩散 MSE + 热图重建 + 辅助损失。
 * **C**：只训练 SAM mask decoder；提示来自冻结扩散模型生成的提示。
-* **D**：只训练扩散 U-Net；DDPO + 参考策略 KL + 扩散锚定，奖励来自冻结
+* **D**：只训练扩散 U-Net；GRPO + 参考策略 KL + 扩散锚定，奖励来自冻结
   SAM 的解码结果。
 
 关键实现约定
@@ -14,14 +14,20 @@
 * A/B/C 使用 AMP + ``GradScaler``。D 的 rollout 与 replay 使用**相同的**
   autocast 上下文和 ``eval`` U-Net，保证更新前联合 log-prob 比值为 1。
 * 梯度累积按实际尾组大小归一：``loss / len(group)``。
-* D 以“一张影像的 G 条轨迹”为一个更新组：先整组 rollout（``no_grad``），
-  再逐轨迹、逐步重算并立即 ``backward``，最后每组只做一次优化器更新。
+* D 以“一张影像的 G 条轨迹”为一个 GRPO 组：先整组 rollout（``no_grad``），
+  再逐轨迹、逐步重算并立即 ``backward``，每轮整组重放后更新一次优化器
+  （每组执行 ``update_epochs`` 轮，默认 1）。
   因此 ``train.accumulation_steps`` 只作用于 A/B/C；D 的组语义不同。
+* GRPO 优势为同图奖励的组内标准化值
+  ``(R_i - mean) / max(std, advantage_std_delta)``；组内奖励完全相同时
+  优势为零，策略项自动跳过（KL 与扩散锚定仍保留）。
 * 轨迹中的状态/动作/旧 log-prob 由 ``GaussianDiffusion.sample(record=True)``
   保存在 CPU。重放时一次只把一个时间步的张量搬到 GPU。
-* PPO 使用 ``log_prob`` 返回的动作维**求和**，不做 mean；新旧概率差在
+* 策略使用 ``log_prob`` 返回的动作维**求和**，不做 mean；新旧概率差在
   float64 中计算，避免 2x256x256 维动作的精度损失。
-* 参考 U-Net 只在 D 开始时 ``deepcopy``，永久冻结；KL 使用同方差高斯解析式。
+* 参考 U-Net 优先从 D 快照加载，否则在 D 开始时 ``deepcopy``；永久冻结，
+  KL 使用同方差高斯解析式。
+* 每个阶段使用线性 warmup + cosine 退火；终点乘子由 ``min_lr_ratio`` 控制。
 """
 
 from __future__ import annotations
@@ -34,14 +40,20 @@ import random
 import shutil
 import warnings
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from diffpeak.data import DeepGlobeDataset
+from diffpeak.grpo import (
+    gaussian_kl_divergence,
+    group_relative_advantages,
+    grpo_policy_loss,
+)
 from diffpeak.inference import (
     aggregate_metrics,
     build_models,
@@ -65,6 +77,7 @@ from diffpeak.inference import (
     stable_seed,
 )
 from diffpeak.losses import auxiliary_loss, segmentation_loss
+from diffpeak.schedules import resolve_warmup_steps, warmup_cosine_factor
 
 __all__ = ["DiffPeakEngine", "STAGE_ORDER"]
 
@@ -128,7 +141,7 @@ def _scalar(value: Any) -> Optional[float]:
 
 
 class DiffPeakEngine:
-    """负责阶段切换、训练循环、验证、checkpoint 与 DDPO 的引擎。"""
+    """负责阶段切换、训练循环、验证、checkpoint 与 GRPO 的引擎。"""
 
     def __init__(
         self,
@@ -200,17 +213,51 @@ class DiffPeakEngine:
         self.val_limit = self.train_cfg.get("val_limit")
         self.threshold = float(self.inference_cfg.get("threshold", 0.5))
 
+        self.rl_algorithm = str(self.rl_cfg.get("algorithm", "grpo")).lower()
+        if self.rl_algorithm != "grpo":
+            raise ValueError(
+                "当前实现只支持 GRPO；rl.algorithm 必须为 'grpo'，"
+                f"收到 {self.rl_algorithm!r}。旧 DDPO 配置请迁移后再训练。"
+            )
         self.group_size = int(self.rl_cfg.get("group_size", 4))
+        # 键名保留 ppo_clip 以兼容已有配置；它在这里是 GRPO 的裁剪半径。
         self.ppo_clip = float(self.rl_cfg.get("ppo_clip", 1e-4))
         self.kl_weight = float(self.rl_cfg.get("kl_weight", 0.01))
-        self.anchor_weight = float(self.rl_cfg.get("anchor_weight", 0.1))
+        self.anchor_weight = float(self.rl_cfg.get("anchor_weight", 0.0))
         self.update_epochs = max(1, int(self.rl_cfg.get("update_epochs", 1)))
+        self.advantage_std_delta = float(
+            self.rl_cfg.get("advantage_std_delta", 1e-4)
+        )
+        self.point_cost_warmup_steps = max(
+            0, int(self.rl_cfg.get("point_cost_warmup_steps", 0))
+        )
+        if self.ppo_clip < 0.0 or not math.isfinite(self.ppo_clip):
+            raise ValueError("rl.ppo_clip（GRPO 裁剪半径）必须是非负有限数")
+        if self.kl_weight < 0.0 or not math.isfinite(self.kl_weight):
+            raise ValueError("rl.kl_weight 必须是非负有限数")
+        if self.anchor_weight < 0.0 or not math.isfinite(self.anchor_weight):
+            raise ValueError("rl.anchor_weight 必须是非负有限数")
+        if (
+            self.advantage_std_delta <= 0.0
+            or not math.isfinite(self.advantage_std_delta)
+        ):
+            raise ValueError("rl.advantage_std_delta 必须是严格正的有限数")
 
         self.optimizer: Optional[torch.optim.Optimizer] = None
         self.scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
+        self.scheduler_total_steps = 0
+        self.scheduler_warmup_steps = 0
+        self.scheduler_min_lr_ratio = 0.0
+        self.scheduler_stage_lr = 0.0
+        self.scheduler_steps_per_epoch = 0
+        self.scheduler_epochs = 0
+        self.scheduler_lr_schedule = "cosine"
         self.scaler: Optional[Any] = None
         self.ref_unet: Optional[torch.nn.Module] = None
         self.global_step = 0
+        # 点成本预热按“已处理的 D 组数”推进，而不是按成功的 optimizer step；
+        # 否则整组常量奖励且 KL/anchor 关闭时预热会永远停在 0。
+        self.grpo_groups_processed = 0
         self.best_metric: Optional[float] = None
         self.history: List[Dict[str, Any]] = []
         self._stage: Optional[str] = None
@@ -343,8 +390,9 @@ class DiffPeakEngine:
             for parameter in decoder.parameters():
                 parameter.requires_grad_(True)
 
+        # A 阶段按设计只更新 SAM mask decoder；细节/条件分支属于 B 阶段。
         for parameter in self.condition_encoder.parameters():
-            parameter.requires_grad_(stage in ("A", "B"))
+            parameter.requires_grad_(stage == "B")
         for parameter in self.unet.parameters():
             parameter.requires_grad_(stage in ("B", "D"))
 
@@ -355,7 +403,7 @@ class DiffPeakEngine:
             decoder = getattr(getattr(self.sam, "sam", None), "mask_decoder", None)
             if decoder is not None:
                 decoder.train()
-        self.condition_encoder.train(stage in ("A", "B"))
+        self.condition_encoder.train(stage == "B")
         # D 的 rollout 与 replay 必须使用同一个 eval U-Net 分布。
         self.unet.train(stage == "B")
         if self.ref_unet is not None:
@@ -400,25 +448,54 @@ class DiffPeakEngine:
         )
 
         total_steps = max(1, int(epochs) * max(1, int(steps_per_epoch)))
-        warmup_steps = int(
-            stage_cfg.get("warmup_steps", self.train_cfg.get("warmup_steps", 0)) or 0
+        warmup_steps = resolve_warmup_steps(
+            total_steps,
+            warmup_steps=int(
+                stage_cfg.get(
+                    "warmup_steps", self.train_cfg.get("warmup_steps", 0)
+                )
+                or 0
+            ),
+            warmup_ratio=float(
+                stage_cfg.get(
+                    "warmup_ratio", self.train_cfg.get("warmup_ratio", 0.0)
+                )
+                or 0.0
+            ),
         )
-        warmup_ratio = float(
-            stage_cfg.get("warmup_ratio", self.train_cfg.get("warmup_ratio", 0.0)) or 0.0
+        min_lr_ratio = float(
+            stage_cfg.get(
+                "min_lr_ratio", self.train_cfg.get("min_lr_ratio", 0.0)
+            )
+            or 0.0
         )
-        if warmup_steps <= 0 and warmup_ratio > 0:
-            warmup_steps = int(round(total_steps * warmup_ratio))
+        if not (0.0 <= min_lr_ratio <= 1.0):
+            raise ValueError("min_lr_ratio 必须在 [0, 1] 内")
 
         def lr_lambda(step: int) -> float:
-            step = int(step)
-            if warmup_steps > 0 and step < warmup_steps:
-                return max(1e-8, float(step + 1) / float(warmup_steps))
-            progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-            progress = min(1.0, max(0.0, progress))
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+            # Read restored metadata rather than closing over the new CLI config.
+            return warmup_cosine_factor(
+                step,
+                total_steps=self.scheduler_total_steps,
+                warmup_steps=self.scheduler_warmup_steps,
+                min_lr_ratio=self.scheduler_min_lr_ratio,
+            )
+
+        self.scheduler_total_steps = total_steps
+        self.scheduler_warmup_steps = warmup_steps
+        self.scheduler_min_lr_ratio = min_lr_ratio
 
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer, lr_lambda=lr_lambda
+        )
+        self.scheduler_stage_lr = learning_rate
+        self.scheduler_steps_per_epoch = int(steps_per_epoch)
+        self.scheduler_epochs = int(epochs)
+        self.scheduler_lr_schedule = "cosine"
+        print(
+            f"[{stage}] lr={learning_rate:.3e} total_steps={total_steps} "
+            f"warmup_steps={warmup_steps} min_lr_ratio={min_lr_ratio}",
+            flush=True,
         )
         # 联合动作 log-prob 的梯度较大；D 使用更保守的初始缩放。
         scale_config = self.rl_cfg if stage == "D" else self.train_cfg
@@ -451,7 +528,16 @@ class DiffPeakEngine:
         else:
             self.scheduler.step()
             self.global_step += 1
+            # 注意：点成本预热使用独立的 grpo_groups_processed，不能在这里
+            # 同步到 global_step；常量组安全跳过时 optimizer 不 step，但 D
+            # 组仍然处理过，预热需要按组推进。
         return not skipped
+
+    def _current_lr(self) -> float:
+        """返回当前优化器学习率；尚未构造优化器时返回 NaN。"""
+        if self.optimizer is not None and self.optimizer.param_groups:
+            return float(self.optimizer.param_groups[0]["lr"])
+        return float("nan")
 
     # ------------------------------------------------------------------
     # 批次整理与损失
@@ -548,7 +634,8 @@ class DiffPeakEngine:
             embeddings = encode_images(self.sam, images, valid_sizes)
 
         if stage == "A":
-            _, auxiliary_logits = self.condition_encoder(images, embeddings)
+            # 按设计 A 阶段只训练 SAM mask decoder；条件/细节编码器和辅助头
+            # 属于 B 阶段，这里不做无用 forward，也不把 aux 损失加进来。
             points = get_points(
                 self.peak_extractor,
                 target_heatmaps,
@@ -573,14 +660,10 @@ class DiffPeakEngine:
                     masks.index_select(0, index_tensor),
                     cldice_weight=self.cldice_weight,
                 )
-            auxiliary = auxiliary_loss(auxiliary_logits, masks, skeletons)
-            total = self.aux_weight * auxiliary
-            if segmentation is not None:
-                total = total + segmentation
             return {
-                "loss": total,
+                "loss": segmentation,
                 "seg": segmentation,
-                "aux": auxiliary,
+                "aux": None,
                 "points": float(sum(int(item[1].numel()) for item in points)),
             }
 
@@ -726,14 +809,14 @@ class DiffPeakEngine:
         stats["skipped_groups"] = float(skipped_groups)
         return stats
 
-    def _train_epoch_ddpo(
+    def _train_epoch_grpo(
         self, stage: str, epoch: int, loader: DataLoader
     ) -> Dict[str, float]:
         self._set_train_modes(stage)
         records: List[Dict[str, Any]] = []
         for group_index, batch in enumerate(loader, start=1):
             prepared = self._prepare_batch(batch)
-            record = self._ddpo_group(prepared, epoch)
+            record = self._grpo_group(prepared, epoch)
             records.append(record)
             if group_index % self.log_every == 0:
                 print(
@@ -741,6 +824,14 @@ class DiffPeakEngine:
                     f"reward={record.get('reward')} "
                     f"iou={record.get('iou')} "
                     f"points={record.get('point_count')} "
+                    f"pts+/-={record.get('positive_point_count')}/"
+                    f"{record.get('negative_point_count')} "
+                    f"div={record.get('point_set_diversity')} "
+                    f"active={record.get('active_group_rate')} "
+                    f"inactive={record.get('inactive_group_rate')} "
+                    f"var={record.get('reward_variance')} "
+                    f"cost_scale={record.get('point_cost_scale')} "
+                    f"lr={record.get('lr')} "
                     f"clip_frac={record.get('clip_fraction')}",
                     flush=True,
                 )
@@ -749,15 +840,31 @@ class DiffPeakEngine:
         keys = (
             "reward",
             "reward_std",
+            "reward_variance",
+            "advantage_abs_mean",
+            "active_group_rate",
+            "inactive_group_rate",
+            "invalid_groups",
             "iou",
             "f1",
             "cldice",
             "path",
             "point_count",
-            "ppo",
+            "positive_point_count",
+            "negative_point_count",
+            "point_set_diversity",
+            "unique_point_sets",
+            "point_set_identical_ratio",
+            "point_cost_scale",
+            "point_cost",
+            "lr",
+            "grpo",
             "kl",
             "anchor",
+            "logratio_abs_mean",
+            "logratio_abs_max",
             "clip_fraction",
+            "policy_terms",
         )
         for key in keys:
             values = [
@@ -767,15 +874,110 @@ class DiffPeakEngine:
         stats["optimizer_steps"] = float(
             sum(float(record.get("updates", 0.0)) for record in records)
         )
-        stats["skipped_groups"] = float(
+        stats["skipped_update_steps"] = float(
             sum(float(record.get("skipped_updates", 0.0)) for record in records)
+        )
+        stats["skipped_groups"] = float(
+            sum(float(record.get("updates", 0.0)) == 0.0 for record in records)
         )
         return stats
 
-    def _ddpo_group(self, batch: Mapping[str, Any], epoch: int) -> Dict[str, float]:
-        """采样一组轨迹、计算奖励，并做一次（或 ``update_epochs`` 次）更新。"""
+    def _point_cost_scale(self, groups_processed: Optional[int] = None) -> float:
+        """返回提示成本预热乘子；``1`` 表示已到配置值。
+
+        定义：按**已处理的 D 组数**线性推进。第 1 组使用 ``1/N``，
+        第 ``N`` 组到 ``1`` 后保持（``N = rl.point_cost_warmup_steps``，
+        ``0`` 禁用）。
+        使用独立的组计数器而不是 ``global_step``：整组奖励常量且
+        ``kl_weight=0``、``anchor_weight=0`` 时更新会被安全跳过，
+        ``global_step`` 永不增加；若按它预热，点成本会永远停在 0。
+        AMP 溢出不会提前推进组计数以外的任何状态。
+        """
+        warmup_steps = int(getattr(self, "point_cost_warmup_steps", 0) or 0)
+        if warmup_steps <= 0:
+            return 1.0
+        if groups_processed is None:
+            # 唯一事实来源是独立组计数器；不退回 global_step，避免重新引入
+            # “整组常量时预热永远停在 0”的问题。
+            step = int(getattr(self, "grpo_groups_processed", 0))
+        else:
+            step = int(groups_processed)
+        step = max(0, min(step, warmup_steps))
+        return float(step) / float(warmup_steps)
+
+    def _effective_reward_config(self):
+        """D 阶段的提示成本从 0 线性升到配置值。
+
+        验证始终使用 ``self.reward_config`` 的基准值，避免同一检查点在
+        不同 epoch 的验证协议漂移。
+        """
+        if self._stage != "D" or self.point_cost_warmup_steps <= 0:
+            return self.reward_config
+        return replace(
+            self.reward_config,
+            point_cost=float(self.reward_config.point_cost)
+            * self._point_cost_scale(),
+        )
+
+    @staticmethod
+    def _point_set_signature(points: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[Any, ...]:
+        """返回与点顺序无关的点集签名，用于组内 diversity 诊断。
+
+        坐标取整到 SAM 输入像素；只用于日志，不参与损失。
+        """
+        coords, labels = points
+        coords = coords.detach().cpu().reshape(-1, 2)
+        labels = labels.detach().cpu().reshape(-1)
+        if coords.shape[0] == 0:
+            return ()
+        if labels.numel() != coords.shape[0]:
+            raise ValueError("点集坐标与标签数量不一致")
+        rounded = torch.round(coords).to(torch.long)
+        rows = [
+            (int(labels[index]), int(rounded[index, 0]), int(rounded[index, 1]))
+            for index in range(rounded.shape[0])
+        ]
+        return tuple(sorted(rows))
+
+    @staticmethod
+    def _payload_algorithm_name(payload: Mapping[str, Any]) -> str:
+        algorithm = payload.get("algorithm")
+        if isinstance(algorithm, Mapping):
+            return str(algorithm.get("name", "")).strip().lower()
+        return str(algorithm or "").strip().lower()
+
+    def _validate_resume_algorithm(self, payload: Mapping[str, Any]) -> None:
+        """拒绝把旧 DDPO 的 optimizer/scheduler 状态直接接入 GRPO。
+
+        ``--init`` 只加载权重，不经过这里，因此旧 DDPO 快照仍可作为初始化。
+        """
+        stage = str(payload.get("stage", "")).upper()
+        if stage != "D":
+            return
+        version = int(payload.get("format_version", 1) or 1)
+        name = self._payload_algorithm_name(payload)
+        if name != "grpo" or version < 2:
+            raise ValueError(
+                "检测到旧 DDPO 阶段的 checkpoint：不能直接 --resume 到 GRPO "
+                "（优化器、调度器和旧策略状态语义不同）。请改用 --init 只加载"
+                "模型权重，然后从阶段 D 的第 0 个 epoch 重新开始。"
+            )
+
+    @staticmethod
+    def _active_group_mask(reward_tensor: torch.Tensor) -> torch.Tensor:
+        """标记有策略信号的组：只有奖励**完全常量**的组才跳过。
+
+        不能把 ``std <= delta`` 的组判为无效；``delta`` 只限制优势分母，
+        非零低方差组仍应以缩放后的优势参与更新。
+        """
+        if reward_tensor.ndim != 2:
+            raise ValueError("reward_tensor 必须是 [G, B]")
+        return reward_tensor.amax(dim=0) > reward_tensor.amin(dim=0)
+
+    def _grpo_group(self, batch: Mapping[str, Any], epoch: int) -> Dict[str, float]:
+        """采样一组轨迹、计算 GRPO 优势，并做一次（或多次）更新。"""
         if self.group_size < 2:
-            raise ValueError("D 阶段要求 rl.group_size >= 2 才能做 leave-one-out")
+            raise ValueError("D 阶段要求 rl.group_size >= 2 才能做组内相对优势")
         if self.ref_unet is None:
             raise RuntimeError("D 阶段缺少冻结参考 U-Net")
 
@@ -791,6 +993,16 @@ class DiffPeakEngine:
             conditions_raw, _ = self.condition_encoder(images, embeddings)
             conditions = [item.detach() for item in conditions_raw]
 
+        # 先推进独立组计数，再计算成本乘子：第 1 组为 1/N，第 N 组到
+        # 配置值。即使本组最终没有 optimizer step（常量组且 KL/anchor
+        # 关闭），预热仍会随“处理过的 D 组”前进，不会永远停在 0。
+        self.grpo_groups_processed = int(
+            getattr(self, "grpo_groups_processed", 0)
+        ) + 1
+        point_cost_scale = self._point_cost_scale()
+        reward_config = self._effective_reward_config()
+        effective_point_cost = float(reward_config.point_cost)
+
         targets_np: List[np.ndarray] = []
         for index in range(batch_size):
             valid = valid_sizes[index] or (self.image_size, self.image_size)
@@ -805,6 +1017,7 @@ class DiffPeakEngine:
         rewards: List[List[float]] = []
         trajectories: List[List[Dict[str, Any]]] = []
         metric_rows: List[Dict[str, float]] = []
+        point_signatures: List[List[Tuple[Any, ...]]] = []
 
         for trajectory_index in range(self.group_size):
             generator = make_generator(
@@ -835,45 +1048,122 @@ class DiffPeakEngine:
                 probabilities = torch.sigmoid(logits)
 
                 sample_rewards: List[float] = []
+                trajectory_signatures: List[Tuple[Any, ...]] = []
                 for index in range(batch_size):
                     valid = valid_sizes[index] or (self.image_size, self.image_size)
                     height, width = int(valid[0]), int(valid[1])
                     prediction = (
                         probabilities[index, 0, :height, :width] > self.threshold
                     ).detach().cpu().numpy()
-                    point_count = int(points[index][1].numel())
+                    coords, labels = points[index]
+                    point_count = int(labels.numel())
+                    positive_points = int((labels == 1).sum().item())
+                    negative_points = int((labels == 0).sum().item())
                     metrics = compute_image_metrics(
                         prediction,
                         targets_np[index],
                         point_count,
-                        self.reward_config,
+                        reward_config,
                     )
                     sample_rewards.append(float(metrics["reward"]))
                     metric_rows.append(
-                        {**metrics, "point_count": float(point_count)}
+                        {
+                            **metrics,
+                            "point_count": float(point_count),
+                            "positive_point_count": float(positive_points),
+                            "negative_point_count": float(negative_points),
+                        }
+                    )
+                    trajectory_signatures.append(
+                        self._point_set_signature(points[index])
                     )
                 rewards.append(sample_rewards)
+                point_signatures.append(trajectory_signatures)
                 # trace 已由扩散模块保存在 CPU；这里只保留轨迹。
                 trajectories.append(trace)
             # 显式释放采样图，避免 G 条轨迹的完整计算图/激活驻留。
             del heatmaps, logits, probabilities
 
         reward_tensor = torch.tensor(rewards, dtype=torch.float64)  # [G, B]
-        leave_one_out = (
-            reward_tensor.sum(dim=0, keepdim=True) - reward_tensor
-        ) / float(self.group_size - 1)
-        advantages = reward_tensor - leave_one_out
-        reward_std = float(
-            reward_tensor.std(dim=0, unbiased=False).mean().cpu()
+        # GRPO：同一影像的 G 个候选构成一个组，组内标准化后才作为优势。
+        # 组内奖励完全相同时优势为零，策略项不会用数值噪声放大出虚假信号。
+        advantages = group_relative_advantages(
+            reward_tensor, delta=self.advantage_std_delta
+        )
+        per_image_std = reward_tensor.std(dim=0, unbiased=False)
+        per_image_variance = per_image_std.pow(2)
+        # 只有奖励完全相同的组才真正没有策略信号；低方差组由 delta 限制
+        # 优势幅度，而不是直接跳过。
+        active_groups = self._active_group_mask(reward_tensor)
+        reward_std = float(per_image_std.mean().cpu())
+        reward_variance = float(per_image_variance.mean().cpu())
+        active_group_rate = float(active_groups.double().mean().cpu())
+        inactive_group_rate = 1.0 - active_group_rate
+        invalid_groups = int(batch_size - int(active_groups.sum().item()))
+
+        # 组内点集 diversity：每张图 G 个候选中有多少个不同的点集。
+        # identical_ratio 是“该图所有候选点集完全相同（unique == 1）”
+        # 的图所占比例，不能与 1 - diversity 混为一谈。
+        diversity_values: List[float] = []
+        unique_point_sets: List[float] = []
+        identical_values: List[float] = []
+        for index in range(batch_size):
+            signatures = [
+                point_signatures[trajectory_index][index]
+                for trajectory_index in range(len(point_signatures))
+            ]
+            if signatures:
+                unique_count = len(set(signatures))
+                unique_point_sets.append(float(unique_count))
+                diversity_values.append(
+                    float(unique_count) / float(len(signatures))
+                )
+                identical_values.append(
+                    1.0 if unique_count == 1 else 0.0
+                )
+            else:
+                diversity_values.append(float("nan"))
+                unique_point_sets.append(float("nan"))
+                identical_values.append(float("nan"))
+        point_set_diversity = (
+            _mean_of(diversity_values) if diversity_values else float("nan")
+        )
+        point_set_identical_ratio = (
+            _mean_of(identical_values) if identical_values else float("nan")
         )
 
-        update_stats = self._ddpo_update(
-            conditions, target_heatmaps, trajectories, advantages
+        update_stats = self._grpo_update(
+            conditions,
+            target_heatmaps,
+            trajectories,
+            advantages,
+            active_groups,
         )
 
         merged: Dict[str, float] = dict(update_stats)
         merged["reward_std"] = reward_std
-        for key in ("reward", "iou", "f1", "cldice", "path", "point_count"):
+        merged["reward_variance"] = reward_variance
+        merged["active_group_rate"] = active_group_rate
+        merged["inactive_group_rate"] = inactive_group_rate
+        merged["invalid_groups"] = float(invalid_groups)
+        merged["point_set_diversity"] = point_set_diversity
+        merged["unique_point_sets"] = _mean_of(unique_point_sets)
+        merged["point_set_identical_ratio"] = point_set_identical_ratio
+        merged["advantage_abs_mean"] = float(
+            advantages.abs().mean().cpu()
+        ) if advantages.numel() else float("nan")
+        merged["point_cost_scale"] = point_cost_scale
+        merged["point_cost"] = effective_point_cost
+        for key in (
+            "reward",
+            "iou",
+            "f1",
+            "cldice",
+            "path",
+            "point_count",
+            "positive_point_count",
+            "negative_point_count",
+        ):
             values = [
                 float(row[key])
                 for row in metric_rows
@@ -882,43 +1172,77 @@ class DiffPeakEngine:
             merged[key] = _mean_of(values) if values else float("nan")
         return merged
 
-    def _ddpo_update(
+    def _grpo_update(
         self,
         conditions: Sequence[torch.Tensor],
         target_heatmaps: torch.Tensor,
         trajectories: Sequence[Sequence[Mapping[str, Any]]],
         advantages: torch.Tensor,
+        active_groups: Optional[torch.Tensor] = None,
     ) -> Dict[str, float]:
-        """固定整组轨迹后做 PPO/KL/anchor 更新；每组 step 一次。"""
+        """固定整组轨迹后做 GRPO/KL/anchor 更新；每组 step 一次。"""
         assert self.optimizer is not None and self.scheduler is not None
         assert self.scaler is not None
+
+        def _empty_stats() -> Dict[str, float]:
+            return {
+                "grpo": float("nan"),
+                "kl": float("nan"),
+                "anchor": float("nan"),
+                "clip_fraction": float("nan"),
+                "logratio_abs_mean": float("nan"),
+                "logratio_abs_max": float("nan"),
+                "lr": self._current_lr(),
+                "updates": 0.0,
+                "skipped_updates": 0.0,
+                "policy_terms": 0.0,
+            }
+
         if not trajectories:
-            return {
-                "ppo": float("nan"),
-                "kl": float("nan"),
-                "anchor": float("nan"),
-                "clip_fraction": float("nan"),
-                "updates": 0.0,
-                "skipped_updates": 0.0,
-            }
+            return _empty_stats()
 
-        total_terms = sum(len(trajectory) for trajectory in trajectories)
-        if total_terms <= 0:
-            return {
-                "ppo": float("nan"),
-                "kl": float("nan"),
-                "anchor": float("nan"),
-                "clip_fraction": float("nan"),
-                "updates": 0.0,
-                "skipped_updates": 0.0,
-            }
+        batch_size = int(conditions[0].shape[0])
+        steps_per_trajectory = sum(len(trajectory) for trajectory in trajectories)
+        # 单轮更新分母是 G*T*B；无效组在分子中贡献 0，但仍占用分母。
+        per_epoch_terms = steps_per_trajectory * batch_size
+        # 日志中的 grpo_sum/kl_sum 会累计 update_epochs 轮，最终分母同步乘上
+        # update_epochs，避免同一组多轮更新时诊断值随轮数线性放大。
+        total_terms = per_epoch_terms * max(1, int(self.update_epochs))
+        if per_epoch_terms <= 0:
+            return _empty_stats()
 
-        ppo_values: List[float] = []
-        kl_values: List[float] = []
+        active_mask: Optional[torch.Tensor] = None
+        if active_groups is not None:
+            active_mask = active_groups.detach().to(self.device).reshape(-1).bool()
+            if active_mask.numel() == 1 and batch_size > 1:
+                active_mask = active_mask.expand(batch_size)
+            if active_mask.numel() != batch_size:
+                raise ValueError(
+                    "active_groups 数量与 batch size 不一致："
+                    f"{active_mask.numel()} vs {batch_size}"
+                )
+        has_active_policy = (
+            bool(active_mask.any()) if active_mask is not None else True
+        )
+        has_kl = self.kl_weight > 0
+        has_anchor = self.anchor_weight > 0
+        if not has_active_policy and not has_kl and not has_anchor:
+            # 整组奖励完全相同且没有 KL/锚定项：不构造计算图、不 backward、
+            # 不调用 optimizer.step()，也不消耗 scheduler/global_step。
+            skipped = _empty_stats()
+            skipped["skipped_updates"] = float(self.update_epochs)
+            return skipped
+
+        grpo_sum = 0.0
+        kl_sum = 0.0
         anchor_values: List[float] = []
         clip_values: List[float] = []
+        logratio_abs_sum = 0.0
+        logratio_abs_max = 0.0
+        logratio_count = 0
         update_steps = 0
         skipped_updates = 0
+        policy_terms = 0
         epsilon = float(self.ppo_clip)
 
         for _ in range(self.update_epochs):
@@ -934,86 +1258,154 @@ class DiffPeakEngine:
                 self.scaler.scale(anchor.float()).backward()
                 anchor_values.append(float(anchor.detach().float().cpu()))
 
-            for trajectory_index, trajectory in enumerate(trajectories):
-                advantage = advantages[trajectory_index].to(self.device)
-                for step in trajectory:
-                    # 高维动作统一保持 float32；log_prob 内部再升到 float64。
-                    state = step["state"].to(
-                        self.device, dtype=torch.float32, non_blocking=True
+            # 策略项与 KL 项都依赖 rollout 轨迹；只有锚定时可以完全跳过
+            # 轨迹重放，避免无意义的 backward。
+            if has_active_policy or has_kl:
+                for trajectory_index, trajectory in enumerate(trajectories):
+                    advantage64 = (
+                        advantages[trajectory_index]
+                        .detach()
+                        .to(self.device)
+                        .reshape(-1)
+                        .double()
                     )
-                    action = step["action"].to(
-                        self.device, dtype=torch.float32, non_blocking=True
-                    )
-                    timestep = step["timestep"]
-                    previous_timestep = step["previous_timestep"]
-                    old_log_prob = (
-                        step["old_log_prob"].to(self.device).reshape(-1).double()
-                    )
-
-                    # rollout 与 replay 使用同一 AMP 上下文和同一 eval U-Net。
-                    with self._autocast():
-                        mean, std = self.diffusion.transition(
-                            self.unet,
-                            state,
-                            timestep,
-                            previous_timestep,
-                            conditions,
+                    if advantage64.numel() != batch_size:
+                        raise ValueError(
+                            "优势数量与 batch size 不一致："
+                            f"{advantage64.numel()} vs {batch_size}"
                         )
-                        new_log_prob = self.diffusion.log_prob(action, mean, std)
-
-                    # 全维 SUM log-prob 的差值在 float64 中计算。
-                    new_log_prob = new_log_prob.reshape(-1).double()
-                    if old_log_prob.numel() == 1 and new_log_prob.numel() > 1:
-                        old_log_prob = old_log_prob.expand_as(new_log_prob)
-                    log_ratio = torch.clamp(
-                        new_log_prob - old_log_prob, min=-20.0, max=20.0
+                    sample_active = (
+                        active_mask
+                        if active_mask is not None
+                        else torch.ones(batch_size, dtype=torch.bool, device=self.device)
                     )
-                    ratio = torch.exp(log_ratio)
-                    clipped = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon)
-                    clipped_mask = (ratio < 1.0 - epsilon) | (ratio > 1.0 + epsilon)
-                    clip_values.append(float(clipped_mask.double().mean().cpu()))
-                    advantage64 = advantage.reshape(-1).double()
-                    ppo_loss = -torch.minimum(
-                        ratio * advantage64, clipped * advantage64
-                    ).mean()
+                    active_float = sample_active.to(torch.float64)
+                    active_count = int(sample_active.sum().item())
+                    if active_count > 0:
+                        # 记录真正参与策略项的 sample-step 数；分母仍然是
+                        # G*T*B，不能用这个数替换。
+                        policy_terms += len(trajectory) * active_count
+                    # 常量组优势为 0；显式置零，避免 ratio*0 仍产生浮点噪声。
+                    advantage64 = advantage64 * active_float
 
-                    kl_value = torch.zeros((), dtype=torch.float64, device=self.device)
-                    if self.kl_weight > 0:
-                        with torch.no_grad(), self._autocast():
-                            reference_mean, _ = self.diffusion.transition(
-                                self.ref_unet,
+                    for step in trajectory:
+                        # 高维动作统一保持 float32；log_prob 内部再升到 float64。
+                        state = step["state"].to(
+                            self.device, dtype=torch.float32, non_blocking=True
+                        )
+                        action = step["action"].to(
+                            self.device, dtype=torch.float32, non_blocking=True
+                        )
+                        timestep = step["timestep"]
+                        previous_timestep = step["previous_timestep"]
+                        old_log_prob = (
+                            step["old_log_prob"].to(self.device).reshape(-1).double()
+                        )
+
+                        # rollout 与 replay 使用同一 AMP 上下文和同一 eval U-Net。
+                        with self._autocast():
+                            mean, std = self.diffusion.transition(
+                                self.unet,
                                 state,
                                 timestep,
                                 previous_timestep,
                                 conditions,
                             )
-                        delta = (
-                            mean.double() - reference_mean.double()
-                        ) / std.double().clamp_min(1e-12)
-                        # 同方差高斯 KL = 0.5 * sum((mu - mu_ref)^2 / sigma^2)。
-                        kl_value = 0.5 * delta.reshape(
-                            delta.shape[0], -1
-                        ).pow(2).sum(dim=1).mean()
-                        kl_values.append(float(kl_value.detach().cpu()))
+                            new_log_prob = self.diffusion.log_prob(action, mean, std)
 
-                    loss = (ppo_loss + self.kl_weight * kl_value) / float(total_terms)
-                    self.scaler.scale(loss.float()).backward()
-                    ppo_values.append(float(ppo_loss.detach().cpu()))
+                        # 全维 SUM log-prob 的差值在 float64 中计算。
+                        new_log_prob = new_log_prob.reshape(-1).double()
+                        if old_log_prob.numel() == 1 and new_log_prob.numel() > 1:
+                            old_log_prob = old_log_prob.expand_as(new_log_prob)
+                        if old_log_prob.numel() != new_log_prob.numel():
+                            raise ValueError(
+                                "old/new log-prob 形状不一致："
+                                f"{old_log_prob.numel()} vs {new_log_prob.numel()}"
+                            )
+                        raw_log_ratio = new_log_prob - old_log_prob
+                        log_ratio = torch.clamp(raw_log_ratio, min=-20.0, max=20.0)
+                        ratio = torch.exp(log_ratio)
+                        clipped_mask = (
+                            (ratio < 1.0 - epsilon)
+                            | (ratio > 1.0 + epsilon)
+                        )
 
-                    del state, action, mean, std, new_log_prob, log_ratio, ratio
+                        if active_count > 0:
+                            selected_clip = clipped_mask[sample_active]
+                            clip_values.append(
+                                float(selected_clip.double().mean().cpu())
+                            )
+                            selected_abs = raw_log_ratio.detach().abs()[sample_active]
+                            logratio_abs_sum += float(selected_abs.sum().cpu())
+                            logratio_abs_max = max(
+                                logratio_abs_max,
+                                float(selected_abs.max().cpu()),
+                            )
+                            logratio_count += active_count
+
+                        # grpo_policy_loss 对传入的 B 个样本取平均；乘回
+                        # batch_size 得到分子求和，再统一除以 G*T*B。
+                        grpo_loss = grpo_policy_loss(
+                            ratio, advantage64, epsilon
+                        )
+                        grpo_sum += float(grpo_loss.detach().cpu()) * batch_size
+
+                        kl_element = torch.zeros(
+                            (), dtype=torch.float64, device=self.device
+                        )
+                        if has_kl:
+                            with torch.no_grad(), self._autocast():
+                                reference_mean, _ = self.diffusion.transition(
+                                    self.ref_unet,
+                                    state,
+                                    timestep,
+                                    previous_timestep,
+                                    conditions,
+                                )
+                            # 同方差高斯 KL = 0.5 * sum((mu - mu_ref)^2 / sigma^2)。
+                            kl_element = gaussian_kl_divergence(
+                                mean, reference_mean, std
+                            )
+                            kl_sum += float(kl_element.detach().sum().cpu())
+
+                        loss = (
+                            grpo_loss * batch_size
+                            + self.kl_weight * kl_element.sum()
+                        ) / float(per_epoch_terms)
+                        self.scaler.scale(loss.float()).backward()
+
+                        del state, action, mean, std, new_log_prob, log_ratio, ratio
 
             if self._optimizer_step():
                 update_steps += 1
             else:
                 skipped_updates += 1
 
+        grpo_value = (
+            grpo_sum / float(total_terms)
+            if policy_terms > 0
+            else float("nan")
+        )
+        kl_value = (
+            kl_sum / float(total_terms) if has_kl else float("nan")
+        )
         return {
-            "ppo": _mean_of(ppo_values),
-            "kl": _mean_of(kl_values),
+            "grpo": grpo_value,
+            "kl": kl_value,
             "anchor": _mean_of(anchor_values),
             "clip_fraction": _mean_of(clip_values),
+            "logratio_abs_mean": (
+                logratio_abs_sum / float(logratio_count)
+                if logratio_count > 0
+                else float("nan")
+            ),
+            "logratio_abs_max": (
+                logratio_abs_max if logratio_count > 0 else float("nan")
+            ),
+            "lr": self._current_lr(),
             "updates": float(update_steps),
             "skipped_updates": float(skipped_updates),
+            "policy_terms": float(policy_terms),
         }
 
     # ------------------------------------------------------------------
@@ -1155,6 +1547,7 @@ class DiffPeakEngine:
         self._build_optimizer(stage, epochs, steps_per_epoch)
         self.best_metric = None
         self.global_step = 0
+        self.grpo_groups_processed = 0
 
     def run_stage(
         self,
@@ -1186,7 +1579,14 @@ class DiffPeakEngine:
         # run_stage 自身负责恢复模型权重，不能依赖 CLI 预加载；
         # D 阶段的 ref_unet 也在这里严格恢复。
         if resume_payload is not None:
-            self.load_models_from_payload(resume_payload, include_ref=True)
+            # 先检查算法归属：旧 DDPO 的 D 阶段快照即使带有 ref_unet，也不能
+            # 把其 optimizer/scheduler 状态直接接到 GRPO。
+            self._validate_resume_algorithm(resume_payload)
+            self.load_models_from_payload(
+                resume_payload,
+                include_ref=True,
+                allow_missing_ref=stage != "D",
+            )
             # 权重已装入模块；释放快照中的大块模型 state_dict，避免整个
             # 阶段训练期间多保留一份 CPU 权重。优化器/RNG 等仍在 payload 中。
             if isinstance(resume_payload, dict):
@@ -1205,7 +1605,7 @@ class DiffPeakEngine:
             self._epoch = epoch
             train_loader = self._build_train_loader(epoch)
             if stage == "D":
-                train_stats = self._train_epoch_ddpo(stage, epoch, train_loader)
+                train_stats = self._train_epoch_grpo(stage, epoch, train_loader)
             else:
                 train_stats = self._train_epoch_supervised(stage, epoch, train_loader)
             del train_loader
@@ -1360,7 +1760,35 @@ class DiffPeakEngine:
         self, stage: str, epoch: int, best_metric: Optional[float]
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
-            "format_version": 1,
+            # v2：显式记录 RL 算法，旧 DDPO D 阶段快照不能直接 --resume。
+            "format_version": 2,
+            "algorithm": {
+                "name": self.rl_algorithm,
+                "version": 2,
+                "group_size": int(self.group_size),
+                "advantage_std_delta": float(self.advantage_std_delta),
+                "ppo_clip": float(self.ppo_clip),
+                "kl_weight": float(self.kl_weight),
+                "anchor_weight": float(self.anchor_weight),
+                "update_epochs": int(self.update_epochs),
+                "point_cost_warmup_steps": int(self.point_cost_warmup_steps),
+                "grpo_groups_processed": int(
+                    getattr(self, "grpo_groups_processed", 0)
+                ),
+                "reward_point_cost": float(
+                    getattr(self.reward_config, "point_cost", 0.0)
+                ),
+            },
+            "schedule": {
+                "name": "warmup_cosine",
+                "stage": stage,
+                "learning_rate": float(self.scheduler_stage_lr),
+                "total_steps": int(self.scheduler_total_steps),
+                "warmup_steps": int(self.scheduler_warmup_steps),
+                "min_lr_ratio": float(self.scheduler_min_lr_ratio),
+                "steps_per_epoch": int(self.scheduler_steps_per_epoch),
+                "epochs": int(self.scheduler_epochs),
+            },
             "config": self._resolved_config(),
             "stage": stage,
             "epoch": int(epoch),
@@ -1430,6 +1858,7 @@ class DiffPeakEngine:
         os.replace(temporary, path)
 
     def _restore_resume(self, payload: Mapping[str, Any]) -> None:
+        self._validate_resume_algorithm(payload)
         payload_stage = str(payload.get("stage", self._stage)).upper()
         if self._stage is not None and payload_stage != self._stage:
             raise ValueError(
@@ -1446,6 +1875,65 @@ class DiffPeakEngine:
         self.optimizer.load_state_dict(payload["optimizer"])
         self.scheduler.load_state_dict(payload["scheduler"])
         self.scaler.load_state_dict(payload["scaler"])
+
+        # 算法超参与 warmup/cosine 配置随 checkpoint 恢复；旧快照没有这些
+        # 字段时保持当前配置。匹配完整 config 时值相同，这里主要是让日志
+        # 与后续 checkpoint 明确反映训练时的实际协议。
+        algorithm = payload.get("algorithm")
+        if isinstance(algorithm, Mapping):
+            self.group_size = int(algorithm.get("group_size", self.group_size))
+            self.advantage_std_delta = float(
+                algorithm.get("advantage_std_delta", self.advantage_std_delta)
+            )
+            self.ppo_clip = float(algorithm.get("ppo_clip", self.ppo_clip))
+            self.kl_weight = float(algorithm.get("kl_weight", self.kl_weight))
+            self.anchor_weight = float(
+                algorithm.get("anchor_weight", self.anchor_weight)
+            )
+            self.update_epochs = max(
+                1, int(algorithm.get("update_epochs", self.update_epochs))
+            )
+            self.point_cost_warmup_steps = max(
+                0,
+                int(
+                    algorithm.get(
+                        "point_cost_warmup_steps",
+                        self.point_cost_warmup_steps,
+                    )
+                ),
+            )
+            self.grpo_groups_processed = max(
+                0,
+                int(
+                    algorithm.get(
+                        "grpo_groups_processed",
+                        self.grpo_groups_processed,
+                    )
+                ),
+            )
+        schedule = payload.get("schedule")
+        if isinstance(schedule, Mapping):
+            self.scheduler_stage_lr = float(
+                schedule.get("learning_rate", self.scheduler_stage_lr)
+            )
+            self.scheduler_total_steps = int(
+                schedule.get("total_steps", self.scheduler_total_steps)
+            )
+            self.scheduler_warmup_steps = int(
+                schedule.get("warmup_steps", self.scheduler_warmup_steps)
+            )
+            self.scheduler_min_lr_ratio = float(
+                schedule.get("min_lr_ratio", self.scheduler_min_lr_ratio)
+            )
+            self.scheduler_steps_per_epoch = int(
+                schedule.get("steps_per_epoch", self.scheduler_steps_per_epoch)
+            )
+            self.scheduler_epochs = int(
+                schedule.get("epochs", self.scheduler_epochs)
+            )
+            self.scheduler_lr_schedule = str(
+                schedule.get("name", self.scheduler_lr_schedule)
+            )
 
         self.global_step = int(payload.get("global_step", 0))
         self.best_metric = payload.get("best_metric")
@@ -1465,8 +1953,14 @@ class DiffPeakEngine:
         payload: Mapping[str, Any],
         *,
         include_ref: bool = True,
+        allow_missing_ref: bool = True,
     ) -> Dict[str, Any]:
-        """严格加载模型权重；D 快照必须同时包含参考 U-Net。"""
+        """严格加载模型权重。
+
+        ``allow_missing_ref=True`` 时，D 快照缺少 ``ref_unet`` 也可只做
+        ``--init``；真正的 ``--resume`` 由 :meth:`run_stage` 传 ``False``，
+        以保持参考策略的严格恢复。
+        """
         report = load_checkpoint_models(
             self.models, payload, include_ref=False
         )
@@ -1479,14 +1973,20 @@ class DiffPeakEngine:
             self.ref_unet = self.ref_unet.to(self.device).eval()
             for parameter in self.ref_unet.parameters():
                 parameter.requires_grad_(False)
-        elif include_ref and payload_stage == "D":
+        elif include_ref and payload_stage == "D" and not allow_missing_ref:
             raise ValueError("D 阶段 checkpoint 缺少 ref_unet，不能恢复 KL 参考策略")
         return report
 
     def load_init_weights(self, path: Union[str, Path]) -> Mapping[str, Any]:
-        """``--init``：只加载模型权重，不恢复优化器/epoch/RNG。"""
+        """``--init``：只加载模型权重，不恢复优化器/epoch/RNG。
+
+        快照含 ref_unet 时保留该冻结参考；缺失时允许只初始化当前策略，
+        随后由 ``_prepare_stage`` 从当前 U-Net 建立新的冻结参考模型。
+        """
         payload = read_checkpoint(path)
-        report = self.load_models_from_payload(payload, include_ref=True)
+        report = self.load_models_from_payload(
+            payload, include_ref=True, allow_missing_ref=True
+        )
         print(f"已从 {path} 初始化模型权重（不含优化器状态）", flush=True)
         return report
 

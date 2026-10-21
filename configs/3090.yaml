@@ -50,20 +50,44 @@ train:
   aux_weight: 0.2
   cldice_weight: 0.2
   save_every: 1
+  # 线性 warmup + cosine 退火。warmup_steps > 0 时优先；
+  # 否则按 warmup_ratio * 当前阶段总更新步数计算，两者均为 0 时关闭预热。
+  # 全局起点：warmup_ratio=0.05、min_lr_ratio=0.05；D 阶段单独覆盖为 0.1/0.1。
+  warmup_steps: 0
+  warmup_ratio: 0.05
+  min_lr_ratio: 0.05
 
 stages:
+  # A：只训练 SAM mask decoder，使用真实目标热图提取的提示。
   A: {epochs: 15, lr: 0.0001}
+  # B：训练条件编码器与去噪 U-Net（扩散 MSE + 热图重建 + 辅助）。
   B: {epochs: 60, lr: 0.0001}
+  # C：只训练 SAM mask decoder，提示来自冻结扩散模型。
   C: {epochs: 10, lr: 0.00005}
-  D: {epochs: 10, lr: 0.000003}
+  # D：只训练扩散 U-Net。组更新稀疏，使用 1e-6 小学习率；
+  # 预热与退火终点均覆盖为 0.1，避免策略早期被压死。
+  D: {epochs: 10, lr: 0.000001, warmup_ratio: 0.1, min_lr_ratio: 0.1}
 
 rl:
+  # 当前只实现 GRPO；显式写入算法名，避免旧 DDPO 配置被误读为新协议。
+  algorithm: grpo
+  # 每张影像采样 G 条轨迹，同图组内标准化优势；G 必须 >= 2。
   group_size: 4
   # 高维动作使用联合 log-prob 的 sum，不用 mean 偷换目标。
+  # 键名沿用 ppo_clip 以兼容旧配置；语义是 GRPO 裁剪半径 epsilon。
   ppo_clip: 0.0001
   kl_weight: 0.01
-  anchor_weight: 0.1
+  # 建议默认 0.0：参考 GRPO 设计不含监督锚定项。
+  # 设为非零时是可选监督锚定，对目标热图额外加扩散 MSE。
+  anchor_weight: 0.0
   update_epochs: 1
+  # 组内奖励标准差下限，只作为优势分母的 clamp；
+  # 非零低方差组仍参与学习，只有奖励完全相同的组优势为零。
+  advantage_std_delta: 0.0001
+  # 策略点成本按已处理的 D 组数线性升到 reward.point_cost（第 1 组为 1/N）；
+  # 0 表示禁用预热。组内奖励完全常量、没有实际 backward 的组也会推进，
+  # 避免预热永远停在 0；验证始终使用未预热的基准成本。
+  point_cost_warmup_steps: 100
   amp_init_scale: 64.0
 
 reward:

@@ -28,8 +28,9 @@
    ``path_match_radius`` 控制，并保证同一次匹配中目标点不被复用；
 4. 用 Dijkstra 测地距离作为路径长度代理，按
    ``max(0, 1 - |d_pred - d_target| / (d_target + eps))`` 计分；
-5. 双向计算（target→prediction、prediction→target），对所有有效的方向与
-   采样对取平均。无任何有效路径对时，路径项无效，剩余质量权重重新归一化。
+5. 双向计算（target→prediction、prediction→target），对请求的采样对取平均；
+   端点无法匹配或对应路径断开时按零分计入。无法请求任何采样对时，路径项
+   无效，剩余质量权重重新归一化。
 
 该路径项只是**抽样代理奖励**，不是正式 APLS。它衡量的是“标注所表达的
 道路连通性”，不能区分立交跨越与平面交叉；论文/最终评估中的 APLS 仍应
@@ -598,7 +599,7 @@ def compute_reward(
 
     * 路径项有效时：按 ``iou_weight``、``cldice_weight``、``path_weight``
       直接加权；
-    * 路径项未启用或没有有效路径对时：把剩余的 ``iou_weight`` 与
+    * 路径项未启用或没有可请求的采样对时：把剩余的 ``iou_weight`` 与
       ``cldice_weight`` 归一到总和 1（默认配置下原本就是 1），避免因为
       路径项缺失而整体缩小质量奖励；
     * 提示成本始终扣除。

@@ -11,7 +11,7 @@
     # 恢复某阶段中断前的 last.pt（不传 --config 时使用 checkpoint 内配置）
     python train.py --resume runs/diffpeak/last.pt
 
-    # 显式用新配置覆盖训练时的配置
+    # 显式修改路径等配置；resume 的优化器及学习率曲线仍以 checkpoint 为准
     python train.py --config configs/3090.yaml --resume runs/diffpeak/last.pt
 
 ``--resume`` 恢复模型、优化器、GradScaler、学习率调度、epoch 与 RNG；
@@ -126,6 +126,8 @@ def main() -> None:
             resume_payload = engine.read_checkpoint(args.resume)
         if not isinstance(resume_payload, dict):
             raise ValueError("--resume 必须指向本项目生成的完整训练快照")
+        # Also validate already-completed stages, which bypass run_stage below.
+        engine._validate_resume_algorithm(resume_payload)
         # run_stage 自身会严格加载模型权重（含 D 的 ref_unet）；
         # 这里不要预加载或删除 payload.models，避免重复加载/破坏严格恢复。
         resume_stage = str(resume_payload.get("stage", "")).upper()

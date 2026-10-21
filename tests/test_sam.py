@@ -109,6 +109,16 @@ class RoadSAMPointHandlingTest(unittest.TestCase):
 
 
 class RoadSAMValidSizesTest(unittest.TestCase):
+    def test_per_sample_none_means_full_image(self) -> None:
+        self.assertEqual(
+            RoadSAM._normalise_valid_sizes([None, (512, 1024)], 2, image_size=1024),
+            [(1024, 1024), (512, 1024)],
+        )
+        self.assertEqual(
+            RoadSAM._normalise_valid_sizes([None], 1, image_size=64),
+            [(64, 64)],
+        )
+
     def test_accepts_single_pair_and_per_sample_sequence(self) -> None:
         single = RoadSAM._normalise_valid_sizes((512, 1024), 1, image_size=1024)
         batch = RoadSAM._normalise_valid_sizes(

@@ -128,6 +128,9 @@ class RoadSAM(nn.Module):
 
         normalised: List[Tuple[int, int]] = []
         for item in items:
+            if item is None:
+                normalised.append((image_size, image_size))
+                continue
             if isinstance(item, Tensor):
                 item = item.detach().cpu().tolist()
             if not _is_size_pair(item):

@@ -82,17 +82,27 @@ class PeakExtractorTest(unittest.TestCase):
         # 平顶列为 10..13，中心 11.5；两个最近点中按 (y, x) 取 x=11。
         self.assertEqual(first[0].tolist(), [[11.0, 10.0]])
 
-    def test_same_coordinate_tie_prefers_positive(self) -> None:
+    def test_same_coordinate_tie_removes_both(self) -> None:
         heatmaps = np.zeros((1, 2, 16, 16), dtype=np.float32)
         heatmaps[0, 0, 8, 8] = 0.8
         heatmaps[0, 1, 8, 8] = 0.8
+        heatmaps[0, 0, 3, 3] = 1.0
         extractor = PeakExtractor(_DETERMINISTIC_CONFIG)
 
         coords, labels = extractor(heatmaps, image_size=16)[0]
 
         self.assertEqual(tuple(coords.shape), (1, 2))
         self.assertEqual(labels.tolist(), [1])
-        self.assertEqual(coords.tolist(), [[8.0, 8.0]])
+        self.assertEqual(coords.tolist(), [[3.0, 3.0]])
+
+    def test_same_coordinate_tie_can_leave_no_prompts(self) -> None:
+        heatmaps = np.zeros((1, 2, 16, 16), dtype=np.float32)
+        heatmaps[0, :, 8, 8] = 0.8
+        coords, labels = PeakExtractor(_DETERMINISTIC_CONFIG)(
+            heatmaps, image_size=16
+        )[0]
+        self.assertEqual(tuple(coords.shape), (0, 2))
+        self.assertEqual(labels.numel(), 0)
 
     def test_same_coordinate_higher_score_wins(self) -> None:
         heatmaps = np.zeros((1, 2, 16, 16), dtype=np.float32)
@@ -207,6 +217,30 @@ class TargetRecoveryTest(unittest.TestCase):
         self.assertEqual(report["positive"]["matched"], 1)
         self.assertEqual(report["negative"]["matched"], 1)
         self.assertEqual(report["empty_sample_count"], 0)
+
+    def test_final_transition_noise_preserves_isolated_target_peaks(self) -> None:
+        from diffpeak.models.diffusion import GaussianDiffusion
+
+        class ZeroNoise(torch.nn.Module):
+            def forward(self, state, timestep, conditions):
+                return torch.zeros_like(state)
+
+        heatmaps = self._render(np.array([[7.0, 13.0]]), np.array([[20.0, 6.0]]))
+        diffusion = GaussianDiffusion(timesteps=8, sampling_steps=2, min_std=0.02)
+        state = diffusion.alphas_cumprod[0].sqrt() * (2 * heatmaps - 1)
+        mean, std = diffusion.transition(ZeroNoise(), state, 0, -1, [state] * 4)
+        for seed in range(8):
+            with self.subTest(seed=seed):
+                noise = torch.randn(state.shape, generator=torch.Generator().manual_seed(seed))
+                sampled = ((mean + std * noise + 1) / 2).clamp(0, 1)
+                report = target_recovery_report(
+                    sampled,
+                    expected_coords=np.array([[13.0, 7.0], [6.0, 20.0]]),
+                    expected_labels=np.array([1, 0]),
+                    image_size=32,
+                )
+                self.assertTrue(report["recovered"])
+                self.assertEqual(report["extra"], 0)
 
     def test_zero_target_heatmap_is_correctly_empty(self) -> None:
         heatmaps = torch.zeros(1, 2, self.heatmap_size, self.heatmap_size)

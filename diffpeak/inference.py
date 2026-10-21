@@ -119,8 +119,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "aux_weight": 0.2,
         "cldice_weight": 0.2,
         "save_every": 1,
+        # 线性 warmup + cosine 退火；显式 warmup_steps 优先于 warmup_ratio。
         "warmup_steps": 0,
-        "warmup_ratio": 0.0,
+        "warmup_ratio": 0.05,
+        "min_lr_ratio": 0.05,
         "log_every": 10,
         "val_every": 1,
         "val_limit": None,
@@ -130,14 +132,31 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "A": {"epochs": 15, "lr": 0.0001},
         "B": {"epochs": 60, "lr": 0.0001},
         "C": {"epochs": 10, "lr": 0.00005},
-        "D": {"epochs": 10, "lr": 0.000003},
+        # D 只训练扩散 U-Net；更小的学习率与更高预热/退火终点见 README。
+        "D": {
+            "epochs": 10,
+            "lr": 0.000001,
+            "warmup_ratio": 0.1,
+            "min_lr_ratio": 0.1,
+        },
     },
     "rl": {
+        # 当前只实现 GRPO；显式算法名便于拒绝旧 DDPO 配置。
+        "algorithm": "grpo",
         "group_size": 4,
+        # 沿用 ppo_clip 键名以兼容旧配置；语义是 GRPO 的裁剪半径 epsilon。
         "ppo_clip": 0.0001,
         "kl_weight": 0.01,
-        "anchor_weight": 0.1,
+        # 建议 0.0；非零时是可选监督锚定（目标热图上的扩散 MSE）。
+        "anchor_weight": 0.0,
         "update_epochs": 1,
+        # 组内奖励标准差下限，只用于优势分母 clamp；
+        # 非零低方差组仍参与学习，奖励完全相同的组优势为零。
+        "advantage_std_delta": 0.0001,
+        # 策略点成本在前 N 个已处理 D 组内线性预热；0 表示禁用。
+        "point_cost_warmup_steps": 100,
+        # 高维联合 log-prob 的策略梯度较大，D 使用更保守的 AMP 初始 scale。
+        "amp_init_scale": 64.0,
     },
     "reward": {
         "iou_weight": 0.6,
@@ -1320,7 +1339,11 @@ class Predictor:
         """从文件读取影像并推理；不会读取同名掩码。"""
         path = Path(path)
         image = load_image_file(path)
-        identifier = str(image_id) if image_id is not None else path.stem
+        # 与训练验证/evaluate 使用同一 canonical id，避免 ``scene_sat.jpg``
+        # 和 ``scene.jpg`` 得到不同扩散种子。
+        identifier = (
+            str(image_id) if image_id is not None else canonical_image_id(path.stem)
+        )
         result = self.predict_array(
             image,
             image_id=identifier,

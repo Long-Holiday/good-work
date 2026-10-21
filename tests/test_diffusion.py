@@ -3,7 +3,7 @@
 关键设计约束：
 * 任意转移（包括末步)的高斯 std 都大于零（由 min_std 保证）；
 * ``log_prob`` 对所有动作维度求 **sum**，而不是 mean；
-* 采样记录中的 old_log_prob 必须有限，可直接用于 DDPO 比值。
+* 采样记录中的 old_log_prob 必须有限，可直接用于 GRPO 比值。
 """
 
 from __future__ import annotations
@@ -40,6 +40,17 @@ class GaussianDiffusionTransitionTest(unittest.TestCase):
         )
         self.unet = _ZeroUNet()
         self.conditions = [torch.zeros(2, 4, 8, 8) for _ in range(4)]
+
+    def test_invalid_policy_variance_and_schedule_are_rejected(self) -> None:
+        for std in (0.0, -0.02, float("nan"), float("inf")):
+            with self.subTest(min_std=std), self.assertRaises(ValueError):
+                GaussianDiffusion(min_std=std)
+        for eta in (-1.0, 1.1, float("nan"), float("inf")):
+            with self.subTest(eta=eta), self.assertRaises(ValueError):
+                GaussianDiffusion(eta=eta)
+        for start, end in ((0.0, 0.02), (0.1, 0.01), (0.01, 1.0), (float("nan"), 0.02)):
+            with self.subTest(beta=(start, end)), self.assertRaises(ValueError):
+                GaussianDiffusion(beta_start=start, beta_end=end)
 
     def test_sampling_schedule_is_descending(self) -> None:
         schedule = self.diffusion.sampling_schedule.tolist()

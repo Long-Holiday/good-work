@@ -2,7 +2,7 @@
 
 该模块同时服务于：
 - 扩散预训练：``training_losses`` 返回扩散损失与热图重建损失；
-- DDPO 采样与重算：``sample`` 记录每步状态、动作和旧策略对数概率，
+- GRPO 采样与重算：``sample`` 记录每步状态、动作和旧策略对数概率，
   ``transition`` / ``log_prob`` 用于更新时重新计算概率。
 
 热图映射只使用固定仿射变换 ``z0 = 2H - 1`` 与 ``H = clip((z0 + 1) / 2)``，
@@ -28,7 +28,7 @@ class GaussianDiffusion(nn.Module):
         timesteps: 训练时使用的扩散步数，默认 1000。
         sampling_steps: 推理/采样时的 DDIM 步数，默认 20。
         min_std: 每个转移（含末步）的高斯标准差下限，默认 0.02。
-            该下限保证 DDPO 中对任意一步都能计算非退化的高斯对数概率；
+            该下限保证 GRPO 中对任意一步都能计算非退化的高斯对数概率；
             它是对策略分布的独立扰动，不改变 DDIM 均值中的系数。
         beta_start: 线性 beta 调度起点。
         beta_end: 线性 beta 调度终点。
@@ -62,8 +62,12 @@ class GaussianDiffusion(nn.Module):
             raise ValueError("timesteps 必须为正")
         if sampling_steps <= 0 or sampling_steps > timesteps:
             raise ValueError("sampling_steps 必须在 [1, timesteps] 内")
-        if min_std <= 0:
-            raise ValueError("min_std 必须为正，以保证转移方差非零")
+        if not math.isfinite(min_std) or min_std <= 0:
+            raise ValueError("min_std 必须为正有限数，以保证转移方差非零")
+        if not math.isfinite(eta) or not 0.0 <= eta <= 1.0:
+            raise ValueError("eta 必须是 [0, 1] 内的有限数")
+        if not (0.0 < beta_start <= beta_end < 1.0):
+            raise ValueError("beta 必须满足 0 < beta_start <= beta_end < 1")
 
         self.timesteps = int(timesteps)
         self.sampling_steps = int(sampling_steps)
@@ -270,7 +274,7 @@ class GaussianDiffusion(nn.Module):
             其中 ``sigma`` 是 eta 给出的**名义** DDIM 标准差，而不是被
             ``min_std`` 抬高后的值。末步 ``previous_timestep=-1`` 时
             ``alpha_prev=1``、名义 ``sigma=0``，均值退化为 ``x0``；此时
-            ``min_std`` 提供的额外噪声是 DDPO 的策略探索扰动，不属于
+            ``min_std`` 提供的额外噪声是 GRPO 的策略探索扰动，不属于
             DDIM 边缘分布。其余步若名义 ``sigma < min_std`` 同理。
         """
         if state.ndim != 4:
@@ -344,7 +348,7 @@ class GaussianDiffusion(nn.Module):
             unet: 条件 U-Net。
             conditions: 四个尺度的条件特征。
             generator: 可选随机数生成器；允许 CPU 生成器配合 GPU 条件。
-            record: 是否记录每步的 DDPO 轨迹信息。
+            record: 是否记录每步的 GRPO 轨迹信息。
 
         Returns:
             ``record=False`` 时返回 ``B x 2 x 256 x 256`` 热图；
@@ -354,7 +358,7 @@ class GaussianDiffusion(nn.Module):
 
             采样从 ``timesteps-1`` 开始，最后一步的 ``previous_timestep`` 为
             ``-1``，因此返回的热图对应 ``alpha_bar=1`` 的干净端点；末步仍会
-            加入 ``min_std`` 的策略探索噪声，符合 DDPO 的非零方差要求。
+            加入 ``min_std`` 的策略探索噪声，符合 GRPO 的非零方差要求。
         """
         if len(conditions) != 4:
             raise ValueError("conditions 必须包含四个尺度")

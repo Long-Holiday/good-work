@@ -13,7 +13,11 @@ GaussianDiffusion.training_losses + auxiliary_loss，AMP float16 + GradScaler
 
 阶段 D：U-Net eval、条件 detach，固定 CUDA generator 采样 G=2 轨迹
 （timesteps=32, steps=4），检查记录 dtype、逐步重算 log-prob 的 ratio≈1，
-再用固定优势 ±1 做 PPO + KL + 扩散 anchor 组合反向，检查梯度有限、参数更新。
+再用组内奖励 [0.4, 0.6] 走真实的 ``diffpeak.grpo`` 优势/裁剪/KL 工具，
+做 GRPO + KL + 扩散 anchor 组合反向，检查梯度有限、参数更新。
+
+另有一组纯张量检查覆盖 GRPO 工具的多图组（``[G, B]`` 按列独立标准化）、
+常量组（零优势、策略项零梯度）与裁剪边界；不绘制任何图表。
 
 显存只报告当前设备（4 GiB RTX 3050 Laptop）上的实测峰值，不涉及其他显卡。
 """
@@ -35,6 +39,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from diffpeak.grpo import (  # noqa: E402
+    gaussian_kl_divergence,
+    group_relative_advantages,
+    grpo_policy_loss,
+)
 from diffpeak.losses import auxiliary_loss  # noqa: E402
 from diffpeak.models.conditioning import ConditionEncoder  # noqa: E402
 from diffpeak.models.diffusion import GaussianDiffusion  # noqa: E402
@@ -117,6 +126,77 @@ def build_targets() -> Dict[str, torch.Tensor]:
         "heatmaps": heatmaps,
         "road": road,
         "skeleton": skeleton,
+    }
+
+
+def grpo_utility_checks() -> Dict[str, Any]:
+    """用真实 ``diffpeak.grpo`` 工具覆盖多图组、常量组与裁剪/KL 边界。"""
+    # 多图：[G=2, B=2]。两列奖励尺度不同，但每列都应按各自组标准化为 ∓1，
+    # 不能把整张 [G, B] 当成一个组。
+    multi_rewards = torch.tensor(
+        [[0.40, 0.90], [0.60, 0.91]], dtype=torch.float64
+    )
+    multi_advantages = group_relative_advantages(multi_rewards, delta=1e-9)
+    torch.testing.assert_close(
+        multi_advantages,
+        torch.tensor([[-1.0, -1.0], [1.0, 1.0]], dtype=torch.float64),
+    )
+
+    # 常量组：组内奖励完全相同 -> 零优势；策略项及其对 ratio 的梯度都必须为零。
+    constant_rewards = torch.full((GROUP, 2), 0.75, dtype=torch.float64)
+    constant_advantages = group_relative_advantages(
+        constant_rewards, delta=1e-4
+    )
+    assert torch.equal(constant_advantages, torch.zeros_like(constant_rewards))
+    constant_ratio = torch.tensor(
+        [0.5, 1.5, 2.0, 0.1], dtype=torch.float64, requires_grad=True
+    )
+    constant_loss = grpo_policy_loss(
+        constant_ratio, constant_advantages.reshape(-1), clip_epsilon=1e-4
+    )
+    constant_grad = torch.autograd.grad(constant_loss, constant_ratio)[0]
+    assert float(constant_loss.detach()) == 0.0, f"常量组策略损失非零: {constant_loss}"
+    assert torch.equal(
+        constant_grad, torch.zeros_like(constant_grad)
+    ), "常量组策略项仍产生非零梯度"
+
+    # 裁剪边界：A>0 的超上界与 A<0 的超下界都必须走 clamp 分支。
+    clip_ratio = torch.tensor([2.0, 0.1], dtype=torch.float64)
+    clip_advantage = torch.tensor([1.0, -1.0], dtype=torch.float64)
+    utility_clip = 0.2
+    clipped_loss = grpo_policy_loss(clip_ratio, clip_advantage, utility_clip)
+    # min(2, 1.2) * 1 + min(0.1, 0.8) * -1 = 1.2 - 0.8 = 0.4 -> loss = -0.2。
+    torch.testing.assert_close(
+        clipped_loss, torch.tensor(-0.2, dtype=torch.float64)
+    )
+
+    # KL 工具：相同均值为 0；逐元素差 1 时为 0.5 * 动作维元素数，且梯度非零。
+    kl_mean = torch.zeros(2, 2, 4, 4, dtype=torch.float64, requires_grad=True)
+    kl_std = torch.ones_like(kl_mean)
+    identical_kl = gaussian_kl_divergence(
+        kl_mean, kl_mean.detach().clone(), kl_std
+    )
+    assert torch.equal(identical_kl, torch.zeros(2, dtype=torch.float64))
+    kl_reference = torch.ones_like(kl_mean)
+    kl = gaussian_kl_divergence(kl_mean, kl_reference, kl_std)
+    torch.testing.assert_close(kl, torch.full((2,), 16.0, dtype=torch.float64))
+    kl_grad = torch.autograd.grad(kl.mean(), kl_mean)[0]
+    assert bool(torch.isfinite(kl_grad).all()) and float(kl_grad.abs().max()) > 0.0
+
+    return {
+        "multi_image_rewards": multi_rewards.tolist(),
+        "multi_image_advantages": multi_advantages.tolist(),
+        "constant_group_rewards": constant_rewards[:, 0].tolist(),
+        "constant_group_advantages": constant_advantages[:, 0].tolist(),
+        "constant_group_loss": float(constant_loss.detach()),
+        "constant_group_ratio_grad_abs_max": float(constant_grad.abs().max()),
+        "clip_epsilon": utility_clip,
+        "clip_ratio": clip_ratio.tolist(),
+        "clip_advantages": clip_advantage.tolist(),
+        "clip_loss": float(clipped_loss),
+        "kl_identical": identical_kl.tolist(),
+        "kl_unit_mean_shift": kl.tolist(),
+        "kl_mean_gradient_abs_max": float(kl_grad.abs().max()),
     }
 
 
@@ -266,8 +346,16 @@ def phase_d(
     repeat_diff = float((heatmaps - heatmaps_repeat).abs().max())
     assert repeat_diff < 1e-6, f"固定 generator 采样不可复现: {repeat_diff}"
 
-    advantages = torch.tensor([1.0, -1.0], device=DEVICE, dtype=torch.float64)
-    ppo_clip = 1e-4  # 与 engine rl.ppo_clip 默认配置一致
+    group_rewards = torch.tensor(
+        [[0.4], [0.6]], dtype=torch.float64
+    )  # [G=2, B=1]
+    advantages = group_relative_advantages(
+        group_rewards, delta=1e-4
+    ).reshape(-1).to(DEVICE)
+    torch.testing.assert_close(
+        advantages, torch.tensor([-1.0, 1.0], dtype=torch.float64, device=DEVICE)
+    )
+    clip_epsilon = 1e-4  # 与 engine rl.ppo_clip（GRPO 裁剪半径）默认配置一致
 
     # 合成参考 U-Net：微小扰动权重，专门让 KL 项有非零梯度可走。
     ref_unet = copy.deepcopy(unet)
@@ -281,7 +369,7 @@ def phase_d(
 
     ref_mean_stats: List[float] = []
     ratio_errors: List[float] = []
-    ppo_values: List[float] = []
+    grpo_values: List[float] = []
     kl_values: List[float] = []
     policy_mean_grads: List[float] = []
     kl_mean_grads: List[float] = []
@@ -327,25 +415,24 @@ def phase_d(
         ratio = torch.exp(log_ratio)
         ratio_errors.append(float((ratio - 1.0).abs().max().detach()))
 
-        clipped = torch.clamp(ratio, 1.0 - ppo_clip, 1.0 + ppo_clip)
-        ppo_loss = -torch.minimum(ratio * advantages, clipped * advantages).mean()
+        grpo_loss = grpo_policy_loss(ratio, advantages, clip_epsilon)
 
-        delta = (mean.double() - ref_mean.double()) / std.double().clamp_min(1e-12)
-        kl = 0.5 * delta.reshape(delta.shape[0], -1).pow(2).sum(dim=1).mean()
+        # 与 engine._grpo_update 相同的同方差高斯 KL 工具：动作维求和后取组均值。
+        kl = gaussian_kl_divergence(mean, ref_mean, std).mean()
 
-        # 单独验证 log-prob 的 PPO 梯度与 KL 梯度都能到达动作均值。
-        ppo_mean_grad = torch.autograd.grad(ppo_loss, mean, retain_graph=True)[0]
+        # 单独验证 GRPO 梯度与 KL 梯度都能到达动作均值。
+        grpo_mean_grad = torch.autograd.grad(grpo_loss, mean, retain_graph=True)[0]
         kl_mean_grad = torch.autograd.grad(kl, mean, retain_graph=True)[0]
-        assert torch.isfinite(ppo_mean_grad).all(), "PPO 对 mean 的梯度非有限"
+        assert torch.isfinite(grpo_mean_grad).all(), "GRPO 对 mean 的梯度非有限"
         assert torch.isfinite(kl_mean_grad).all(), "KL 对 mean 的梯度非有限"
-        policy_mean_grads.append(float(ppo_mean_grad.abs().mean().detach()))
+        policy_mean_grads.append(float(grpo_mean_grad.abs().mean().detach()))
         kl_mean_grads.append(float(kl_mean_grad.abs().mean().detach()))
 
-        ppo_values.append(float(ppo_loss.detach()))
+        grpo_values.append(float(grpo_loss.detach()))
         kl_values.append(float(kl.detach()))
-        policy_kl_loss = policy_kl_loss + (ppo_loss + 0.01 * kl) / total_terms
+        policy_kl_loss = policy_kl_loss + (grpo_loss + 0.01 * kl) / total_terms
 
-    # 扩散 anchor：与 engine 的 _ddpo_update 一致，只用噪声 MSE。
+    # 扩散 anchor：与 engine 的 _grpo_update 一致，只用噪声 MSE。
     with autocast():
         anchor_losses = diffusion.training_losses(
             unet, conditions, targets["heatmaps"].expand(GROUP, -1, -1, -1)
@@ -358,8 +445,8 @@ def phase_d(
     assert len(ratio_errors) == SAMPLING_STEPS
     max_ratio_error = max(ratio_errors)
     assert max_ratio_error < 5e-3, f"重算 ratio 偏离 1 过大: {max_ratio_error}"
-    assert all(math.isfinite(v) for v in ppo_values + kl_values), "PPO/KL 出现非有限值"
-    assert max(policy_mean_grads) > 0.0, "PPO 对 mean 的梯度为 0"
+    assert all(math.isfinite(v) for v in grpo_values + kl_values), "GRPO/KL 出现非有限值"
+    assert max(policy_mean_grads) > 0.0, "GRPO 对 mean 的梯度为 0"
     assert max(kl_mean_grads) > 0.0, "KL 对 mean 的梯度为 0"
     assert max(ref_mean_stats) > 0.0
 
@@ -389,16 +476,18 @@ def phase_d(
         "sample_reproducible_max_abs_diff": repeat_diff,
         "heatmap_range": [round(float(heatmaps.min()), 4), round(float(heatmaps.max()), 4)],
         "logprob_ratio_max_abs_error": max_ratio_error,
-        "advantages": advantages.tolist(),
-        "ppo_clip": ppo_clip,
-        "ppo_loss_mean": round(sum(ppo_values) / len(ppo_values), 6),
-        "ppo_mean_gradient_abs_mean": round(
+        "group_rewards": group_rewards.reshape(-1).tolist(),
+        "grpo_advantages": advantages.tolist(),
+        "grpo_clip_epsilon": clip_epsilon,
+        "grpo_loss_mean": round(sum(grpo_values) / len(grpo_values), 6),
+        "grpo_mean_gradient_abs_mean": round(
             sum(policy_mean_grads) / len(policy_mean_grads), 6
         ),
         "kl_mean": round(sum(kl_values) / len(kl_values), 6),
         "kl_mean_gradient_abs_mean": round(
             sum(kl_mean_grads) / len(kl_mean_grads), 6
         ),
+        "kl_tool": "diffpeak.grpo.gaussian_kl_divergence",
         "kl_reference": "deepcopy(unet) + 1e-4 合成扰动，仅用于打通 KL 梯度路径",
         "anchor_diff": round(float(anchor_losses["diff"].detach()), 6),
         "combined_loss": round(float(combined.detach()), 6),
@@ -429,6 +518,7 @@ def main() -> None:
         BATCH, 256, EMBED_SIZE, EMBED_SIZE, device=DEVICE, generator=generator
     )
     targets = build_targets()
+    utility_checks = grpo_utility_checks()
 
     encoder = ConditionEncoder().to(DEVICE)
     # 默认通道 (64, 128, 256, 256)，gradient_checkpointing=True。
@@ -467,6 +557,7 @@ def main() -> None:
             "diffusion": {"timesteps": TIMESTEPS, "sampling_steps": SAMPLING_STEPS},
             "phase_d_group_size": GROUP,
         },
+        "grpo_utility_checks": utility_checks,
         "phase_b": phase_b_result,
         "phase_d": phase_d_result,
         "memory": {
