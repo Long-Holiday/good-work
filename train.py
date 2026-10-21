@@ -1,0 +1,207 @@
+"""DiffPeak-SAM 训练入口。
+
+用法示例（在项目根目录执行）::
+
+    # 顺序执行 A -> B -> C -> D
+    python train.py --config configs/3090.yaml --stage all
+
+    # 只跑 B，并用 A 阶段权重初始化
+    python train.py --config configs/3090.yaml --stage B --init runs/diffpeak/stage_A.pth
+
+    # 恢复某阶段中断前的 last.pt（不传 --config 时使用 checkpoint 内配置）
+    python train.py --resume runs/diffpeak/last.pt
+
+    # 显式用新配置覆盖训练时的配置
+    python train.py --config configs/3090.yaml --resume runs/diffpeak/last.pt
+
+``--resume`` 恢复模型、优化器、GradScaler、学习率调度、epoch 与 RNG；
+``--init`` 只加载模型权重，从指定阶段的第 0 个 epoch 开始。
+"""
+
+from __future__ import annotations
+
+import argparse
+import warnings
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from diffpeak.engine import STAGE_ORDER, DiffPeakEngine
+from diffpeak.inference import (
+    config_from_checkpoint,
+    find_config_path,
+    load_config,
+    read_checkpoint,
+    seed_everything,
+)
+
+
+def _parse_stages(value: str) -> List[str]:
+    if value is None or value.strip().lower() == "all":
+        return list(STAGE_ORDER)
+    requested = {
+        part.strip().upper() for part in value.split(",") if part.strip()
+    }
+    unknown = requested - set(STAGE_ORDER)
+    if unknown:
+        raise ValueError(f"未知阶段：{sorted(unknown)}")
+    # 固定按 A/B/C/D 顺序执行，避免跨阶段依赖被颠倒。
+    return [stage for stage in STAGE_ORDER if stage in requested]
+
+
+def _load_training_config(args: argparse.Namespace):
+    """显式 --config 优先；否则 resume/init 使用 checkpoint 内配置。
+
+    返回 ``(config, config_dir, preloaded_payload)``；从 checkpoint 读取配置时
+    顺便返回已加载快照，避免训练入口再读取一次整份权重。
+    """
+    if args.config is not None:
+        return load_config(args.config), Path(args.config).expanduser().parent, None
+    if args.resume is not None:
+        payload = read_checkpoint(args.resume)
+        config = config_from_checkpoint(args.resume, payload=payload)
+        return config, None, payload
+    if args.init is not None:
+        payload = read_checkpoint(args.init)
+        config = config_from_checkpoint(args.init, payload=payload)
+        return config, None, payload
+    return load_config(None), find_config_path(None).parent, None
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="YAML 配置；省略时 resume/init 读取 checkpoint 内配置，否则使用默认配置。",
+    )
+    parser.add_argument(
+        "--stage",
+        type=str,
+        default="all",
+        help="all 或逗号分隔的阶段子集，例如 A、B,C、all。",
+    )
+    parser.add_argument("--resume", type=str, default=None, help="完整快照，用于阶段内恢复。")
+    parser.add_argument("--init", type=str, default=None, help="仅加载模型权重的上一阶段快照。")
+    parser.add_argument("--device", type=str, default=None, help="例如 cuda、cuda:0、cpu。")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="显式覆盖配置中的 seed（默认不覆盖）。",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.resume is not None and args.init is not None:
+        parser.error("--resume 与 --init 不能同时使用")
+
+    config, config_dir, preloaded = _load_training_config(args)
+    if args.seed is not None:
+        config["seed"] = int(args.seed)
+
+    seed = int(config.get("seed", 42))
+    seed_everything(seed, deterministic=bool(config.get("train", {}).get("deterministic", False)))
+
+    engine = DiffPeakEngine(config, device=args.device, config_dir=config_dir)
+
+    resume_payload: Optional[Dict[str, Any]] = None
+    resume_stage: Optional[str] = None
+    resume_epoch = 0
+
+    if args.init is not None:
+        if preloaded is not None and args.config is None:
+            engine.load_models_from_payload(preloaded, include_ref=True)
+            print(f"已从 {args.init} 初始化模型权重（不含优化器状态）", flush=True)
+            preloaded = None
+        else:
+            engine.load_init_weights(args.init)
+    if args.resume is not None:
+        if preloaded is not None and args.config is None:
+            resume_payload = preloaded
+        else:
+            resume_payload = engine.read_checkpoint(args.resume)
+        if not isinstance(resume_payload, dict):
+            raise ValueError("--resume 必须指向本项目生成的完整训练快照")
+        # run_stage 自身会严格加载模型权重（含 D 的 ref_unet）；
+        # 这里不要预加载或删除 payload.models，避免重复加载/破坏严格恢复。
+        resume_stage = str(resume_payload.get("stage", "")).upper()
+        resume_epoch = int(resume_payload.get("epoch", 0))
+        if resume_stage not in STAGE_ORDER:
+            raise ValueError(f"checkpoint 中的阶段无效：{resume_stage!r}")
+
+    selected = _parse_stages(args.stage)
+    if resume_stage is not None:
+        if resume_stage not in selected:
+            if args.stage.strip().lower() != "all":
+                parser.error(
+                    f"checkpoint 属于阶段 {resume_stage}，不在 --stage {args.stage} 中"
+                )
+            selected = list(STAGE_ORDER)
+        selected = [stage for stage in selected if STAGE_ORDER.index(stage) >= STAGE_ORDER.index(resume_stage)]
+
+    print(
+        f"配置来源：{'显式 --config' if args.config is not None else ('checkpoint' if args.resume or args.init else '默认配置')}；"
+        f"输出目录：{engine.output_dir}",
+        flush=True,
+    )
+    print(f"执行阶段：{','.join(selected)}", flush=True)
+
+    has_weights = args.init is not None or args.resume is not None
+    if not has_weights and selected and selected[0] != "A":
+        warnings.warn(
+            f"阶段 {selected[0]} 没有 --init/--resume，将从当前初始化权重开始。",
+            RuntimeWarning,
+        )
+
+    try:
+        for stage in selected:
+            if resume_stage is not None and stage == resume_stage:
+                epochs = int(config.get("stages", {}).get(stage, {}).get("epochs", 0))
+                if resume_epoch >= epochs:
+                    # 该阶段已完成，但后续阶段仍必须从它的权重继续；
+                    # engine.run_stage 不会被调用，所以这里先恢复一次模型。
+                    if resume_payload is None:
+                        raise RuntimeError("已完成的 resume 阶段缺少模型 payload")
+                    engine.load_models_from_payload(
+                        resume_payload, include_ref=True
+                    )
+                    # 下一阶段使用新优化器，但保留历史指标与 RNG 连续性。
+                    engine.history = list(resume_payload.get("history", []))
+                    engine._restore_rng(resume_payload.get("rng"))
+                    resume_payload = None
+                    resume_stage = None
+                    print(
+                        f"[{stage}] checkpoint 已完成该阶段（epoch={resume_epoch}/{epochs}），"
+                        "已恢复权重并继续后续阶段",
+                        flush=True,
+                    )
+                    continue
+                engine.run_stage(
+                    stage, start_epoch=resume_epoch, resume_payload=resume_payload
+                )
+                resume_payload = None
+            else:
+                engine.run_stage(stage, start_epoch=0)
+    except KeyboardInterrupt:
+        # 不把当前 epoch 的部分更新写成 last.pt：last.pt 仍对应上一个完整
+        # epoch，其优化器、调度器与 RNG 状态一致，可安全 --resume。
+        print(
+            "训练被中断。last.pt 保留上一个完整 epoch 的检查点；"
+            "当前 epoch 已进行的更新将丢失（最多一个 epoch）。",
+            flush=True,
+        )
+        raise SystemExit(130)
+
+    print(
+        f"训练结束。checkpoint：{engine.output_dir / 'last.pt'}、"
+        f"{engine.output_dir / 'best.pt'}、stage_X.pth",
+        flush=True,
+    )
+
+
+if __name__ == "__main__":
+    main()

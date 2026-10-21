@@ -1,0 +1,12 @@
+# Python 3.10；先按 README 安装 CUDA 12.1 的 torch/torchvision，再安装此文件。
+# 本文件不触发安装，也不下载 SAM 权重。
+torch==2.5.1
+torchvision==0.20.1
+numpy==1.26.4
+scipy==1.13.1
+scikit-image==0.24.0
+Pillow==10.4.0
+PyYAML==6.0.2
+tqdm==4.66.5
+# 原版 SAM 的 PyPI 发布；权重与许可证见官方仓库。
+segment-anything==1.0

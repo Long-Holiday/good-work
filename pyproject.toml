@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diffpeak-sam"
+version = "0.1.0"
+description = "Conditional diffusion point prompts for DeepGlobe road segmentation"
+requires-python = ">=3.10,<3.12"
+# CUDA 版本通过 README 中的专用 PyTorch index 安装；其他固定依赖见 requirements.txt。
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+include = ["diffpeak*"]
+exclude = ["tests*", "DeepGlobe_Road*", "docs*"]

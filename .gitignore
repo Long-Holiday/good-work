@@ -1,0 +1,49 @@
+# ===== 数据集（体积大，不入库）=====
+/DeepGlobe_Road/
+/data/
+/datasets/
+
+# 原始数据压缩包
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# ===== 模型权重与训练产物 =====
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+
+# ===== 运行输出 =====
+runs/
+outputs/
+predictions/
+splits/
+logs/
+wandb/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.env
+
+# ===== 测试与工具缓存 =====
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ===== 编辑器 / 系统 =====
+.idea/
+.DS_Store
