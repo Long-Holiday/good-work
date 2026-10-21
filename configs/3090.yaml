@@ -13,7 +13,8 @@ data:
   root: DeepGlobe_Road
   train_split: splits/protocol_v1/train.json
   val_split: splits/protocol_v1/val.json
-  num_workers: 8
+  # Vast.ai 32GiB 短程实测优先4；AutoDL 90GiB 可独立复测8。
+  num_workers: 4
   augment: true
   heatmap_sigma: 1.0
   target_min_distance: 4.0
@@ -51,8 +52,8 @@ peaks:
   min_distance: 4
 
 train:
-  batch_size: 1
-  accumulation_steps: 4
+  batch_size: 2
+  accumulation_steps: 2
   amp: true
   amp_init_scale: 1024.0
   weight_decay: 0.01
@@ -71,14 +72,15 @@ train:
 # LR 来自同预算开发筛选；epochs 暂沿用原计划，不代表已验证最优长度。
 stages:
   # A：只训练 SAM mask decoder，使用真实目标热图提取的提示。
-  A: {epochs: 15, lr: 0.0003}
+  A: {epochs: 15, lr: 0.0003, batch_size: 2, accumulation_steps: 2}
   # B：训练条件编码器与去噪 U-Net（扩散 MSE + 热图重建 + 辅助）。
-  B: {epochs: 60, lr: 0.0001}
+  B: {epochs: 60, lr: 0.0001, batch_size: 2, accumulation_steps: 2}
   # C：只训练 SAM mask decoder，提示来自冻结扩散模型。
-  C: {epochs: 10, lr: 0.0001}
-  # D：只训练扩散 U-Net。短程 32 组未覆盖 100 组点成本预热，D LR/调度仍待确认；
-  # 这里保留 1e-6 原基线，不把 32 组 IoU 差异当作增益。
-  D: {epochs: 10, lr: 0.000001, warmup_ratio: 0.1, min_lr_ratio: 0.1}
+  # 保持 A/B/C 有效 batch=4；batch8 吞吐仅小幅更快，未验证质量。
+  C: {epochs: 10, lr: 0.0001, batch_size: 4, accumulation_steps: 1}
+  # D：batch8 是吞吐候选；LR3e-7按较低KL保守选择，不代表效果最优。
+  # batch变化会改变每轮更新数/调度；100组点成本预热后的稳态仍待确认。
+  D: {epochs: 10, lr: 0.0000003, batch_size: 8, accumulation_steps: 1, warmup_ratio: 0.1, min_lr_ratio: 0.1}
 
 rl:
   # 当前只实现 GRPO；显式写入算法名，避免旧 DDPO 配置被误读为新协议。

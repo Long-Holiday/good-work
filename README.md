@@ -226,7 +226,7 @@ tensorboard --logdir runs/diffpeak --port 6006
 
 ## 6. 实验注意事项
 
-消融与主流模型比较按 [实验协议](docs/experimental_protocol.md) 冻结数据、预算、模型选择及评估口径。运行参数集中于配置，资源实测及开发筛选集中于 [3090 探针记录](docs/probe_3090.md)，避免在多份文档维护重复参数表。SAM2 替换 SAM1 属于骨干变更：旧 SAM1 快照、A/B/C/D 结果和探针数据全部失效，必须用 SAM2.1 权重从 A 重新执行 A→B→C→D，并重新测量吞吐与显存。3090 探针脚本用 `--cpu-threads 2 --interop-threads 1` 限制 CPU 线程；SAM1 与 SAM2 的 worker 数、吞吐和显存均按骨干分开记录，参见实测文档。
+消融与主流模型比较按 [实验协议](docs/experimental_protocol.md) 冻结数据、预算、模型选择及评估口径。运行参数集中于配置，资源实测及开发筛选集中于 [3090 探针记录](docs/probe_3090.md)，避免在多份文档维护重复参数表。SAM2 替换 SAM1 属于骨干变更：旧 SAM1 快照、A/B/C/D 结果和探针数据全部失效，必须用 SAM2.1 权重从 A 重新执行 A→B→C→D，并重新测量吞吐与显存。探针工具已归档到 `experiments/3090-throughput-probes-20261021` 分支，主分支仅保留训练实现。正式训练建议用 `--cpu-threads 2 --interop-threads 1` 限制 CPU 线程；SAM1 与 SAM2 的 worker 数、吞吐和显存均按骨干分开记录，参见实测文档。
 
 先做 A→B→C 的监督链条再进行 D；D 可能因组内奖励相同、优势为零而停滞，不保证必然改善。先检查目标热图的 `target_recovery_report`，确保随机目标峰经最终提取器仍可恢复。困难负点只在具备阶段性假阳性数据时启用，不把普通背景采样冒充困难负点挖掘。
 
