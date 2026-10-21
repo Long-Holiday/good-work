@@ -1,4 +1,5 @@
-# 所有数值均为未实测的实验起点；模型几何固定为 SAM 1024 / 热图 256。
+# SAM 2.1 Hiera-B+，输入 1024 / 热图 256；SAM1 历史探针不等于 SAM2 参数实测。
+# 运行选择与尚待确认的效果参数集中记录于 docs/probe_3090.md。
 seed: 42
 output_dir: runs/diffpeak
 
@@ -10,9 +11,9 @@ logging:
 
 data:
   root: DeepGlobe_Road
-  train_split: splits/train.json
-  val_split: splits/val.json
-  num_workers: 4
+  train_split: splits/protocol_v1/train.json
+  val_split: splits/protocol_v1/val.json
+  num_workers: 8
   augment: true
   heatmap_sigma: 1.0
   target_min_distance: 4.0
@@ -31,8 +32,11 @@ data:
       min_separation: 12.0
 
 model:
-  sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
-  gradient_checkpointing: true
+  sam_checkpoint: checkpoints/sam2.1_hiera_base_plus.pt
+  sam_config: configs/sam2.1/sam2.1_hiera_b+.yaml
+  sam_architecture: sam2.1_hiera_base_plus
+  sam_apply_postprocessing: false
+  gradient_checkpointing: false
 
 diffusion:
   timesteps: 1000
@@ -50,6 +54,7 @@ train:
   batch_size: 1
   accumulation_steps: 4
   amp: true
+  amp_init_scale: 1024.0
   weight_decay: 0.01
   grad_clip: 1.0
   heat_weight: 0.1
@@ -58,20 +63,21 @@ train:
   save_every: 1
   # 线性 warmup + cosine 退火。warmup_steps > 0 时优先；
   # 否则按 warmup_ratio * 当前阶段总更新步数计算，两者均为 0 时关闭预热。
-  # 全局起点：warmup_ratio=0.05、min_lr_ratio=0.05；D 阶段单独覆盖为 0.1/0.1。
+  # 完整训练调度尚待确认；LR 开发筛选使用恒定 LR，详见探针记录。
   warmup_steps: 0
   warmup_ratio: 0.05
   min_lr_ratio: 0.05
 
+# LR 来自同预算开发筛选；epochs 暂沿用原计划，不代表已验证最优长度。
 stages:
   # A：只训练 SAM mask decoder，使用真实目标热图提取的提示。
-  A: {epochs: 15, lr: 0.0001}
+  A: {epochs: 15, lr: 0.0003}
   # B：训练条件编码器与去噪 U-Net（扩散 MSE + 热图重建 + 辅助）。
   B: {epochs: 60, lr: 0.0001}
   # C：只训练 SAM mask decoder，提示来自冻结扩散模型。
-  C: {epochs: 10, lr: 0.00005}
-  # D：只训练扩散 U-Net。组更新稀疏，使用 1e-6 小学习率；
-  # 预热与退火终点均覆盖为 0.1，避免策略早期被压死。
+  C: {epochs: 10, lr: 0.0001}
+  # D：只训练扩散 U-Net。短程 32 组未覆盖 100 组点成本预热，D LR/调度仍待确认；
+  # 这里保留 1e-6 原基线，不把 32 组 IoU 差异当作增益。
   D: {epochs: 10, lr: 0.000001, warmup_ratio: 0.1, min_lr_ratio: 0.1}
 
 rl:

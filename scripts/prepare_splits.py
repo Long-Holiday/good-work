@@ -12,10 +12,14 @@ def main() -> None:
     parser.add_argument("--root", type=Path, default=Path("DeepGlobe_Road"))
     parser.add_argument("--output", type=Path, default=Path("splits"))
     parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument("--test-fraction", type=float, default=0.0,
+                        help="从有标注 train 中另留独立测试集；默认 0 保持原有两分划分。")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     if not 0 < args.val_fraction < 1:
         parser.error("val-fraction 必须在 (0, 1) 内")
+    if not 0 <= args.test_fraction < 1 or args.val_fraction + args.test_fraction >= 1:
+        parser.error("test-fraction 必须在 [0, 1) 内，且 val/test 比例之和小于 1")
     if not args.root.is_dir():
         parser.error(f"数据目录不存在：{args.root}")
     candidates = sorted((args.root / "train").glob("*_sat.jpg"))
@@ -27,14 +31,19 @@ def main() -> None:
     items = [p.relative_to(args.root).as_posix() for p in candidates]
     random.Random(args.seed).shuffle(items)
     n_val = min(len(items) - 1, max(1, round(len(items) * args.val_fraction)))
-    manifests = {"train.json": sorted(items[n_val:]), "val.json": sorted(items[:n_val])}
+    n_test = max(1, round(len(items) * args.test_fraction)) if args.test_fraction > 0 else 0
+    if n_val + n_test >= len(items):
+        parser.error("样本数不足，无法在所选 val/test 比例下保留非空训练集")
+    manifests = {"train.json": sorted(items[n_val + n_test:]), "val.json": sorted(items[:n_val])}
+    if n_test:
+        manifests["test.json"] = sorted(items[n_val:n_val + n_test])
     inference = sorted(p.relative_to(args.root).as_posix() for split in ("valid", "test")
                        for p in (args.root / split).glob("*_sat.jpg"))
     manifests["unlabeled.json"] = inference
     manifests["protocol.json"] = {
         "seed": args.seed, "val_fraction": args.val_fraction,
-        "source": "labeled train only", "train_count": len(items) - n_val,
-        "val_count": n_val,
+        "source": "labeled train only", "train_count": len(items) - n_val - n_test,
+        "val_count": n_val, "test_count": n_test, "test_fraction": args.test_fraction,
         "warning": "随机按影像划分不保证地理独立性；有地理分组时请替换为区域隔离划分。",
     }
     for name in manifests:
@@ -43,7 +52,8 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     for name, contents in manifests.items():
         (args.output / name).write_text(json.dumps(contents, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"划分已写入 {args.output}：train={len(items) - n_val}, val={n_val}, unlabeled={len(inference)}")
+    print(f"划分已写入 {args.output}：train={len(items) - n_val - n_test}, "
+          f"val={n_val}, test={n_test}, unlabeled={len(inference)}")
 
 
 if __name__ == "__main__":

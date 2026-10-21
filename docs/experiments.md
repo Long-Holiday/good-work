@@ -4,11 +4,11 @@
 
 ## 最小实验路线
 
-1. 固定 `splits/*.json` 与依赖版本，不对官方无掩码 valid/test 计算指标。
-2. 先运行 `python check_targets.py --config configs/3090.yaml --samples 16`，检查目标点回提 precision / recall、数量、最大定位误差及无正峰率。少量样本仅用于排错，正式定阈值需覆盖整个内部验证集。
-3. A 阶段只训练 SAM 解码器，确认真实提示下 SAM 能学道路。A 的真值提示指标是受提示监督的诊断指标，不能与 B/C/D 自动生成提示成绩混称。
+1. 固定 `splits/protocol_v1/*.json`（或登记过的等价三分清单）与依赖版本；不对官方无掩码 valid/test 计算指标，内部 test 只在全部选模完成后统一评估。划分与测试集使用历史见 [实验协议](experimental_protocol.md) 第 2 节。
+2. 先运行 `python check_targets.py --config configs/3090.yaml --samples 16`，检查目标点回提 precision / recall、数量、最大定位误差及无正峰率。少量样本仅用于排错，正式定阈值需覆盖整个内部验证集。若仍在用旧两分清单，这 16 张可能落入新 test，必须按协议登记用途，不能据此声称测试集从未被查看。
+3. A 阶段只训练 SAM2 解码器，确认真实提示下 SAM2 能学道路；SAM2 迁移后必须从 A 重新开始 A→B→C→D。A 的真值提示指标是受提示监督的诊断指标，不能与 B/C/D 自动生成提示成绩混称。
 4. B 阶段训练细节/条件编码器与去噪 U-Net。先检查扩散 MSE 与低中噪声重建，再看生成热图幅度、正负峰数与无正峰率；只看扩散 MSE 不足以选择最终模型。
-5. C 阶段只训练 SAM 解码器，确认生成提示分布下解码器适配有效，再冻结解码器进入 D。
+5. C 阶段只训练 SAM2 解码器，确认生成提示分布下解码器适配有效，再冻结解码器进入 D。
 6. D 阶段只训练扩散 U-Net，使用 GRPO。同时记录终端奖励、组内奖励标准差、零优势组比例、联合 log-ratio、KL、裁剪比例与点数。若同图四条轨迹奖励完全一致，优势为零是正确行为，不应替换成跨图基线；非零但方差低于 `advantage_std_delta` 的组只按该下限缩放，仍会参与学习，不能误记为“已跳过”。
 7. 完整实验以每张影像一次采样为主协议，多种子重复。不要用标注从多轨迹中挑最优结果当成无标注推理性能。
 
@@ -16,11 +16,11 @@
 
 | 对照 | 固定因素 | 改变因素 |
 |---|---|---|
-| B/C 对比 D | 条件、SAM、峰值与推理采样 | 是否做 GRPO 后训练 |
+| B/C 对比 D | 条件、SAM2、峰值与推理采样 | 是否做 GRPO 后训练 |
 | 不惩罚点数 | 全部模型与数据 | `reward.point_cost=0`，需重新后训练 |
-| 点成本预热 | 模型、数据、点数成本 | `rl.point_cost_warmup_steps` 为 `0` 或 `100`，需分别重新后训练 |
+| 点成本预热 | 模型、数据、点数成本 | `rl.point_cost_warmup_steps` 为 `0` 与配置值，需分别重新后训练 |
 | 监督锚定 | 其余 GRPO 协议 | `rl.anchor_weight=0` 对比非零值；非零只是可选监督锚定，不是默认协议 |
-| 加路径代理 | 其余协议 | 质量权重从 0.6/0.4/0 改为 0.5/0.3/0.2 |
+| 加路径代理 | 其余协议 | 在实验 YAML 中启用非零路径权重；只作为独立消融，不改主协议 |
 | 正点 vs 双通道 | 正通道与模型 | 负点是否参与，需定义训练一致的消融 |
 | h-maxima vs 普通局部极大 | 数据和模型 | 重新校准且固定峰值提取协议 |
 | 提示依赖性 | 同一模型 | 移除或打乱提示，仅用于评估诊断 |
@@ -29,26 +29,20 @@
 
 ## D 阶段 GRPO 协议与迁移口径
 
-当前 D 阶段配置显式写 `rl.algorithm=grpo`，表示 DDPO 已被同图组内相对优势的 GRPO 取代。参考设计是 [`docs/model_grpo.md`](model_grpo.md)；[`docs/model.md`](model.md) 保留为早期 DDPO 设计记录，不应再用它解释当前 D 训练。
+当前 D 阶段配置显式写 `rl.algorithm=grpo`，表示 DDPO 已被同图组内相对优势的 GRPO 取代。当前实现规范是 [`docs/model_grpo.md`](model_grpo.md)，已被替代的旧设计稿不再保留在工作树。D 的学习率、warmup、裁剪半径等**数值起点统一见 `configs/3090.yaml`**，本文只保留语义，不复制参数表。
 
-| 配置 | 当前起点 | 说明 |
-|---|---:|---|
-| `stages.D.lr` | `1e-6` | 高维联合动作的策略更新更保守 |
-| `stages.D.warmup_ratio` | `0.1` | 覆盖全局 `train.warmup_ratio=0.05` |
-| `stages.D.min_lr_ratio` | `0.1` | 覆盖全局 `train.min_lr_ratio=0.05`，退火终点不压到 0.05 |
-| `rl.ppo_clip` | `1e-4` | 键名保留以兼容旧配置；语义是 GRPO 裁剪半径 epsilon |
-| `rl.advantage_std_delta` | `1e-4` | 组内标准差分母下限，不是跳过阈值 |
-| `rl.point_cost_warmup_steps` | `100` | 按已处理 D 组数在 100 组内线性升到 `reward.point_cost`（第 1 组为 1/100）；`0` 禁用 |
-| `rl.anchor_weight` | `0.0` | 默认不启用；非零时是可选监督锚定 |
-
+- `ppo_clip` 键名为兼容旧配置保留，语义是 GRPO 裁剪半径 epsilon，不是 PPO 的原始超参。
+- `advantage_std_delta` 是组内优势分母的标准差下限，不是“跳过阈值”；非零但低方差的组仍按该下限缩放后参与学习，只有奖励完全相同的组优势为零。
+- `point_cost_warmup_steps` 按**已处理的 D 组数**推进，不依赖该组是否真正产生 optimizer step；这样常量奖励组或 AMP 溢出不会让预热永久停在 0。验证固定使用未预热的基准 `reward.point_cost`，避免同一 checkpoint 的验证奖励随预热进度漂移；`0` 表示禁用。
+- `anchor_weight` 默认 `0`；非零时是可选监督锚定（对目标热图额外加扩散 MSE），不是默认 GRPO 目标。
+- D 阶段的 `lr`、`warmup_ratio`、`min_lr_ratio` 在 `stages.D` 中覆盖全局值；具体数值以配置为准，不在文档中重复。
 - **两种“旧策略”不要混淆。** 组 rollout 时保存的 `old_log_prob` 在组内冻结并 detach，只作为概率比的分母；重放更新时重算当前策略。首次从 B/C 进入 D 时深拷贝当前预训练 U-Net 为长期参考，之后永久冻结，只用于 KL；从已有 D 快照初始化或恢复时保留其中的 `ref_unet`，缺失时才从已加载权重重建，需记录该协议差异。前者不是长期参考模型。
-- **按组推进的点成本预热。** 点成本预热按已处理的 D 组数推进，不依赖该组是否真正产生 optimizer step；这样整组奖励常量或 AMP 溢出不会让预热永久停在 0。验证固定使用未预热的 `reward.point_cost`，避免同一 checkpoint 在不同 epoch 的验证奖励随预热进度漂移。
-- **从 DDPO 快照迁移。** 旧 DDPO 模型可以用 `--init` 只加载权重来启动新的 D 阶段；不支持把旧 DDPO 快照直接 `--resume` 当作 GRPO 训练继续，因为优化器/调度器/RNG 可加载并不代表旧策略轨迹、组采样或参考策略语义兼容。旧配置也可能缺少 `rl.algorithm` 与 `rl.point_cost_warmup_steps`，建议显式提供新 YAML 并使用独立输出目录。
+- **从 DDPO 快照迁移。** 旧 DDPO 模型可以用 `--init` 只加载权重来启动新的 D 阶段；不支持把旧 DDPO 快照直接 `--resume` 当作 GRPO 训练继续，因为优化器/调度器/RNG 可加载并不代表旧策略轨迹、组采样或参考策略语义兼容。旧配置也可能缺少 `rl.algorithm` 与 `rl.point_cost_warmup_steps`，应显式提供新 YAML 并使用独立输出目录。
 - 以上均为待验证起点，本文不声称已运行 GRPO 实验或取得改进。
 
 ## 实验运行目录、日志与 TensorBoard
 
-本节描述 `train.py` 的实验日志协议。TensorBoard 2.21.0 的 SummaryWriter/event accumulator 写读已在 `pytorch` 环境通过，`pip check` 无 broken requirements；尚未用真实 SAM 权重运行完整 A–D 训练来验证真实训练负载下的日志轮转、flush 行为或曲线。`evaluate.py`/`predict.py` 的既有输出不受本协议影响。
+本节描述 `train.py` 的实验日志协议。TensorBoard 2.21.0 的 SummaryWriter/event accumulator 写读已在 `pytorch` 环境通过，`pip check` 无 broken requirements；尚未用真实 SAM2 权重运行完整 A–D 训练来验证真实训练负载下的日志轮转、flush 行为或曲线；SAM1 时期的日志结果不能视为 SAM2 证据。`evaluate.py`/`predict.py` 的既有输出不受本协议影响。
 
 ### 输出目录与 CLI
 
@@ -95,22 +89,7 @@ python train.py --config configs/3090.yaml --stage all --no-tensorboard
 
 ### YAML 配置
 
-建议在每个实验 YAML 中显式写入：
-
-```yaml
-logging:
-  tensorboard: true
-  log_every: 10
-  flush_secs: 30
-```
-
-| 键 | 协议默认 | 含义 |
-|---|---:|---|
-| `logging.tensorboard` | `true` | 是否写 TensorBoard；`--no-tensorboard` 优先覆盖为关闭 |
-| `logging.log_every` | `10` | 每处理多少个 batch（D 阶段为 group）记录一次；每轮首批、末批也记录。训练 epoch 汇总始终记录，验证指标按 `train.val_every`（以及末轮）记录 |
-| `logging.flush_secs` | `30` | TensorBoard 事件刷新周期；`metrics.jsonl` 与 `train.log` 按行/每次写入刷新，不依赖该周期 |
-
-`log_every`、`flush_secs` 转为整数后下限为 1。CLI 加载配置时补齐上述默认值，配置及 CLI 覆盖写入 session 的 `config.json`。
+`logging.*` 的当前数值统一见 `configs/3090.yaml`，文档不复制参数表。语义保持如下：`tensorboard` 控制是否写事件，`--no-tensorboard` 优先覆盖为关闭；`log_every` 表示每处理多少个 batch（D 阶段为 group）记录一次，每轮首批、末批也记录，训练 epoch 汇总始终记录，验证指标按 `train.val_every` 及末轮记录；`flush_secs` 只控制 TensorBoard 事件刷新周期，`metrics.jsonl` 与 `train.log` 按行/每次写入刷新，不依赖该周期。`log_every`、`flush_secs` 转为整数后下限为 1；CLI 加载配置时补齐默认值，配置及 CLI 覆盖写入 session 的 `config.json`。
 
 ### Session 文件内容
 
@@ -134,7 +113,7 @@ tag 以阶段名为第一级，避免同一输出目录顺序执行 A→B→C→
 <stage>/system/<metric>         # 耗时/学习率/AMP/显存，例如 A/system/epoch_seconds
 ```
 
-- 阶段前缀使用实际的 `A`/`B`/`C`/`D`，因此 A/C 的 SAM 解码器指标与 B/D 的 U-Net 指标不会混称。
+- 阶段前缀使用实际的 `A`/`B`/`C`/`D`，因此 A/C 的 SAM2 解码器指标与 B/D 的 U-Net 指标不会混称。
 - epoch 级标量（`train_epoch`、`val_epoch`、按 epoch 统计的 `system`）使用 1-based epoch 作为 step，即第一个完整 epoch 为 1。
 - batch/group 标量使用 `global_step = epoch_index * len(loader) + index`：`epoch_index` 为该轮从 0 开始的内部序号，`index` 为该 epoch 内从 1 开始的 batch 序号；D 阶段以 `group_index` 替代 `batch_index`（`len(loader)` 为该阶段训练 loader 长度）。因此第一个 epoch 的第一个 batch/group 为 step 1，同一 session 内该轴单调递增且跨 epoch 不重叠。`metrics.jsonl` 中的 `epoch` 字段仍是 1-based。
 - `metrics.jsonl` 中指标记录的 `step` 与 TensorBoard 标量使用同一个 step。
@@ -165,12 +144,14 @@ tensorboard --logdir runs/diffpeak --port 6006
 - 空预测且空标注的质量得分为 1，仅一方为空则为 0。报告空图比例，避免宏平均误导。
 - 路径指标是双向骨架图抽样代理，基于八邻域像素图，不能区分跨越与交叉，也不能冠名正式 APLS。
 - 统计正负点均值/中位数/P95、有道路但无正峰率、点落点正确率，并明确坐标量化容差。
-- 耗时统计包括图像编码、细节条件、20 步采样、GPU→CPU 热图复制、h-maxima/NMS、SAM 解码及输出恢复；单独报模型内核耗时不能冒充端到端耗时。
+- 耗时统计包括图像编码、细节条件、配置的扩散采样步数、GPU→CPU 热图复制、h-maxima/NMS、SAM2 解码及输出恢复；单独报模型内核耗时不能冒充端到端耗时。
 
 ## 配置与内存
 
-输入 1024² 和热图 256² 是当前基础几何，不是随意可改的缩放开关。RTX 3090 默认 micro-batch=1；混合精度、U-Net 检查点、冻结 SAM 编码器、串行 RL 轨迹和 CPU 暂存用于控制显存，但未实测峰值。
+输入 1024²、热图 256² 是当前硬编码的基础几何，不是可随意调换的缩放开关。3090 的 batch、AMP、U-Net 检查点、冻结 SAM2 编码器、串行轨迹和 CPU 暂存等取值统一见 `configs/3090.yaml`，已测范围见 [探针记录](probe_3090.md)。改变实验因素需单独登记，不能把降配悄悄混入主表。
 
-目标采点间距使用**原始标注像素**；高斯宽度和 NMS 使用**热图像素**；路径匹配半径使用**分割评估像素**；提示坐标交给 SAM 时使用其 1024 输入空间的 `(x,y)`。更换影像分辨率时应重新检查这些参数物理含义。
+SAM2 替换 SAM1 是骨干变更：SAM1 的 checkpoint、A/B/C/D 快照和已有探针结果都不再适用，必须用 SAM2.1 Hiera-B+ 权重（`sam2.1_hiera_base_plus.pt`，官方配置 `configs/sam2.1/sam2.1_hiera_b+.yaml`）从 A 重新训练并重新测量。3090 探针脚本固定 `--cpu-threads 2 --interop-threads 1` 限制 CPU 线程；SAM1 历史数字与 SAM2 新探针分开保存，不交叉复用。
 
-先确定峰值提取参数，再运行 C/D。D checkpoint 推理必须复用训练的峰值和随机采样协议。改变它们属于新实验，不是等价加速。
+单位语义必须保持：目标采点间距使用**原始标注像素**；热图高斯和 NMS 使用**热图像素**；路径匹配半径使用**分割评估像素**；提示坐标交给 SAM2 时使用其 1024 输入空间的 `(x,y)`。更换影像分辨率时应重新检查这些参数的物理含义。
+
+先确定并冻结峰值提取参数，再运行 C/D。D checkpoint 推理必须复用训练的峰值和随机采样协议；改变它们属于新实验，不是等价加速。

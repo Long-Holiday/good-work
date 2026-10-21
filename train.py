@@ -25,6 +25,8 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import torch
+
 from diffpeak.engine import STAGE_ORDER, DiffPeakEngine
 from diffpeak.experiment_logging import ExperimentLogger
 from diffpeak.inference import (
@@ -35,6 +37,38 @@ from diffpeak.inference import (
     resolve_output_dir,
     seed_everything,
 )
+
+
+def _positive_int(value: str) -> int:
+    """argparse 类型：只接受正整数。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"必须是正整数，收到：{value!r}")
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"必须是正整数，收到：{value!r}")
+    return number
+
+
+def _apply_thread_settings(
+    cpu_threads: Optional[int], interop_threads: Optional[int]
+) -> Dict[str, Optional[int]]:
+    """按需设置 torch 线程数，并返回用于实验元数据的请求值/实际值。
+
+    仅在显式传入参数时调用对应的 torch setter，因此不传 flag 时保持
+    PyTorch 默认行为不变。此函数必须在模型/engine 构造前调用，尤其是
+    ``set_num_interop_threads`` 需要在任何并行工作开始前设置。
+    """
+    if cpu_threads is not None:
+        torch.set_num_threads(cpu_threads)
+    if interop_threads is not None:
+        torch.set_num_interop_threads(interop_threads)
+    return {
+        "cpu_threads_requested": cpu_threads,
+        "cpu_threads_actual": int(torch.get_num_threads()),
+        "interop_threads_requested": interop_threads,
+        "interop_threads_actual": int(torch.get_num_interop_threads()),
+    }
 
 
 def _parse_stages(value: str) -> List[str]:
@@ -92,6 +126,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="显式覆盖配置中的 seed（默认不覆盖）。",
     )
+    parser.add_argument(
+        "--cpu-threads",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="设置 torch 的 CPU 运算线程数（默认沿用 PyTorch 的自动选择）。",
+    )
+    parser.add_argument(
+        "--interop-threads",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="设置 torch 的 inter-op 线程数（默认沿用 PyTorch 的自动选择）。",
+    )
     parser.add_argument("--output-dir", type=str, default=None, help="覆盖输出目录（相对于当前工作目录）。")
     parser.add_argument("--experiment-name", type=str, default=None, help="在输出目录下创建命名实验子目录。")
     parser.add_argument("--no-tensorboard", action="store_true", help="关闭 TensorBoard，仍保存文本和 JSONL 日志。")
@@ -103,6 +151,9 @@ def main() -> None:
     args = parser.parse_args()
     if args.resume is not None and args.init is not None:
         parser.error("--resume 与 --init 不能同时使用")
+
+    # 必须在 ExperimentLogger / engine（及其模型）构造前设置 torch 线程数。
+    thread_metadata = _apply_thread_settings(args.cpu_threads, args.interop_threads)
 
     config, config_dir, preloaded = _load_training_config(args)
     if args.seed is not None:
@@ -126,7 +177,8 @@ def main() -> None:
     with ExperimentLogger(
         resolve_output_dir(config, config_dir), config,
         metadata={"resume": args.resume, "init": args.init, "requested_stages": args.stage,
-                  "config_source": args.config, "device_requested": args.device},
+                  "config_source": args.config, "device_requested": args.device,
+                  **thread_metadata},
     ) as experiment:
         engine = DiffPeakEngine(config, device=args.device, config_dir=config_dir)
         engine.experiment_logger = experiment

@@ -113,7 +113,7 @@ class EnginePipelineTest(unittest.TestCase):
                 self.assertTrue(np.isfinite(metrics["iou"]))
                 payload = read_checkpoint(engine.output_dir / "last.pt")
                 self.assertEqual(payload["stage"], stage)
-                self.assertEqual(payload["format_version"], 2)
+                self.assertEqual(payload["format_version"], 3)
                 self.assertTrue((engine.output_dir / f"stage_{stage}.pth").is_file())
             self.assertEqual([item["stage"] for item in engine.history], list("ABCD"))
             self.assertGreater(engine.global_step, 0)

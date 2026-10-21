@@ -45,6 +45,12 @@ import torch.nn.functional as F
 from PIL import Image
 
 from diffpeak.models import ConditionEncoder, ConditionalUNet, GaussianDiffusion, RoadSAM
+from diffpeak.models.sam import (
+    DEFAULT_SAM2_ARCHITECTURE,
+    DEFAULT_SAM2_CONFIG,
+    SAM2ImageFeatures,
+    low_res_features,
+)
 from diffpeak.prompts import PeakExtractor
 
 __all__ = [
@@ -105,7 +111,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "target_min_distance": 4.0,
     },
     "model": {
-        "sam_checkpoint": "checkpoints/sam_vit_b_01ec64.pth",
+        "sam_checkpoint": "checkpoints/sam2.1_hiera_base_plus.pt",
+        "sam_config": DEFAULT_SAM2_CONFIG,
+        "sam_architecture": DEFAULT_SAM2_ARCHITECTURE,
+        "sam_apply_postprocessing": False,
         "gradient_checkpointing": True,
     },
     "diffusion": {"timesteps": 1000, "sampling_steps": 20, "min_std": 0.02},
@@ -409,6 +418,9 @@ def config_from_checkpoint(
 # 影响推理结果的协议字段：显式配置可以覆盖它们，但与训练快照不同时需提示。
 _PROTOCOL_KEYS: Tuple[str, ...] = (
     "data.sampling_config",
+    "model.sam_config",
+    "model.sam_architecture",
+    "model.sam_apply_postprocessing",
     "peaks",
     "train.amp",
     "diffusion.timesteps",
@@ -478,6 +490,24 @@ def make_generator(seed: int) -> torch.Generator:
 # ---------------------------------------------------------------------------
 # 模型构建与权重加载
 # ---------------------------------------------------------------------------
+_SAM2_ARCHITECTURES = {
+    "sam2.1_hiera_t.yaml": "sam2.1_hiera_tiny",
+    "sam2.1_hiera_s.yaml": "sam2.1_hiera_small",
+    "sam2.1_hiera_b+.yaml": "sam2.1_hiera_base_plus",
+    "sam2.1_hiera_l.yaml": "sam2.1_hiera_large",
+}
+
+
+def _validate_sam_architecture(sam_config: str, architecture: str) -> None:
+    """拒绝配置名与记录的骨干标识不一致，避免快照元数据静默错记。"""
+    expected = _SAM2_ARCHITECTURES.get(Path(sam_config).name.lower())
+    if expected is not None and architecture != expected:
+        raise ValueError(
+            f"model.sam_config={sam_config!r} 对应 {expected!r}，与 "
+            f"model.sam_architecture={architecture!r} 不一致。"
+        )
+
+
 def build_models(
     config: Mapping[str, Any],
     device: Union[str, torch.device],
@@ -505,13 +535,26 @@ def build_models(
         checkpoint = resolve_sam_checkpoint(config, config_dir)
     if not checkpoint.is_file():
         raise FileNotFoundError(
-            f"SAM 权重不存在：{checkpoint}。请按 README 手动下载 ViT-B 权重。"
+            f"SAM2 权重不存在：{checkpoint}。请按 README 下载 "
+            "sam2.1_hiera_base_plus.pt。"
         )
 
     model_cfg = config.get("model", {})
     diffusion_cfg = config.get("diffusion", {})
+    sam_config = str(model_cfg.get("sam_config", DEFAULT_SAM2_CONFIG))
+    sam_architecture = str(
+        model_cfg.get("sam_architecture", DEFAULT_SAM2_ARCHITECTURE)
+    )
+    _validate_sam_architecture(sam_config, sam_architecture)
     models: Dict[str, torch.nn.Module] = {
-        "sam": RoadSAM(str(checkpoint)),
+        "sam": RoadSAM(
+            str(checkpoint),
+            config_name=sam_config,
+            apply_postprocessing=bool(
+                model_cfg.get("sam_apply_postprocessing", False)
+            ),
+            architecture=sam_architecture,
+        ),
         "condition_encoder": ConditionEncoder(),
         "unet": ConditionalUNet(
             gradient_checkpointing=bool(model_cfg.get("gradient_checkpointing", True))
@@ -532,6 +575,22 @@ def build_models(
 def _load_state(module: torch.nn.Module, state: Mapping[str, Any], name: str) -> None:
     """严格加载权重；缺失/多余键直接报错，避免静默使用错误 checkpoint。"""
     module.load_state_dict(state, strict=True)
+
+
+def _expects_sam2_state(module: torch.nn.Module) -> bool:
+    """目标 SAM 是否使用 SAM2 的参数命名（``sam.sam_mask_decoder`` 等）。"""
+    inner = getattr(module, "sam", None)
+    return inner is not None and hasattr(inner, "sam_mask_decoder")
+
+
+def _looks_like_sam2_state(state: Mapping[str, Any]) -> bool:
+    """通过默认键前缀识别 SAM2 权重，显式拒绝旧 SAM1 ViT-B 快照。"""
+    prefixes = (
+        "sam.sam_mask_decoder.",
+        "sam.sam_prompt_encoder.",
+        "sam.image_encoder.trunk.",
+    )
+    return any(str(key).startswith(prefixes) for key in state)
 
 
 def load_checkpoint_models(
@@ -560,6 +619,39 @@ def load_checkpoint_models(
             + ", ".join(missing)
             + "；请使用本项目 train.py 生成的快照"
         )
+
+    sam_source = source["sam"]
+    if (
+        isinstance(sam_source, Mapping)
+        and _expects_sam2_state(models.get("sam"))
+        and not _looks_like_sam2_state(sam_source)
+    ):
+        raise ValueError(
+            "checkpoint.models.sam 不是 SAM2 权重：缺少 sam.sam_mask_decoder / "
+            "sam.sam_prompt_encoder / sam.image_encoder.trunk 等键。旧 SAM1 "
+            "ViT-B 训练快照与 SAM2.1 Hiera-B+ 不兼容，不能 --resume/--init "
+            "到 SAM2，请从 A 阶段重新训练。"
+        )
+
+    # 快照内记录的骨干必须与当前构建的 SAM2 配置一致，避免静默混用不同
+    # Hiera 尺寸（例如把 B+ 快照加载到 T/S/L）。旧快照没有该字段时跳过，
+    # 由上面的键前缀检查负责拒绝 SAM1。
+    saved_config = payload.get("config")
+    if isinstance(saved_config, Mapping):
+        saved_model_cfg = saved_config.get("model", {})
+        if isinstance(saved_model_cfg, Mapping):
+            saved_architecture = saved_model_cfg.get("sam_architecture")
+            target_architecture = getattr(models.get("sam"), "architecture", None)
+            if (
+                saved_architecture
+                and target_architecture
+                and str(saved_architecture) != str(target_architecture)
+            ):
+                raise ValueError(
+                    "checkpoint 的 SAM 骨干与当前配置不一致："
+                    f"{saved_architecture!r} != {target_architecture!r}。"
+                    "请使用匹配的 model.sam_architecture / sam_config 与权重。"
+                )
 
     for name in ("sam", "condition_encoder", "unet"):
         if name not in models:
@@ -664,11 +756,12 @@ def encode_images(
     sam: RoadSAM,
     images: torch.Tensor,
     valid_sizes: Optional[Sequence[Optional[Tuple[int, int]]]] = None,
-) -> torch.Tensor:
+) -> Union[torch.Tensor, SAM2ImageFeatures]:
     """调用 ``RoadSAM.encode``，并显式传入填充前有效尺寸。
 
     ``valid_sizes`` 中每项是右下填充前的 ``(height, width)``；模型会据此在
-    标准化后把 padding 特征置零。
+    标准化后把 padding 特征置零。真实 ``RoadSAM`` 返回
+    :class:`SAM2ImageFeatures`；测试用的轻量替身也可返回裸张量。
     """
     if valid_sizes is not None:
         valid_sizes = [
@@ -726,17 +819,18 @@ def points_to_prompt(
 
 def decode_with_prompts(
     sam: RoadSAM,
-    embeddings: torch.Tensor,
+    embeddings: Union[torch.Tensor, SAM2ImageFeatures],
     prompts: Sequence[Optional[Tuple[torch.Tensor, torch.Tensor]]],
     output_size: Tuple[int, int] = (1024, 1024),
 ) -> Tuple[torch.Tensor, List[bool]]:
     """逐图调用 ``RoadSAM.decode``。
 
-    逐图解码规避官方 SAM 在 ``multimask_output=False`` 时对 batch 做
+    逐图解码规避官方 SAM2 在 ``repeat_image=True`` 时对 batch 做
     ``repeat_interleave`` 导致 B² 放大的问题，也便于跳过没有正点的样本。
     返回 ``(logits, active)``；``active[b]`` 表示该图实际参与了解码。
     """
-    batch_size = int(embeddings.shape[0])
+    view = low_res_features(embeddings)
+    batch_size = int(view.shape[0])
     if len(prompts) != batch_size:
         raise ValueError(f"prompts 数量 {len(prompts)} 与 batch size {batch_size} 不一致")
 
@@ -750,13 +844,18 @@ def decode_with_prompts(
         labels: Optional[torch.Tensor] = None
         if prompt is not None:
             coords, labels = prompt
-            coords = coords.to(device=embeddings.device, dtype=torch.float32).reshape(-1, 2)
-            labels = labels.to(device=embeddings.device, dtype=torch.long).reshape(-1)
+            coords = coords.to(device=view.device, dtype=torch.float32).reshape(-1, 2)
+            labels = labels.to(device=view.device, dtype=torch.long).reshape(-1)
             valid = labels.numel() > 0 and bool((labels == 1).any())
 
         if valid and coords is not None and labels is not None:
+            sample = (
+                embeddings.select(index)
+                if isinstance(embeddings, SAM2ImageFeatures)
+                else embeddings[index : index + 1]
+            )
             sample_logits = sam.decode(
-                embeddings[index : index + 1],
+                sample,
                 [(coords, labels)],
                 output_size=output_size,
             )
@@ -778,7 +877,7 @@ def decode_with_prompts(
                     (1, 1, int(output_size[0]), int(output_size[1])),
                     empty_logit,
                     dtype=torch.float32,
-                    device=embeddings.device,
+                    device=view.device,
                 )
             )
             active.append(False)
@@ -1277,7 +1376,7 @@ class Predictor:
         # 处理由扩散模块和 engine 的 log_prob 负责。
         with self._autocast():
             embeddings = encode_images(self.sam, tensor, valid_sizes)
-            conditions, _ = self.condition_encoder(tensor, embeddings)
+            conditions, _ = self.condition_encoder(tensor, low_res_features(embeddings))
             conditions = [item.detach() for item in conditions]
             heatmaps = self.diffusion.sample(
                 self.unet,

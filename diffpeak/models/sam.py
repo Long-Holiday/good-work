@@ -1,19 +1,70 @@
-"""SAM 分割分支。
+"""SAM 2.1 分割分支。
 
 约定：
-- 图像编码器与提示编码器始终冻结，仅掩码解码器可训练；
+- 图像编码器与提示编码器始终冻结，仅掩码解码器（含其高分辨率投影）可训练；
 - 输入图像为 RGB、取值范围 ``[0, 1]``、尺寸 ``B x 3 x 1024 x 1024``；
-- 提示点坐标已经位于 SAM 的 1024 输入坐标系，正点标签为 1，负点为 0。
+- 提示点坐标已经位于 SAM2 的 1024 输入坐标系，正点标签为 1，负点为 0。
+
+与 SAM1 的关键差异：
+- 图像编码器为 Hiera + FPN neck，输出低分辨率 ``B x 256 x 64 x 64``；
+- SAM2.1 解码器默认还需要两级高分辨率特征
+  ``B x 32 x 256 x 256`` 与 ``B x 64 x 128 x 128``；
+- 归一化使用 ImageNet ``[0.485, 0.456, 0.406] / [0.229, 0.224, 0.225]``
+  （在 ``[0, 1]`` 像素尺度上），与 SAM1 的 0~255 均值/方差数值等价；
+- 官方图像预测器会把冻结的 ``no_mem_embed`` 加到最低分辨率特征上，
+  这里保持一致。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from numbers import Real
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+# SAM2.1 Hiera-B+ 的官方 Hydra 配置名（相对于已安装的 sam2 包）。
+DEFAULT_SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+DEFAULT_SAM2_ARCHITECTURE = "sam2.1_hiera_base_plus"
+
+
+@dataclass(frozen=True)
+class SAM2ImageFeatures:
+    """一张（或一批）图像的低分辨率与高分辨率 SAM2 特征。
+
+    Attributes:
+        low_res: ``B x 256 x 64 x 64``，供条件编码器与掩码解码器使用。
+        high_res: ``(B x 256 x 256 x 256, B x 256 x 128 x 128)`` 的原始 FPN
+            特征。其通道仍为 neck 的 ``d_model``；1x1 投影 ``conv_s0`` /
+            ``conv_s1`` 在解码时执行，使这两个解码器参数可训练。
+        """
+
+    low_res: Tensor
+    high_res: Optional[Tuple[Tensor, Tensor]] = None
+
+    def select(self, index: int) -> "SAM2ImageFeatures":
+        """返回 batch 中第 ``index`` 个样本的视图（保持 batch 维）。"""
+        high = (
+            None
+            if self.high_res is None
+            else (self.high_res[0][index : index + 1], self.high_res[1][index : index + 1])
+        )
+        return SAM2ImageFeatures(self.low_res[index : index + 1], high)
+
+
+def low_res_features(embeddings: object) -> Tensor:
+    """从特征容器或裸张量中取出低分辨率特征。"""
+    low = getattr(embeddings, "low_res", None)
+    if isinstance(low, Tensor):
+        return low
+    if isinstance(embeddings, Tensor):
+        return embeddings
+    raise TypeError(
+        "SAM 特征应为 Tensor 或 SAM2ImageFeatures，"
+        f"实际为 {type(embeddings)!r}"
+    )
 
 
 def _is_size_pair(value: object) -> bool:
@@ -28,71 +79,122 @@ def _is_size_pair(value: object) -> bool:
         return False
 
 
-def _build_sam(checkpoint: str, model_type: str) -> nn.Module:
-    """按需导入官方实现并构建 SAM，避免无 SAM 环境下的模块级强依赖。"""
+def _build_sam2(
+    config_name: str,
+    checkpoint: Optional[str],
+    *,
+    apply_postprocessing: bool = False,
+) -> nn.Module:
+    """按需导入官方 SAM2 并构建模型，避免无 SAM2 环境下的强依赖。
+
+    ``checkpoint=None`` 时使用官方随机初始化路径，便于无权重架构测试。
+    """
     try:
-        from segment_anything import sam_model_registry
+        from sam2.build_sam import build_sam2
     except ImportError as exc:  # pragma: no cover - 仅用于给出更清晰的安装提示
         raise ImportError(
-            "未找到官方 segment-anything，请安装 "
-            "`pip install git+https://github.com/facebookresearch/segment-anything.git`"
+            "未找到官方 SAM2，请安装 "
+            "`SAM2_BUILD_CUDA=0 pip install "
+            "'SAM-2 @ git+https://github.com/facebookresearch/sam2.git"
+            "@2b90b9f5ceec907a1c18123530e92e794ad901a4'`"
         ) from exc
-    if model_type not in sam_model_registry:
-        raise ValueError(f"未知的 SAM 模型类型: {model_type}")
-    return sam_model_registry[model_type](checkpoint=checkpoint)
+
+    # 统一在 CPU 上构建，由外层 ``.to(device)`` 搬运；避免构建时假设 CUDA。
+    # apply_postprocessing 默认关闭，让单掩码输出固定使用 token 0，
+    # 训练/验证/奖励口径一致。
+    try:
+        return build_sam2(
+            config_file=config_name,
+            ckpt_path=checkpoint,
+            device="cpu",
+            mode="eval",
+            apply_postprocessing=apply_postprocessing,
+        )
+    except (RuntimeError, KeyError) as exc:
+        if checkpoint is None:
+            raise
+        # 官方 ``_load_checkpoint`` 对 missing/unexpected key 只抛出无信息的
+        # RuntimeError；若文件根本不含 ``"model"`` 字段（例如直接保存的
+        # SAM1 state dict），则抛出 KeyError。两者都补上明确诊断，拒绝把
+        # SAM1 ViT-B 权重误用于 SAM2。
+        raise ValueError(
+            f"无法按 SAM2 配置 {config_name!r} 加载权重：{checkpoint}。"
+            "请确认权重与所选 Hiera 尺寸一致。SAM1 ViT-B（如 "
+            "sam_vit_b_01ec64.pth）的 state dict 与 SAM2 不兼容；其他尺寸的"
+            "SAM2.1 权重也需要对应的 sam_config/sam_architecture。"
+        ) from exc
 
 
 class RoadSAM(nn.Module):
-    """基于官方 SAM ViT-B 的道路分割分支。
+    """基于官方 SAM2.1 Hiera-B+ 的道路分割分支。
 
-    图像编码器和提示编码器冻结，掩码解码器可训练。``encode`` 与 SAM 的
-    预处理一起完成，内部使用 ``torch.no_grad()``，因此返回的特征不带梯度。
+    图像编码器、提示编码器、记忆模块与位置参数全部冻结；仅
+    ``sam_mask_decoder``（含 ``conv_s0`` / ``conv_s1``）可训练。
+    ``encode`` 在 ``torch.no_grad()`` 下运行冻结编码器，返回不带梯度的
+    特征；高分辨率投影在 ``decode`` 中执行，以保留了解码器参数的梯度。
 
     Args:
-        checkpoint: 官方 SAM 权重路径（例如 ``sam_vit_b_01ec64.pth``）。
-        model_type: ``segment_anything`` 注册表中的模型类型，默认 ``vit_b``。
-        no_positive_logit: 无正点时的常量负 logit，默认 -20（sigmoid 后约为 0）。
+        checkpoint: 官方 SAM2.1 权重路径（例如
+            ``sam2.1_hiera_base_plus.pt``）。
+        config_name: 官方 Hydra 配置名，默认 Hiera-B+。
+        no_positive_logit: 无正点时的常量负 logit，默认 -20。
+        apply_postprocessing: 是否启用官方解码器的动态多掩码回退。默认
+            ``False``，保证训练、验证与奖励使用同一种单掩码语义。
+        architecture: 写入快照的骨干标识；默认使用 ``config_name``。
     """
 
     def __init__(
         self,
-        checkpoint: str,
-        model_type: str = "vit_b",
+        checkpoint: Optional[str] = None,
+        config_name: str = DEFAULT_SAM2_CONFIG,
         no_positive_logit: float = -20.0,
+        apply_postprocessing: bool = False,
+        architecture: Optional[str] = None,
     ) -> None:
         super().__init__()
-        self.sam = _build_sam(checkpoint, model_type)
-        self.model_type = model_type
+        self.sam = _build_sam2(
+            str(config_name),
+            None if checkpoint is None else str(checkpoint),
+            apply_postprocessing=bool(apply_postprocessing),
+        )
+        self.config_name = str(config_name)
+        self.architecture = str(architecture or config_name)
+        self.apply_postprocessing = bool(apply_postprocessing)
         self.no_positive_logit = float(no_positive_logit)
 
-        # 官方 SAM 使用 0~255 像素尺度下的均值/方差做归一化。
+        # SAM2 官方变换在 [0,1] 像素尺度上做 ImageNet 标准化。
         self.register_buffer(
             "pixel_mean",
-            torch.tensor([123.675, 116.28, 103.53]).view(1, 3, 1, 1),
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
             persistent=False,
         )
         self.register_buffer(
             "pixel_std",
-            torch.tensor([58.395, 57.12, 57.375]).view(1, 3, 1, 1),
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
             persistent=False,
         )
 
         self._freeze_encoder_and_prompt()
 
+    @property
+    def mask_decoder(self) -> nn.Module:
+        """可训练的解码器（SAM2 命名为 ``sam_mask_decoder``）。"""
+        return self.sam.sam_mask_decoder
+
     def _freeze_encoder_and_prompt(self) -> None:
-        """冻结图像编码器与提示编码器，仅保留掩码解码器可训练。"""
-        for module in (self.sam.image_encoder, self.sam.prompt_encoder):
-            module.eval()
-            for param in module.parameters():
-                param.requires_grad_(False)
-        for param in self.sam.mask_decoder.parameters():
-            param.requires_grad_(True)
+        """冻结除掩码解码器外的全部 SAM2 参数。"""
+        for parameter in self.sam.parameters():
+            parameter.requires_grad_(False)
+        for parameter in self.sam.sam_mask_decoder.parameters():
+            parameter.requires_grad_(True)
 
     def train(self, mode: bool = True) -> "RoadSAM":
-        """保持冻结模块处于 eval，避免训练脚本整体 ``train()`` 改变其行为。"""
+        """保持冻结模块处于 eval，仅切换掩码解码器的训练状态。"""
         super().train(mode)
-        self.sam.image_encoder.eval()
-        self.sam.prompt_encoder.eval()
+        for name, child in self.sam.named_children():
+            if name != "sam_mask_decoder":
+                child.eval()
+        self.sam.sam_mask_decoder.train(mode)
         return self
 
     @staticmethod
@@ -147,37 +249,35 @@ class RoadSAM(nn.Module):
         self,
         images: Tensor,
         valid_sizes: Optional[Union[Sequence[Tuple[int, int]], Tensor]] = None,
-    ) -> Tensor:
-        """编码 RGB 图像，返回 SAM 图像特征。
+    ) -> SAM2ImageFeatures:
+        """编码 RGB 图像，返回 SAM2 低分辨率与高分辨率特征。
 
         Args:
             images: ``[0, 1]`` 范围的 ``B x 3 x 1024 x 1024`` 张量。非方形
                 影像应由外层先按最长边缩放到 1024，并在右下补零到 1024²。
-            valid_sizes: 可选的每样本有效区域 ``(height, width)``，表示缩放
-                后内容在 1024 画布左上角占据的区域。提供时会把右下填充区在
-                归一化后显式置零，与官方 SAM ``preprocess`` 的
-                ``F.pad(..., value=0)`` 一致。必须由调用方显式给出；本方法
-                不会根据黑色像素猜测填充区域。
+            valid_sizes: 可选的每样本有效区域 ``(height, width)``。提供时
+                会在归一化后把右下填充区显式置零。
 
         Returns:
-            ``B x 256 x 64 x 64`` 图像特征，不带梯度。
+            :class:`SAM2ImageFeatures`，其中 ``low_res`` 为
+            ``B x 256 x 64 x 64``，``high_res`` 为原始 FPN 的
+            ``B x 256 x 256 x 256`` 与 ``B x 256 x 128 x 128`` 特征。
+            所有特征都不带梯度。
         """
         if images.ndim != 4 or images.shape[1] != 3:
             raise ValueError(f"images 应为 B x 3 x H x W，实际为 {tuple(images.shape)}")
         if tuple(images.shape[-2:]) != (1024, 1024):
-            raise ValueError(f"SAM ViT-B 要求 1024 x 1024 输入，实际为 {tuple(images.shape[-2:])}")
+            raise ValueError(
+                f"SAM2 Hiera 要求 1024 x 1024 输入，实际为 {tuple(images.shape[-2:])}"
+            )
         if not images.is_floating_point():
             raise TypeError(f"images 必须是浮点张量，实际 dtype 为 {images.dtype}")
 
         height, width = int(images.shape[-2]), int(images.shape[-1])
 
         with torch.no_grad():
-            x = images * 255.0
-
-            # 官方 Sam.preprocess 先标准化有效图像，再以 0 填充。
-            # 外层已填充的 RGB 画布须在标准化之后重置无效区域。
-            x = (x - self.pixel_mean.to(device=x.device, dtype=x.dtype)) / self.pixel_std.to(
-                device=x.device, dtype=x.dtype
+            x = (images - self.pixel_mean.to(device=images.device, dtype=images.dtype)) / (
+                self.pixel_std.to(device=images.device, dtype=images.dtype)
             )
             if valid_sizes is not None:
                 sizes = self._normalise_valid_sizes(
@@ -193,7 +293,53 @@ class RoadSAM(nn.Module):
                         mask[index, 0, :valid_h, :valid_w] = True
                     x = x.masked_fill(~mask, 0.0)
 
-            return self.sam.image_encoder(x)
+            # 直接调用 image_encoder，而不是 forward_image：后者会在 no_grad
+            # 内执行解码器的 conv_s0/conv_s1，导致这两个参数拿不到梯度。
+            backbone_out = self.sam.image_encoder(x)
+            low_res = backbone_out["vision_features"]
+            if bool(getattr(self.sam, "directly_add_no_mem_embed", False)):
+                # ``no_mem_embed`` 的官方形状是 ``1 x 1 x C``（对应
+                # ``HW x B x C``），加到 BCHW 特征前必须 reshape 为
+                # ``1 x C x 1 x 1``，否则会沿错误维度广播或直接报错。
+                no_mem = self.sam.no_mem_embed.view(
+                    1, -1, 1, 1
+                ).to(device=low_res.device, dtype=low_res.dtype)
+                low_res = low_res + no_mem
+
+            high_res: Optional[Tuple[Tensor, Tensor]] = None
+            if bool(getattr(self.sam, "use_high_res_features_in_sam", False)):
+                fpn = backbone_out["backbone_fpn"]
+                high_res = (fpn[0].detach(), fpn[1].detach())
+
+            return SAM2ImageFeatures(low_res.detach(), high_res)
+
+    @staticmethod
+    def _per_sample_points(
+        points: Sequence[Tuple[Tensor, Tensor]],
+        batch_size: int,
+        device: torch.device,
+    ) -> List[Tuple[Tensor, Tensor]]:
+        """校验并转换每个样本的点集，**不**做跨样本补齐。
+
+        官方 SAM2 提示编码器在 ``boxes=None`` 时会自行追加一个
+        ``not_a_point`` 填充 token。如果在 batch 内按最长点集补齐为 -1，
+        提示编码器仍会再追加一个，导致同一样本在批量与单图解码时 token
+        数不同、结果不一致。因此 ``decode`` 必须使用未补齐的逐样本点集。
+        """
+        if len(points) != batch_size:
+            raise ValueError(f"points 数量 {len(points)} 与 batch size {batch_size} 不一致")
+
+        prepared: List[Tuple[Tensor, Tensor]] = []
+        for sample_points in points:
+            if not isinstance(sample_points, (tuple, list)) or len(sample_points) != 2:
+                raise ValueError("每个样本的 points 应为 (coords[K, 2], labels[K])")
+            coords, labels = sample_points
+            coords = coords.to(device=device, dtype=torch.float32).reshape(-1, 2)
+            labels = labels.to(device=device, dtype=torch.long).reshape(-1)
+            if coords.shape[0] != labels.shape[0]:
+                raise ValueError("点坐标与标签数量不一致")
+            prepared.append((coords, labels))
+        return prepared
 
     def _prepare_points(
         self,
@@ -203,31 +349,17 @@ class RoadSAM(nn.Module):
     ) -> Tuple[Tensor, Tensor]:
         """将变长点集补齐为 ``B x K x 2`` 与 ``B x K``。
 
-        标签为 -1 的填充位置会被官方提示编码器视为 ``not_a_point``。
+        这是批量张量接口的辅助函数；``decode`` 逐图解码，使用
+        :meth:`_per_sample_points`，避免跨样本补齐引入多余提示 token。
         """
-        if len(points) != batch_size:
-            raise ValueError(f"points 数量 {len(points)} 与 batch size {batch_size} 不一致")
-
-        coords_list: List[Tensor] = []
-        labels_list: List[Tensor] = []
-        max_points = 0
-        for sample_points in points:
-            if not isinstance(sample_points, (tuple, list)) or len(sample_points) != 2:
-                raise ValueError("每个样本的 points 应为 (coords[K, 2], labels[K])")
-            coords, labels = sample_points
-            coords = coords.to(device=device, dtype=torch.float32).reshape(-1, 2)
-            labels = labels.to(device=device, dtype=torch.long).reshape(-1)
-            if coords.shape[0] != labels.shape[0]:
-                raise ValueError("点坐标与标签数量不一致")
-            coords_list.append(coords)
-            labels_list.append(labels)
-            max_points = max(max_points, coords.shape[0])
+        prepared = self._per_sample_points(points, batch_size, device)
+        max_points = max((coords.shape[0] for coords, _ in prepared), default=0)
 
         padded_coords = torch.zeros(batch_size, max_points, 2, device=device, dtype=torch.float32)
         padded_labels = torch.full(
             (batch_size, max_points), -1, device=device, dtype=torch.long
         )
-        for index, (coords, labels) in enumerate(zip(coords_list, labels_list)):
+        for index, (coords, labels) in enumerate(prepared):
             count = coords.shape[0]
             if count == 0:
                 continue
@@ -237,87 +369,112 @@ class RoadSAM(nn.Module):
 
     def _empty_logits(
         self,
-        embeddings: Tensor,
+        embeddings: Union[Tensor, SAM2ImageFeatures],
         output_size: Tuple[int, int],
         dtype: Optional[torch.dtype] = None,
     ) -> Tensor:
-        """生成不带梯度的常量负 logits，用于无正点样本。
-
-        ``dtype`` 可显式指定，以便混合 batch 中与掩码解码器的输出对齐
-        （例如 AMP 下解码器输出与图像特征 dtype 不同的情况）。
-        """
-        batch_size = embeddings.shape[0]
+        """生成不带梯度的常量负 logits，用于无正点样本。"""
+        low_res = low_res_features(embeddings)
+        batch_size = low_res.shape[0]
         height, width = int(output_size[0]), int(output_size[1])
         return torch.full(
             (batch_size, 1, height, width),
             self.no_positive_logit,
-            device=embeddings.device,
-            dtype=embeddings.dtype if dtype is None else dtype,
+            device=low_res.device,
+            dtype=low_res.dtype if dtype is None else dtype,
         )
 
     def decode(
         self,
-        embeddings: Tensor,
+        embeddings: Union[Tensor, SAM2ImageFeatures],
         points: Sequence[Tuple[Tensor, Tensor]],
         output_size: Tuple[int, int] = (1024, 1024),
     ) -> Tensor:
-        """根据 SAM 图像特征与正负点提示输出道路分割 logits。
+        """根据 SAM2 图像特征与正负点提示输出道路分割 logits。
 
         Args:
-            embeddings: ``encode`` 返回的 ``B x 256 x 64 x 64`` 特征。
+            embeddings: ``encode`` 返回的 :class:`SAM2ImageFeatures`。为兼容
+                旧测试，也接受裸低分辨率 ``B x 256 x 64 x 64`` 张量；此时若
+                模型需要高分辨率特征会明确报错。
             points: 长度为 B 的列表，每项为
-                ``(coords[K, 2], labels[K])``；坐标使用 SAM 的 1024 坐标系，
+                ``(coords[K, 2], labels[K])``；坐标使用 1024 坐标系，
                 标签 1 为正点、0 为负点。
             output_size: 输出空间尺寸，默认 ``(1024, 1024)``。
 
         Returns:
-            ``B x 1 x H x W`` 的分割 logits。若某个样本没有正点，则该样本输出
-            常量负 logits，并且不会为其构造计算图。
-
-        Notes:
-            官方 ``mask_decoder`` 内部会对 ``image_embeddings`` 执行
-            ``repeat_interleave(tokens.shape[0], dim=0)``。如果一次传入 B 张
-            图像和 B 组提示，会得到 B*B 个 mask；因此这里逐图解码，确保
-            batch>1 时语义正确。掩码解码器参数保持可训练，梯度仍可回传。
+            ``B x 1 x H x W`` 的分割 logits。
         """
-        if embeddings.ndim != 4:
-            raise ValueError(f"embeddings 应为 B x 256 x 64 x 64，实际为 {tuple(embeddings.shape)}")
-        batch_size = embeddings.shape[0]
+        low_res = low_res_features(embeddings)
+        if low_res.ndim != 4:
+            raise ValueError(
+                f"embeddings 应为 B x 256 x 64 x 64，实际为 {tuple(low_res.shape)}"
+            )
+        batch_size = low_res.shape[0]
         if len(output_size) != 2:
             raise ValueError("output_size 应为 (H, W)")
 
-        coords, labels = self._prepare_points(points, batch_size, embeddings.device)
-        positive_counts = (labels == 1).sum(dim=1).tolist()
+        high_res = (
+            embeddings.high_res if isinstance(embeddings, SAM2ImageFeatures) else None
+        )
+
+        prepared_points = self._per_sample_points(points, batch_size, low_res.device)
+        positive_counts = [
+            int((labels == 1).sum()) for _, labels in prepared_points
+        ]
 
         # 整个 batch 都没有正点：直接返回常量，避免无意义的解码与空梯度。
         if not any(count > 0 for count in positive_counts):
             return self._empty_logits(embeddings, output_size)
 
+        if bool(getattr(self.sam, "use_high_res_features_in_sam", False)) and high_res is None:
+            raise ValueError(
+                "SAM2.1 解码器需要高分辨率特征；请传入 RoadSAM.encode 的 "
+                "SAM2ImageFeatures，而不是裸低分辨率张量"
+            )
+
         with torch.no_grad():
-            image_pe = self.sam.prompt_encoder.get_dense_pe()
+            image_pe = self.sam.sam_prompt_encoder.get_dense_pe()
 
         decoded: List[Optional[Tensor]] = []
         for index, positive_count in enumerate(positive_counts):
             if positive_count == 0:
-                # 无正点样本统一返回空道路掩码，不强行补全局最大点。
-                # 先占位，待确定解码器输出的 dtype 后再生成常量。
                 decoded.append(None)
                 continue
 
-            # 每张图像单独调用一次解码器，避免官方 repeat_interleave 造成
-            # B 张图像 × B 组提示的 B² 组合。
-            sample_coords = coords[index : index + 1]
-            sample_labels = labels[index : index + 1]
+            sample_features = (
+                embeddings.select(index)
+                if isinstance(embeddings, SAM2ImageFeatures)
+                else embeddings[index : index + 1]
+            )
+            sample_low = low_res_features(sample_features)
+            # 不补齐：提示编码器会自行追加一个 not_a_point token，与官方
+            # 单图预测路径保持一致。
+            coords, labels = prepared_points[index]
+            sample_coords = coords.unsqueeze(0)
+            sample_labels = labels.unsqueeze(0)
             with torch.no_grad():
-                sparse_embeddings, dense_embeddings = self.sam.prompt_encoder(
+                sparse_embeddings, dense_embeddings = self.sam.sam_prompt_encoder(
                     points=(sample_coords, sample_labels), boxes=None, masks=None
                 )
-            low_res_logits, _ = self.sam.mask_decoder(
-                image_embeddings=embeddings[index : index + 1],
+
+            high_res_features = None
+            if high_res is not None:
+                # 1x1 投影属于掩码解码器，必须在 no_grad 之外执行，保证
+                # conv_s0 / conv_s1 与解码器其他参数一样可训练。
+                sample_high = high_res[0][index : index + 1], high_res[1][index : index + 1]
+                high_res_features = [
+                    self.sam.sam_mask_decoder.conv_s0(sample_high[0]),
+                    self.sam.sam_mask_decoder.conv_s1(sample_high[1]),
+                ]
+
+            low_res_logits, _, _, _ = self.sam.sam_mask_decoder(
+                image_embeddings=sample_low,
                 image_pe=image_pe,
                 sparse_prompt_embeddings=sparse_embeddings,
                 dense_prompt_embeddings=dense_embeddings,
                 multimask_output=False,
+                repeat_image=False,
+                high_res_features=high_res_features,
             )
             decoded.append(
                 F.interpolate(
@@ -328,13 +485,13 @@ class RoadSAM(nn.Module):
                 )
             )
 
-        # 用真实解码结果的 dtype/device 生成空样本常量，兼容 AMP 下
-        # 图像特征与 mask decoder 输出精度不同的情况。
         reference = next(logits for logits in decoded if logits is not None)
         outputs = [
             (
                 self._empty_logits(
-                    embeddings[index : index + 1],
+                    embeddings.select(index)
+                    if isinstance(embeddings, SAM2ImageFeatures)
+                    else embeddings[index : index + 1],
                     output_size,
                     dtype=reference.dtype,
                 )

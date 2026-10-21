@@ -1,6 +1,8 @@
 # 实验登记模板，不是 train.py 配置；不要传给 --config。
 # 复制后填写 null 项；完整训练 YAML 另从 configs/3090.yaml 派生。
 # 规则见 experimental_protocol.md；未在 3090 上实测的数据不得填写为实测值。
+# 目标骨干为 SAM2.1 Hiera-B+（官方配置 configs/sam2.1/sam2.1_hiera_b+.yaml，
+# 权重 sam2.1_hiera_base_plus.pt）。SAM1 的 checkpoint、快照和探针数据不适用。
 protocol:
   version: protocol_v1_draft
   status: draft  # 仅全部必填项已确认后改为 frozen
@@ -14,14 +16,22 @@ data:
   duplicate_check_report: null
   geographic_independence: null
   split_seed: 42
+  split_generation_command: null  # 例：python scripts/prepare_splits.py --root DeepGlobe_Road --output splits/protocol_v1 --val-fraction 0.1 --test-fraction 0.1 --seed 42
   train: {manifest: null, sha256: null, count: null}
   val: {manifest: null, sha256: null, count: null}
   test: {manifest: null, sha256: null, count: null}
-  test_previously_used: null
+  test_previously_used: null  # true/false；当前诊断记录见 experimental_protocol.md 第 2 节
+  test_usage_history: null
+  test_untouched_claim_basis: null
 
 environment:
+  host: seetacloud2
   gpu: NVIDIA RTX 3090 24GB
   gpu_verified: false
+  cpu_quota_vcpus: 14
+  ram_gib: 90
+  shm_gib: 45
+  thread_policy: null  # 探针默认 --cpu-threads 2 --interop-threads 1；记录 OMP/MKL/inter-op 实际线程
   python: null
   pytorch: null
   torchvision: null
@@ -38,8 +48,11 @@ experiment:
   implementation_commit: null
   factor_under_test: null
   comparison_track: null  # data_exposure / equal_compute / mechanism / diagnostic
-  backbone: null
-  pretrained_source: null
+  backbone: sam2.1_hiera_b+
+  sam2_config: configs/sam2.1/sam2.1_hiera_b+.yaml
+  sam2_source_commit: 2b90b9f5ceec907a1c18123530e92e794ad901a4
+  sam2_checkpoint: sam2.1_hiera_base_plus.pt
+  pretrained_source: "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt"
   pretrained_sha256: null
   trainable_modules: null
   parent_checkpoint: null
@@ -49,18 +62,19 @@ experiment:
   training_seeds: [42, 43, 44]
 
 budget:
-  # 以下为候选起点；须先测量再冻结。阶段缩短时总曝光同步改动。
+  # 阶段数值从 configs/3090.yaml 派生；预实验后填入冻结值，不在此复制候选表。
+  # 未在 3090 上实测的数值不得填为实测值；总曝光随阶段缩短同步改动。
   stages:
-    A: {epochs: 15, lr: 0.0001}
-    B: {epochs: 60, lr: 0.0001}
-    C: {epochs: 10, lr: 0.00005}
-    D: {epochs: 10, lr: 0.000001}
-  max_dataset_passes: 95
+    A: {epochs: null, lr: null}
+    B: {epochs: null, lr: null}
+    C: {epochs: null, lr: null}
+    D: {epochs: null, lr: null, warmup_ratio: null, min_lr_ratio: null}
+  max_dataset_passes: null  # 由 M0 预实验冻结，不预设固定 95
   abc_micro_batch: 1
   abc_accumulation: 4
   d_micro_batch: 1
   validation_batch: 1
-  num_workers: 4
+  num_workers: null  # 从本次实际训练 YAML 填入，资源证据见 probe_3090.md
   grpo_group_size: 4
   grpo_update_epochs: 1
   gpu_hours_cap: null  # 等计算轨道必须预先填写统一 H
@@ -72,16 +86,17 @@ budget:
 
 selection:
   metric: macro_iou
-  validation_every_dataset_passes: 5
+  validation_every_dataset_passes: null  # 候选 5，预实验后冻结；所有方法必须相同
   include_final_epoch: true
   tie_breaker: earliest_checkpoint
   stage_handoff: stage_best
-  validation_rng_isolated_from_training: null
+  validation_rng_isolated_from_training: null  # 当前实现仍用训练 seed，须修复/核实后填 true
   per_sample_eval_seed_algorithm: null
   evaluation_seed: 2024
   validation_opportunity_count: null
 
 inference:
+  # 从冻结的 configs/3090.yaml 复制实际值；未实测不保证数值最优。
   longest_side: 1024
   heatmap_size: 256
   sampling_steps: 20
@@ -98,10 +113,14 @@ inference:
   empty_mask_rule: both_empty_1_otherwise_single_empty_0
 
 pilot:
-  real_sam_checkpoint_verified: false
-  full_resolution_verified: false
+  probe_report: docs/probe_3090.md  # SAM2 A/B/C 与 D 系统检查；完整预算待补
+  probe_script: scripts/probe_3090.py
+  loader_benchmark_script: scripts/benchmark_loader.py
+  confirmation_script: scripts/confirm_probe.py
+  real_sam2_checkpoint_verified: true  # SHA-256 见报告；仅开发探针
+  full_resolution_verified: true  # 1024/256；A/B 及 C/D 系统检查
   representative_train_subset_manifest: null
-  per_stage_measurements: null
+  per_stage_measurements: null  # A/B/C 与 D 系统检查已有；D 完整预算和正式长度待补
   checkpoint_resume_verified: false
   inference_repeatability_verified: false
   projected_total_gpu_hours: null

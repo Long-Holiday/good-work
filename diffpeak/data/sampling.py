@@ -1,6 +1,6 @@
 """从道路标注构造正/负提示点目标。
 
-实现遵循 ``docs/model.md`` 的数据约定：
+实现遵循 ``docs/data.md`` 的数据约定：
 
 * 骨架与采样都在**原始标注分辨率**下完成，之后才由
   :class:`~diffpeak.data.geometry.ImageGeometry` 映射到热图；

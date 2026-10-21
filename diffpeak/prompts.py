@@ -28,8 +28,10 @@
 
 from __future__ import annotations
 
+import math
+import sys
 from dataclasses import asdict, dataclass
-from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -52,6 +54,10 @@ DEFAULT_PEAK_CONFIG = {
 }
 
 _CFG_KEYS = ("sigma", "h", "threshold", "min_distance")
+# 坐标绝对值不超过该阈值时，任意两坐标之差的平方和不会溢出 float64
+# （最坏情况 2 * (2 * threshold) ** 2 = float64 最大值 / 2）。超过阈值的
+# 坐标交给旧的字面 O(K^2) 路径，保证连 OverflowError 的行为都与旧实现一致。
+_MAX_SAFE_COORD = math.sqrt(sys.float_info.max) / 4.0
 _CHANNEL_ALIASES = {
     "positive": "positive",
     "pos": "positive",
@@ -305,14 +311,26 @@ def _detect_peaks(heatmap: np.ndarray, config: _ChannelConfig) -> List[_Peak]:
     if not peak_mask.any():
         return []
 
-    components, num_components = ndimage.label(
+    components, _num_components = ndimage.label(
         peak_mask, structure=np.ones((3, 3), dtype=bool)
     )
     peaks: List[_Peak] = []
-    for component_id in range(1, int(num_components) + 1):
-        ys, xs = np.nonzero(components == component_id)
-        if len(ys) == 0:
+    # find_objects 只返回每个连通域的包围盒，避免对每个分量都扫描整张
+    # ``H x W`` 热图（旧实现是 O(K*HW)）。包围盒内仍用 ``== component_id``
+    # 取出精确像素集合，像素顺序与全局 np.nonzero 一致（逐行、列升序），
+    # 因此代表点选择与旧实现逐位相同。
+    for component_id, region in enumerate(
+        ndimage.find_objects(components), start=1
+    ):
+        if region is None:
             continue
+        y_slice, x_slice = region
+        local = components[y_slice, x_slice] == component_id
+        local_ys, local_xs = np.nonzero(local)
+        if len(local_ys) == 0:
+            continue
+        ys = local_ys + y_slice.start
+        xs = local_xs + x_slice.start
         values = smooth[ys, xs]
         max_value = float(values.max())
         # 平顶：在最大值并列的像素中，选择离区域中心最近者；
@@ -335,12 +353,29 @@ def _detect_peaks(heatmap: np.ndarray, config: _ChannelConfig) -> List[_Peak]:
     return peaks
 
 
-def _nms_peaks(peaks: Sequence[Any], min_distance: float) -> List[Any]:
-    """按分数降序做同通道距离 NMS；分数相同用 (y, x) 稳定排序。"""
-    ordered = sorted(peaks, key=lambda peak: (-peak.score, peak.y_heat, peak.x_heat))
-    if min_distance <= 0:
-        return ordered
-    minimum_sq = float(min_distance) ** 2
+def _needs_bruteforce_nms(peak: Any) -> bool:
+    """坐标无法安全走网格路径时返回 True（非有限或量级过大）。
+
+    旧实现会对每一对已保留峰计算平方距离，坐标量级过大时该平方可能
+    溢出为 ``OverflowError``；网格路径只比较邻近峰，可能根本不触发这一
+    溢出。超过 :data:`_MAX_SAFE_COORD` 时退回旧路径，异常行为也保持一致。
+    """
+    for value in (peak.y_heat, peak.x_heat):
+        try:
+            if value != value:  # NaN
+                return True
+            if abs(value) > _MAX_SAFE_COORD:
+                return True
+        except (TypeError, ValueError):
+            # 无法比较的坐标类型也交给旧路径处理。
+            return True
+    return False
+
+
+def _nms_peaks_bruteforce(
+    ordered: Sequence[Any], minimum_sq: float
+) -> List[Any]:
+    """旧实现的 O(K^2) 路径，用于坐标/网格索引退化的兜底。"""
     kept: List[Any] = []
     for peak in ordered:
         if all(
@@ -350,6 +385,62 @@ def _nms_peaks(peaks: Sequence[Any], min_distance: float) -> List[Any]:
             for other in kept
         ):
             kept.append(peak)
+    return kept
+
+
+def _nms_peaks(peaks: Sequence[Any], min_distance: float) -> List[Any]:
+    """按分数降序做同通道距离 NMS；分数相同用 (y, x) 稳定排序。
+
+    用边长为 ``min_distance`` 的空间网格加速：任何与当前峰距离小于
+    ``min_distance`` 的已保留峰，其网格坐标在任一轴上最多相差 1，因此
+    只需检查 3x3 邻域。判定仍逐项使用与旧实现完全相同的
+    ``>= minimum_sq`` 浮点比较，保留顺序不变。
+    """
+    ordered = sorted(peaks, key=lambda peak: (-peak.score, peak.y_heat, peak.x_heat))
+    distance = float(min_distance)
+    # 与 _ChannelConfig 的校验保持一致：非负有限数；0 表示关闭 NMS。
+    if not np.isfinite(distance) or distance < 0:
+        raise ValueError("min_distance 必须是非负有限数")
+    if distance == 0:
+        return ordered
+    minimum_sq = distance ** 2
+    # 旧实现的平方距离比较对所有已保留峰执行；量级过大的坐标会溢出。
+    # 网格路径只比较邻近峰，可能跳过溢出的比较，故先整体退回旧路径。
+    if any(_needs_bruteforce_nms(peak) for peak in ordered):
+        return _nms_peaks_bruteforce(ordered, minimum_sq)
+    # 网格边长取 max(distance, 1e-6)：边长 >= distance 时 3x3 邻域仍
+    # 覆盖所有可能被压制的峰；下限只用于避免极小距离产生溢出索引。
+    cell = max(distance, 1e-6)
+    grid: Dict[Tuple[int, int], List[Any]] = {}
+    kept: List[Any] = []
+    for peak in ordered:
+        try:
+            cell_y = math.floor(peak.y_heat / cell)
+            cell_x = math.floor(peak.x_heat / cell)
+        except (OverflowError, ValueError, TypeError):
+            # 非有限坐标或极端量级无法安全建索引时，退回严格等价的
+            # 旧路径，保证语义不变。
+            return _nms_peaks_bruteforce(ordered, minimum_sq)
+        suppressed = False
+        for offset_y in (-1, 0, 1):
+            for offset_x in (-1, 0, 1):
+                for other in grid.get(
+                    (cell_y + offset_y, cell_x + offset_x), ()
+                ):
+                    if (
+                        (peak.y_heat - other.y_heat) ** 2
+                        + (peak.x_heat - other.x_heat) ** 2
+                        < minimum_sq
+                    ):
+                        suppressed = True
+                        break
+                if suppressed:
+                    break
+            if suppressed:
+                break
+        if not suppressed:
+            kept.append(peak)
+            grid.setdefault((cell_y, cell_x), []).append(peak)
     return kept
 
 

@@ -2,8 +2,7 @@
 
 本文说明 `diffpeak/data/` 与 `diffpeak/prompts.py` 的实现约定，以及
 DeepGlobe_Road 的实际组织方式。模型结构、扩散过程和奖励设计见
-[`docs/model_grpo.md`](model_grpo.md)（当前 GRPO 后训练设计）与
-[`docs/model.md`](model.md)（早期 DDPO 设计记录）；本文只讨论数据、提示目标与固定峰值提取。
+[`docs/model_grpo.md`](model_grpo.md)。本文只讨论数据、提示目标与固定峰值提取。
 
 ## 1. DeepGlobe_Road 实际内容
 
@@ -22,18 +21,24 @@ DeepGlobe_Road/
 `metadata.csv` 同时列出了没有标注的 valid/test，因此**不能**按 metadata
 的 `split` 字段直接把 valid 当作监督集。
 
-`scripts/prepare_splits.py` 只从 `train/` 中有 mask 的影像生成：
+`scripts/prepare_splits.py` 只从 `train/` 中有 mask 的影像生成划分清单：
 
 ```text
 splits/train.json
 splits/val.json
+splits/test.json         # 仅当 --test-fraction > 0
 splits/unlabeled.json    # valid + test 的影像，仅用于推理
 splits/protocol.json
 ```
 
-其中 `train.json` / `val.json` 可以传给 `DeepGlobeDataset`。
-`unlabeled.json` 中的影像没有 GT，**不能**传给当前的监督数据集；它只适合
-单独的无标注推理流程。测试集不参与提示阈值选择、奖励优化或模型选择。
+传入 `--val-fraction 0.1 --test-fraction 0.1 --seed 42` 可生成三分清单；上游环境
+已据此生成 `splits/protocol_v1/`，记录为 train/val/test = 4,980/623/623，本
+仓库不附带生成文件。`train.json` / `val.json` / `test.json` 可以传给
+`DeepGlobeDataset`；`unlabeled.json` 中的影像没有 GT，**不能**传给监督数据集，
+只适合单独的无标注推理流程。测试集不参与提示阈值选择、奖励优化或模型选择。
+旧的两分清单和诊断样本与新 test 的交叉使用历史见
+[实验协议](experimental_protocol.md) 第 2 节，不能仅凭清单文件名声称测试集从未
+被查看。
 
 > 注意：按影像随机划分不保证地理独立性。若后续能获得区域/城市分组，
 > 应替换为区域隔离的训练/验证划分，再比较不同实验。
@@ -99,7 +104,7 @@ DeepGlobeDataset(
 * 缩放比例：`min(image_size / H, image_size / W)`；
 * 保持纵横比，内容放在左上角，右侧与底部补零（bottom-right padding）；
 * 影像用 bilinear、掩码/骨架用 nearest；
-* 点映射使用像素中心对齐，热图与 SAM 坐标互为逆变换：
+* 点映射使用像素中心对齐，热图与 SAM2 坐标互为逆变换：
   `x_image = (x_heat + 0.5) * image_size / heatmap_size - 0.5`。
 
 例如一张 `100 x 200` 的影像在 `image_size=1024` 下缩放为
@@ -157,8 +162,7 @@ seed、worker 划分、epoch 和访问顺序可复现；不同 `num_workers` 或
 ```python
 from diffpeak.prompts import PeakExtractor
 
-extractor = PeakExtractor({"sigma": 0.5, "h": 0.05,
-                           "threshold": 0.3, "min_distance": 4})
+extractor = PeakExtractor(config["peaks"])
 # 也支持 PeakExtractor(**config["peaks"]) 与逐通道覆盖
 coords_and_labels = extractor(
     heatmaps,                 # B x 2 x h x w（或单张 2 x h x w）
@@ -168,14 +172,11 @@ coords_and_labels = extractor(
 coords, labels = coords_and_labels[0]  # K x 2 (x, y), K
 ```
 
-默认参数：
-
-| 参数 | 默认值 | 作用 |
-|---|---:|---|
-| `sigma` | 0.5 | 提取前高斯平滑（热图像素） |
-| `h` | 0.05 | h-maxima 相对高度 |
-| `threshold` | 0.3 | 绝对响应阈值 |
-| `min_distance` | 4 | 同通道 NMS 最小间距（热图像素） |
+协议使用的 `sigma / h / threshold / min_distance` 数值统一见
+`configs/3090.yaml` 的 `peaks`，本文不复制参数表。四个参数的含义和单位保持
+如下：`sigma` 是提取前高斯平滑标准差（热图像素），`h` 是 h-maxima 相对高度，
+`threshold` 是绝对响应阈值，`min_distance` 是同通道 NMS 最小间距（热图像素）。
+`h=0` 时退化为普通局部极大。
 
 每个通道可以独立覆盖：
 
@@ -200,7 +201,7 @@ PeakExtractor({
 3. 删除绝对响应低于阈值的峰；
 4. 峰区域连通域标记，每个区域取一个代表点；平顶时选距区域中心最近者，
    再按 `(y, x)` 字典序固定平局；
-5. 映射到 SAM 坐标，按 `valid_sizes` 排除 padding；
+5. 映射到 SAM2 坐标，按 `valid_sizes` 排除 padding；
 6. 按分数降序做同通道距离 NMS（无固定点数上限）；
 7. 正负坐标完全重合时，分数高者胜；分数相同正点优先。
 
@@ -263,9 +264,9 @@ points = dataset.get_target_points(0)
 * 提取阈值是否高于目标峰的实际响应；
 * `valid_sizes` 是否按 `(height, width)` 传入。
 
-## 6. 依赖与 24G RTX 3090 起点
+## 6. 依赖与配置来源
 
-`requirements.txt` 给出的版本起点（本任务未执行安装或测试）：
+`requirements.txt` 的固定依赖；SAM2 安装与测试记录见 `docs/testing.md` 和 `docs/probe_3090.md`：
 
 ```text
 Ubuntu 22.04 / Python 3.12
@@ -276,27 +277,23 @@ scikit-image==0.24.0
 Pillow==10.4.0
 PyYAML==6.0.2
 tqdm==4.66.5
-segment-anything==1.0
+SAM-2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4
 ```
 
+SAM2 从官方源码安装，安装时设置 `SAM2_BUILD_CUDA=0` 关闭可选 CUDA 扩展；权重使用
+`sam2.1_hiera_base_plus.pt`，官方配置为 `configs/sam2.1/sam2.1_hiera_b+.yaml`。
+SAM1 的 `segment-anything==1.0` 与 `sam_vit_b_01ec64.pth` 不再使用，旧 checkpoint
+不能加载到 SAM2。
+
 `h_maxima`、`distance_transform_edt`、`skeletonize` 分别来自
-scikit-image / SciPy；数据 worker 会使用它们，建议 `num_workers=4` 起步，
-在 3090 机器上按 CPU 核数和内存调整。
+scikit-image / SciPy；数据 worker 会使用它们。数据侧所有数值起点（输入/热图
+几何、`heatmap_sigma`、`target_min_distance`、`peaks`、正负点采样范围和 worker
+数量）统一见 [`configs/3090.yaml`](../configs/3090.yaml)，本文不复制推荐参数表。
+worker 数量不是纯性能开关：worker ID 参与现有数据 RNG，改变数量会改变增强和
+提示随机流，正式实验必须冻结。CPU 预处理吞吐与 SAM2 B 阶段的 worker 比较见
+`docs/probe_3090.md`；探针脚本使用 `--cpu-threads 2 --interop-threads 1` 限制线程。
 
-推荐数据侧参数（与 `configs/3090.yaml` 一致）：
-
-| 项目 | 起点 |
-|---|---|
-| `image_size` | 1024 |
-| `heatmap_size` | 256 |
-| 目标高斯 `heatmap_sigma` | 1.0 热图像素 |
-| `target_min_distance` | 4 热图像素（与提取器一致） |
-| 提取 `sigma / h / threshold / min_distance` | `0.5 / 0.05 / 0.3 / 4` |
-| 正点间距 | 24 ~ 64 原始像素（随机） |
-| 负点 | 边界 8~20、背景 4~12，随影像随机 |
-
-24G 显存下模型侧仍建议 batch size 1 + 梯度累积 + AMP；这些属于训练配置，
-不在数据模块内强制。
+模型侧的 batch size、梯度累积和 AMP 同样属于训练配置，不在数据模块内强制。
 
 ## 7. 已知边界与实验注意
 
@@ -304,8 +301,8 @@ scikit-image / SciPy；数据 worker 会使用它们，建议 `num_workers=4` �
   分支，不代表已做完整拓扑清理。
 * 正点按随机间距采样，是**一组合理提示布局的采样**，不保证覆盖每条分支
   的每个端点；多 epoch 访问会产生不同布局（训练模式）。
-* 256 热图对应 1024 输入时存在固有的量化误差；设计文档建议的
-  `512 x 512` 热图实验可用于单独评估这一项。
+* 256 热图对应 1024 输入时存在固有的量化误差；`512 x 512` 热图可作为
+  单独实验评估这一项。
 * 无道路样本的监督是“双通道全零”；有道路但未生成正峰时，模型应通过
   分割奖励得到低分，而不是由数据模块强行补全局最大点。
 * 官方 valid/test 没有 mask，不能作为监督集；`unlabeled.json` 仅用于

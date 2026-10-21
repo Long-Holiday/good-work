@@ -1,5 +1,15 @@
 # 测试记录
 
+## SAM2.1 与探针工具验证（2026-10-21）
+
+- 在本地 `pytorch` 环境安装官方 SAM2 固定提交 `2b90b9f5ceec907a1c18123530e92e794ad901a4`，`pip check` 通过。最初 build isolation 尝试额外安装 CUDA/PyTorch 导致临时目录空间不足；改用 `SAM2_BUILD_CUDA=0 ... pip install --no-build-isolation`，保留原 PyTorch 后成功。
+- 完整回归：`conda run -n pytorch python -m pytest tests -q`，**293 passed、169 subtests passed，10.16 秒**。包含真实官方随机权重 SAM2 模块的解码/梯度集成、SAM1 快照拒绝、显式高分辨率特征传递、有界探针和线程 CLI。
+- 数据三分工具新增独立 test，保持旧默认两分兼容；固定种子、互斥清单与拒绝覆盖测试通过。
+- 峰区域查找与网格 NMS 优化已对旧实现进行随机/边界/密集峰等价检查；没有改阈值、峰数上限或提示语义。
+- 3090 真实 SAM2 A/B 已完成有界训练和实际更新；资源结果、参数筛选及尚未完成项只在 [3090 探针记录](probe_3090.md) 维护，不能从 CPU 测试推断完整训练收敛。
+
+以下章节均为 **SAM2 迁移前的历史记录**；其中“未下载权重”“未测 3090”等描述只适用于对应历史时点。
+
 ## 实验日志与 TensorBoard 增量验证（2026-10-21）
 
 在已有 `pytorch` conda 环境安装 `tensorboard==2.21.0`，`pip check` 无依赖冲突。

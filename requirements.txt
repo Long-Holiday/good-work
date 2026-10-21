@@ -10,5 +10,5 @@ PyYAML==6.0.2
 tqdm==4.66.5
 # 实验日志/TensorBoard；默认开启，可用 --no-tensorboard 关闭。
 tensorboard>=2.18,<3
-# 原版 SAM 的 PyPI 发布；权重与许可证见官方仓库。
-segment-anything==1.0
+# 官方 SAM 2.1；固定源码版本，安装时 SAM2_BUILD_CUDA=0 可关闭可选 CUDA 扩展。
+SAM-2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4

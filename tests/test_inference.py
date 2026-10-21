@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -25,6 +26,8 @@ from diffpeak.inference import (  # noqa: E402
     Predictor,
     aggregate_metrics,
     decode_with_prompts,
+    _validate_sam_architecture,
+    load_checkpoint_models,
     load_image_file,
     load_labeled_split,
     load_mask_file,
@@ -203,6 +206,70 @@ class PromptBoundaryTest(unittest.TestCase):
                 [None],
                 output_size=(8, 8),
             )
+
+
+class CheckpointSAM2GuardTest(unittest.TestCase):
+    def test_old_sam1_snapshot_is_rejected_with_clear_message(self) -> None:
+        # RoadSAM/SAM2 目标模型按 ``sam.sam_mask_decoder`` 命名权重。
+        target = types.SimpleNamespace(
+            sam=types.SimpleNamespace(
+                sam_mask_decoder=torch.nn.Module(),
+                sam_prompt_encoder=torch.nn.Module(),
+            )
+        )
+        payload = {
+            "models": {
+                # 故意使用 SAM1 ViT-B 的键名。
+                "sam": {
+                    "sam.prompt_encoder.embedding.weight": torch.zeros(1),
+                    "sam.mask_decoder.iou_token.weight": torch.zeros(1),
+                },
+                "condition_encoder": {},
+                "unet": {},
+                "diffusion": {},
+            }
+        }
+
+        with self.assertRaises(ValueError) as caught:
+            load_checkpoint_models({"sam": target}, payload)
+
+        message = str(caught.exception)
+        self.assertIn("旧 SAM1", message)
+        self.assertIn("SAM2", message)
+
+    def test_mismatched_sam_architecture_is_rejected(self) -> None:
+        target = types.SimpleNamespace(
+            sam=types.SimpleNamespace(
+                sam_mask_decoder=torch.nn.Module(),
+                sam_prompt_encoder=torch.nn.Module(),
+            ),
+            architecture="sam2.1_hiera_base_plus",
+        )
+        payload = {
+            "config": {"model": {"sam_architecture": "sam2.1_hiera_large"}},
+            "models": {
+                "sam": {"sam.sam_mask_decoder.conv_s0.weight": torch.zeros(1)},
+                "condition_encoder": {},
+                "unet": {},
+                "diffusion": {},
+            },
+        }
+
+        with self.assertRaises(ValueError) as caught:
+            load_checkpoint_models({"sam": target}, payload)
+
+        self.assertIn("骨干", str(caught.exception))
+        self.assertIn("sam2.1_hiera_large", str(caught.exception))
+
+    def test_config_and_architecture_must_match(self) -> None:
+        _validate_sam_architecture(
+            "configs/sam2.1/sam2.1_hiera_b+.yaml", "sam2.1_hiera_base_plus"
+        )
+        with self.assertRaises(ValueError) as caught:
+            _validate_sam_architecture(
+                "configs/sam2.1/sam2.1_hiera_l.yaml", "sam2.1_hiera_base_plus"
+            )
+        self.assertIn("sam2.1_hiera_large", str(caught.exception))
 
 
 class GeometryRecoveryTest(unittest.TestCase):

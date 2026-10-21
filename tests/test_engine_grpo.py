@@ -451,6 +451,8 @@ class CheckpointMetadataTest(unittest.TestCase):
             output_dir.mkdir()
 
             engine = _bare_engine()
+            engine.sam.architecture = "sam2.1_hiera_base_plus"
+            engine.sam.config_name = "configs/sam2.1/sam2.1_hiera_b+.yaml"
             engine.config = {
                 "data": {"train_split": "train.txt", "val_split": None},
                 "model": {"sam_checkpoint": "sam.pth"},
@@ -489,7 +491,18 @@ class CheckpointMetadataTest(unittest.TestCase):
 
             payload = engine._checkpoint_payload("D", 1, None)
 
-            self.assertEqual(payload["format_version"], 2)
+            self.assertEqual(payload["format_version"], 3)
+            self.assertEqual(
+                payload["sam"]["architecture"], "sam2.1_hiera_base_plus"
+            )
+            self.assertEqual(
+                payload["config"]["model"]["sam_architecture"],
+                "sam2.1_hiera_base_plus",
+            )
+            self.assertEqual(
+                payload["config"]["model"]["sam_config"],
+                "configs/sam2.1/sam2.1_hiera_b+.yaml",
+            )
             self.assertEqual(payload["algorithm"]["name"], "grpo")
             self.assertEqual(payload["algorithm"]["point_cost_warmup_steps"], 10)
             self.assertAlmostEqual(payload["algorithm"]["reward_point_cost"], 0.05)

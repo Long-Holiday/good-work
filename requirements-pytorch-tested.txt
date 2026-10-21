@@ -1,4 +1,4 @@
-# 实测环境记录（非推荐安装清单）。2026-10-21 在已有 conda `pytorch` 环境验证：
+# SAM2 迁移前的历史环境记录（非推荐安装清单）；当前 SAM2 测试环境见 docs/testing.md。2026-10-21 在已有 conda `pytorch` 环境验证：
 # Python 3.11.15，CUDA 13.0（torch 运行时报告 2.14.0+cu130），
 # NVIDIA GeForce RTX 3050 Laptop GPU（约 4 GiB）。
 # 与 requirements.txt 的目标训练环境（Python 3.12 / torch 2.8.0 cu128）区分；除非要精确复现

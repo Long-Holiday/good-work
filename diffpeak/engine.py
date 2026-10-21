@@ -66,6 +66,7 @@ from diffpeak.inference import (
     get_points,
     load_checkpoint_models,
     make_generator,
+    low_res_features,
     make_reward_config,
     normalize_valid_sizes,
     points_to_prompt,
@@ -83,6 +84,19 @@ from diffpeak.schedules import resolve_warmup_steps, warmup_cosine_factor
 __all__ = ["DiffPeakEngine", "STAGE_ORDER"]
 
 STAGE_ORDER: Tuple[str, ...] = ("A", "B", "C", "D")
+
+
+def _decoder_module(sam: torch.nn.Module) -> Optional[torch.nn.Module]:
+    """定位 RoadSAM 的掩码解码器，兼容 SAM2 与旧测试替身。"""
+    decoder = getattr(sam, "mask_decoder", None)
+    if decoder is not None:
+        return decoder
+    inner = getattr(sam, "sam", None)
+    for name in ("sam_mask_decoder", "mask_decoder"):
+        decoder = getattr(inner, name, None)
+        if decoder is not None:
+            return decoder
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -386,9 +400,9 @@ class DiffPeakEngine:
         for parameter in self.sam.parameters():
             parameter.requires_grad_(False)
         if stage in ("A", "C"):
-            decoder = getattr(getattr(self.sam, "sam", None), "mask_decoder", None)
+            decoder = _decoder_module(self.sam)
             if decoder is None:
-                raise AttributeError("RoadSAM 缺少 sam.mask_decoder")
+                raise AttributeError("RoadSAM 缺少 mask decoder")
             for parameter in decoder.parameters():
                 parameter.requires_grad_(True)
 
@@ -402,7 +416,7 @@ class DiffPeakEngine:
         """设置训练模式；冻结模块始终 eval。"""
         self.sam.eval()
         if stage in ("A", "C"):
-            decoder = getattr(getattr(self.sam, "sam", None), "mask_decoder", None)
+            decoder = _decoder_module(self.sam)
             if decoder is not None:
                 decoder.train()
         self.condition_encoder.train(stage == "B")
@@ -670,7 +684,7 @@ class DiffPeakEngine:
             }
 
         if stage == "B":
-            conditions, auxiliary_logits = self.condition_encoder(images, embeddings)
+            conditions, auxiliary_logits = self.condition_encoder(images, low_res_features(embeddings))
             diffusion_losses = self.diffusion.training_losses(
                 self.unet, conditions, target_heatmaps
             )
@@ -691,7 +705,7 @@ class DiffPeakEngine:
 
         if stage == "C":
             with torch.no_grad():
-                conditions, _ = self.condition_encoder(images, embeddings)
+                conditions, _ = self.condition_encoder(images, low_res_features(embeddings))
                 conditions = [item.detach() for item in conditions]
                 generator = make_generator(
                     stable_seed(self.seed, "C", int(epoch), *ids)
@@ -1013,7 +1027,7 @@ class DiffPeakEngine:
 
         with torch.no_grad(), self._autocast():
             embeddings = encode_images(self.sam, images, valid_sizes)
-            conditions_raw, _ = self.condition_encoder(images, embeddings)
+            conditions_raw, _ = self.condition_encoder(images, low_res_features(embeddings))
             conditions = [item.detach() for item in conditions_raw]
 
         # 先推进独立组计数，再计算成本乘子：第 1 组为 1/N，第 N 组到
@@ -1467,7 +1481,7 @@ class DiffPeakEngine:
                             valid_sizes=valid_sizes,
                         )
                     else:
-                        conditions, _ = self.condition_encoder(images, embeddings)
+                        conditions, _ = self.condition_encoder(images, low_res_features(embeddings))
                         conditions = [item.detach() for item in conditions]
                         identifier = ids[0] if ids else ""
                         generator = make_generator(
@@ -1818,6 +1832,18 @@ class DiffPeakEngine:
         model["sam_checkpoint"] = str(
             Path(self.sam_checkpoint).expanduser().resolve()
         )
+        # 快照必须能独立说明使用的是哪一代 SAM 与哪个 Hiera 配置；
+        # 加载时会据此拒绝 SAM1 快照或错误骨干。
+        model["sam_config"] = str(
+            model.get(
+                "sam_config", getattr(self.sam, "config_name", "")
+            )
+        )
+        model["sam_architecture"] = str(
+            model.get(
+                "sam_architecture", getattr(self.sam, "architecture", "")
+            )
+        )
         resolved["model"] = model
         resolved["output_dir"] = str(
             Path(self.output_dir).expanduser().resolve()
@@ -1828,8 +1854,16 @@ class DiffPeakEngine:
         self, stage: str, epoch: int, best_metric: Optional[float]
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
-            # v2：显式记录 RL 算法，旧 DDPO D 阶段快照不能直接 --resume。
-            "format_version": 2,
+            # v3：SAM2.1 迁移。SAM 权重键与 SAM1 完全不兼容，v2 快照不能
+            # 继续 --resume/--init；payload 同时记录骨干标识。
+            "format_version": 3,
+            "sam": {
+                "architecture": str(getattr(self.sam, "architecture", "")),
+                "config": str(getattr(self.sam, "config_name", "")),
+                "apply_postprocessing": bool(
+                    getattr(self.sam, "apply_postprocessing", False)
+                ),
+            },
             "algorithm": {
                 "name": self.rl_algorithm,
                 "version": 2,

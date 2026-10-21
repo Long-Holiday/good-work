@@ -122,6 +122,26 @@ class PrepareSplitsTest(unittest.TestCase):
             self._load(first, "val.json"), self._load(second, "val.json")
         )
 
+    def test_three_way_split_keeps_test_disjoint_and_reproducible(self) -> None:
+        self._add_labeled([f"train_{index:02d}" for index in range(20)])
+        first, second = self.base / "first", self.base / "second"
+        for output in (first, second):
+            self._run(output, "--val-fraction", "0.1", "--test-fraction", "0.1")
+        parts = [self._load(first, f"{name}.json") for name in ("train", "val", "test")]
+        self.assertEqual([len(part) for part in parts], [16, 2, 2])
+        self.assertEqual(len(set().union(*map(set, parts))), 20)
+        self.assertEqual(sum(map(len, parts)), len(set().union(*map(set, parts))))
+        for name in ("train", "val", "test"):
+            self.assertEqual(self._load(first, f"{name}.json"), self._load(second, f"{name}.json"))
+        self.assertEqual(self._load(first, "protocol.json")["test_count"], 2)
+
+    def test_rejects_invalid_test_allocation(self) -> None:
+        self._add_labeled(["a", "b"])
+        for fraction in ("-0.1", "1", "0.95", "0.1", "nan"):
+            with self.subTest(fraction=fraction), self.assertRaises(SystemExit):
+                self._run(self.base / "bad", "--test-fraction", fraction)
+        self.assertFalse((self.base / "bad").exists())
+
     def test_refuses_to_overwrite_existing_manifest(self) -> None:
         self._add_labeled([f"train_{index:02d}" for index in range(4)])
         output = self.base / "splits"
