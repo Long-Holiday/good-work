@@ -12,6 +12,25 @@
 6. D 阶段只训练扩散 U-Net，使用 GRPO。同时记录终端奖励、组内奖励标准差、零优势组比例、联合 log-ratio、KL、裁剪比例与点数。若同图四条轨迹奖励完全一致，优势为零是正确行为，不应替换成跨图基线；非零但方差低于 `advantage_std_delta` 的组只按该下限缩放，仍会参与学习，不能误记为“已跳过”。
 7. 完整实验以每张影像一次采样为主协议，多种子重复。不要用标注从多轨迹中挑最优结果当成无标注推理性能。
 
+## 提示质量与奖励诊断
+
+训练内 A/B/C/D 验证新增以下标量；A 使用真实提示，B/C/D 使用生成提示，不应混排：
+
+- `positive_on_road_rate` / `negative_on_background_rate`：提示在有效图像区域的落点正确率；无该类点时为 NaN（JSONL 为 null），宏平均排除未定义值。
+- `no_positive_rate` / `point_outside_rate`：无正点比例、落在有效内容之外（包括 padding）的点比例。
+- `heatmap_above_threshold_rate`：有效热图像素中，任一通道超过各自峰值阈值的比例；这里统计原始热图，未应用平滑或 h-maxima。另有 `heatmap_mean` / `heatmap_max`。
+- `skeleton_coverage`：GT 骨架像素距最近域内正点不超过 8 个输入图像像素的比例，仅表示局部提示覆盖，不是分支覆盖或 APLS。GT 有骨架但没有域内正点时为 0；GT 无骨架时未定义。
+
+D 阶段每条轨迹还计算 `quality_reward`（不含点成本）、`point_penalty`（包含当前预热乘子）和 `advantage`。`train_group` 的 JSONL `metrics.trajectory_diagnostics` 保存逐候选记录，含 `image_id` 与从 0 开始的 `trajectory_index`，按现有 `logging.log_every` 间隔及首末批记录；设为 1 可记录每批。逐轨迹列表不进入 TensorBoard，也不在整个 epoch 内累积。
+
+TensorBoard 和 epoch 汇总新增质量/成本的组内标准差、`advantage_point_count_corr`、`reward_point_count_corr`、`quality_reward_point_count_corr`。标准差和相关性都先在同一张图的 G 个候选间计算，再跨图平均；常量相关性未定义，另报 `undefined_advantage_corr_rate`。这些诊断不会改变奖励、采样或优化目标。逐组计算覆盖率会增加 CPU 骨架与 KDTree 开销，新的端到端吞吐需重新测量。当前接入范围是训练内验证和 D rollout，独立 `evaluate.py` 尚未输出这些新增字段。
+
+## SAM2 高分辨率条件融合
+
+条件编码器统一使用 SAM2 高分辨率融合结构，不再提供低分辨率旧分支或切换开关。冻结 SAM2 的原始 256² / 128² FPN 特征经独立可训练 1×1 投影与融合层接入条件金字塔。投影不与 mask decoder 共享，B 更新条件模块，A/C/D 保持其冻结；图像编码器仍冻结。训练与 Predictor 推理均传递完整 SAM2 特征，缺少两级高分辨率特征时直接报错。
+
+旧低分辨率条件模型 checkpoint 缺少新增参数，不支持直接 `resume/init`，由严格状态字典加载拒绝；不提供兼容分支或静默迁移。新实验从官方 SAM2 权重执行 A→B→C→D。新增结构的真实 3090 显存、吞吐与精度尚待测量，原低分辨率条件模型的探针结果不能作为新结构验收。
+
 ## 优先消融
 
 | 对照 | 固定因素 | 改变因素 |

@@ -1376,7 +1376,9 @@ class Predictor:
         # 处理由扩散模块和 engine 的 log_prob 负责。
         with self._autocast():
             embeddings = encode_images(self.sam, tensor, valid_sizes)
-            conditions, _ = self.condition_encoder(tensor, low_res_features(embeddings))
+            # 传入完整特征容器：开启高分辨率融合时条件编码器直接使用
+            # SAM2 的原始 FPN 1/4、1/8 特征；旧接口仍接受裸低分辨率张量。
+            conditions, _ = self.condition_encoder(tensor, embeddings)
             conditions = [item.detach() for item in conditions]
             heatmaps = self.diffusion.sample(
                 self.unet,

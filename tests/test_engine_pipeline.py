@@ -18,6 +18,7 @@ from diffpeak.engine import DiffPeakEngine
 from diffpeak.experiment_logging import ExperimentLogger
 from diffpeak.inference import DEFAULT_CONFIG, read_checkpoint
 from diffpeak.models import ConditionEncoder, ConditionalUNet, GaussianDiffusion
+from diffpeak.models.sam import SAM2ImageFeatures
 from diffpeak.prompts import PeakExtractor
 
 
@@ -32,10 +33,15 @@ class _TinySAM(nn.Module):
         self.sam.mask_decoder = nn.Conv2d(4, 1, 1)
 
     def encode(self, images, valid_sizes=None):
-        return self.sam.image_encoder(F.avg_pool2d(images, 4))
+        features = self.sam.image_encoder(images)
+        # 与 SAM2 一致的 1/16 低分辨率特征，以及 1/4、1/8 两级 FPN 特征。
+        return SAM2ImageFeatures(
+            F.avg_pool2d(features, 16),
+            (F.avg_pool2d(features, 4), F.avg_pool2d(features, 8)),
+        )
 
     def decode(self, embeddings, points, output_size):
-        logits = self.sam.mask_decoder(embeddings)
+        logits = self.sam.mask_decoder(embeddings.low_res)
         # The lightweight environment is prompt-sensitive, without using labels.
         coords, labels = points[0]
         shift = coords[labels == 1].mean() / output_size[0]
@@ -363,6 +369,9 @@ class EnginePipelineTest(unittest.TestCase):
                     [(1, 1)],
                 )
                 self.assertIn("iou", validation[0]["metrics"])
+                self.assertIn("positive_on_road_rate", validation[0]["metrics"])
+                self.assertIn("heatmap_above_threshold_rate", validation[0]["metrics"])
+                self.assertIn("quality_reward", validation[0]["metrics"])
 
                 system = scoped(stage, "system")
                 self.assertEqual(
@@ -375,6 +384,15 @@ class EnginePipelineTest(unittest.TestCase):
             self.assertEqual([record["step"] for record in groups], [1, 2, 4])
             self.assertEqual({record["epoch"] for record in groups}, {1})
             self.assertIn("reward", groups[0]["metrics"])
+            details = groups[0]["metrics"]["trajectory_diagnostics"]
+            self.assertTrue(details)
+            self.assertIn("image_id", details[0])
+            self.assertIn("advantage", details[0])
+            self.assertIn("positive_on_road_rate", details[0])
+            self.assertAlmostEqual(
+                details[0]["quality_reward"] - details[0]["point_penalty"],
+                details[0]["reward"],
+            )
             d_epoch = scoped("D", "train_epoch")
             self.assertEqual(
                 [(record["step"], record["epoch"]) for record in d_epoch], [(1, 1)]

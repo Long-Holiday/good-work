@@ -1,7 +1,8 @@
 """RTX 3050 小型 GPU smoke test（阶段 B 与阶段 D）。
 
 只依赖 ``torch`` 与 ``diffpeak`` 的 models/losses 模块；不导入 inference/engine，
-不加载 SAM 权重（用随机张量模拟 SAM 图像嵌入），不安装或下载任何东西。
+不加载 SAM 权重（用随机低分辨率与两级高分辨率张量模拟 SAM2 图像特征），
+不安装或下载任何东西。
 
 运行::
 
@@ -47,6 +48,7 @@ from diffpeak.grpo import (  # noqa: E402
 from diffpeak.losses import auxiliary_loss  # noqa: E402
 from diffpeak.models.conditioning import ConditionEncoder  # noqa: E402
 from diffpeak.models.diffusion import GaussianDiffusion  # noqa: E402
+from diffpeak.models.sam import SAM2ImageFeatures  # noqa: E402
 from diffpeak.models.unet import ConditionalUNet  # noqa: E402
 
 DEVICE = torch.device("cuda")
@@ -205,7 +207,7 @@ def phase_b(
     unet: ConditionalUNet,
     diffusion: GaussianDiffusion,
     images: torch.Tensor,
-    embedding: torch.Tensor,
+    embedding: SAM2ImageFeatures,
     targets: Dict[str, torch.Tensor],
 ) -> Dict[str, Any]:
     """阶段 B：条件编码 + 扩散/热图/辅助损失 + AMP 反向与参数更新。"""
@@ -280,7 +282,7 @@ def phase_d(
     unet: ConditionalUNet,
     diffusion: GaussianDiffusion,
     images: torch.Tensor,
-    embedding: torch.Tensor,
+    embedding: SAM2ImageFeatures,
     targets: Dict[str, torch.Tensor],
 ) -> Dict[str, Any]:
     """阶段 D：eval U-Net、detach 条件、记录式采样、重算与策略梯度反向。"""
@@ -514,8 +516,21 @@ def main() -> None:
     images = torch.rand(
         BATCH, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE, generator=generator
     )
-    embedding = torch.randn(
-        BATCH, 256, EMBED_SIZE, EMBED_SIZE, device=DEVICE, generator=generator
+    # 128 输入对应 SAM2 的 1/16 低分辨率与 1/4、1/8 两级高分辨率特征。
+    embedding = SAM2ImageFeatures(
+        torch.randn(
+            BATCH, 256, EMBED_SIZE, EMBED_SIZE, device=DEVICE, generator=generator
+        ),
+        (
+            torch.randn(
+                BATCH, 256, IMAGE_SIZE // 4, IMAGE_SIZE // 4,
+                device=DEVICE, generator=generator,
+            ),
+            torch.randn(
+                BATCH, 256, IMAGE_SIZE // 8, IMAGE_SIZE // 8,
+                device=DEVICE, generator=generator,
+            ),
+        ),
     )
     targets = build_targets()
     utility_checks = grpo_utility_checks()
@@ -546,7 +561,10 @@ def main() -> None:
         },
         "config": {
             "images": list(images.shape),
-            "fake_sam_embedding": list(embedding.shape),
+            "fake_sam_features": {
+                "low_res": list(embedding.low_res.shape),
+                "high_res": [list(level.shape) for level in embedding.high_res],
+            },
             "heatmap_target_shape": list(targets["heatmaps"].shape),
             "aux_target_shape": list(targets["road"].shape),
             "unet_base_channels": unet.base_channels,

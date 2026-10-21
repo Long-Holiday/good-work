@@ -372,6 +372,18 @@ class GrpoGroupDiagnosticsTest(unittest.TestCase):
         self.assertAlmostEqual(record["unique_point_sets"], 1.5)
         self.assertAlmostEqual(record["lr"], 1e-6)
         self.assertAlmostEqual(record["advantage_abs_mean"], 0.5)
+        details = record["trajectory_diagnostics"]
+        self.assertEqual(len(details), 4)
+        self.assertEqual([row["image_id"] for row in details], ["a", "b", "a", "b"])
+        self.assertEqual([row["trajectory_index"] for row in details], [0, 0, 1, 1])
+        for row, expected in zip(details, [-1.0, 0.0, 1.0, 0.0]):
+            self.assertAlmostEqual(row["advantage"], expected)
+        for row in details:
+            self.assertAlmostEqual(row["quality_reward"] - row["point_penalty"], row["reward"])
+            self.assertAlmostEqual(row["point_penalty"], 0.0125 * row["point_count"] / 32)
+        self.assertEqual(record["positive_on_road_rate"], 0.0)
+        self.assertEqual(record["negative_on_background_rate"], 1.0)
+        self.assertEqual(record["no_positive_rate"], 0.0)
 
         active_groups = engine._grpo_update.call_args.args[4]
         self.assertEqual(active_groups.tolist(), [True, False])

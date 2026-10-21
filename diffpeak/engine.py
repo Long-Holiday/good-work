@@ -58,6 +58,12 @@ import torch
 from torch.utils.data import DataLoader
 
 from diffpeak.data import DeepGlobeDataset
+from diffpeak.diagnostics import (
+    PROMPT_METRIC_KEYS,
+    REWARD_GROUP_METRIC_KEYS,
+    prompt_quality,
+    reward_group_diagnostics,
+)
 from diffpeak.grpo import (
     gaussian_kl_divergence,
     group_relative_advantages,
@@ -74,7 +80,6 @@ from diffpeak.inference import (
     get_points,
     load_checkpoint_models,
     make_generator,
-    low_res_features,
     make_reward_config,
     normalize_valid_sizes,
     points_to_prompt,
@@ -724,7 +729,7 @@ class DiffPeakEngine:
             }
 
         if stage == "B":
-            conditions, auxiliary_logits = self.condition_encoder(images, low_res_features(embeddings))
+            conditions, auxiliary_logits = self.condition_encoder(images, embeddings)
             diffusion_losses = self.diffusion.training_losses(
                 self.unet, conditions, target_heatmaps
             )
@@ -745,7 +750,7 @@ class DiffPeakEngine:
 
         if stage == "C":
             with torch.no_grad():
-                conditions, _ = self.condition_encoder(images, low_res_features(embeddings))
+                conditions, _ = self.condition_encoder(images, embeddings)
                 conditions = [item.detach() for item in conditions]
                 generator = make_generator(
                     stable_seed(self.seed, "C", int(epoch), *ids)
@@ -891,10 +896,11 @@ class DiffPeakEngine:
         for group_index, batch in enumerate(loader, start=1):
             prepared = self._prepare_batch(batch)
             record = self._grpo_group(prepared, epoch)
-            records.append(record)
             self._log_training_record(
                 stage, "train_group", record, epoch, group_index, len(loader)
             )
+            # 逐轨迹详情只写 JSONL，不在整轮内保留所有样本记录。
+            records.append({k: v for k, v in record.items() if k != "trajectory_diagnostics"})
             if group_index % self.log_every == 0:
                 print(
                     f"[D] epoch {epoch + 1} group {group_index} "
@@ -942,6 +948,10 @@ class DiffPeakEngine:
             "logratio_abs_max",
             "clip_fraction",
             "policy_terms",
+            "quality_reward",
+            "point_penalty",
+            *PROMPT_METRIC_KEYS,
+            *REWARD_GROUP_METRIC_KEYS,
         )
         for key in keys:
             values = [
@@ -1051,7 +1061,7 @@ class DiffPeakEngine:
             raise ValueError("reward_tensor 必须是 [G, B]")
         return reward_tensor.amax(dim=0) > reward_tensor.amin(dim=0)
 
-    def _grpo_group(self, batch: Mapping[str, Any], epoch: int) -> Dict[str, float]:
+    def _grpo_group(self, batch: Mapping[str, Any], epoch: int) -> Dict[str, Any]:
         """采样一组轨迹、计算 GRPO 优势，并做一次（或多次）更新。"""
         if self.group_size < 2:
             raise ValueError("D 阶段要求 rl.group_size >= 2 才能做组内相对优势")
@@ -1067,7 +1077,7 @@ class DiffPeakEngine:
 
         with torch.no_grad(), self._autocast():
             embeddings = encode_images(self.sam, images, valid_sizes)
-            conditions_raw, _ = self.condition_encoder(images, low_res_features(embeddings))
+            conditions_raw, _ = self.condition_encoder(images, embeddings)
             conditions = [item.detach() for item in conditions_raw]
 
         # 先推进独立组计数，再计算成本乘子：第 1 组为 1/N，第 N 组到
@@ -1143,9 +1153,21 @@ class DiffPeakEngine:
                         reward_config,
                     )
                     sample_rewards.append(float(metrics["reward"]))
+                    penalty = effective_point_cost * point_count / float(reward_config.point_reference)
+                    quality = prompt_quality(
+                        points[index], targets_np[index], heatmaps[index],
+                        image_size=self.image_size,
+                        threshold=tuple(
+                            getattr(self.peak_extractor, f"{channel}_config", {}).get("threshold", 0.3)
+                            for channel in ("positive", "negative")
+                        ),
+                    )
                     metric_rows.append(
                         {
                             **metrics,
+                            **quality,
+                            "quality_reward": float(metrics["reward"]) + penalty,
+                            "point_penalty": penalty,
                             "point_count": float(point_count),
                             "positive_point_count": float(positive_points),
                             "negative_point_count": float(negative_points),
@@ -1217,7 +1239,17 @@ class DiffPeakEngine:
             active_groups,
         )
 
-        merged: Dict[str, float] = dict(update_stats)
+        merged: Dict[str, Any] = dict(update_stats)
+        merged.update(reward_group_diagnostics(metric_rows, advantages))
+        merged["trajectory_diagnostics"] = [
+            {
+                **row,
+                "image_id": ids[position % batch_size],
+                "trajectory_index": position // batch_size,
+                "advantage": float(advantages[position // batch_size, position % batch_size]),
+            }
+            for position, row in enumerate(metric_rows)
+        ]
         merged["reward_std"] = reward_std
         merged["reward_variance"] = reward_variance
         merged["active_group_rate"] = active_group_rate
@@ -1240,6 +1272,9 @@ class DiffPeakEngine:
             "point_count",
             "positive_point_count",
             "negative_point_count",
+            "quality_reward",
+            "point_penalty",
+            *PROMPT_METRIC_KEYS,
         ):
             values = [
                 float(row[key])
@@ -1514,14 +1549,15 @@ class DiffPeakEngine:
                     embeddings = encode_images(self.sam, images, valid_sizes)
 
                     if stage == "A":
+                        heatmaps = prepared["heatmaps"]
                         points = get_points(
                             self.peak_extractor,
-                            prepared["heatmaps"],
+                            heatmaps,
                             image_size=self.image_size,
                             valid_sizes=valid_sizes,
                         )
                     else:
-                        conditions, _ = self.condition_encoder(images, low_res_features(embeddings))
+                        conditions, _ = self.condition_encoder(images, embeddings)
                         conditions = [item.detach() for item in conditions]
                         identifier = ids[0] if ids else ""
                         generator = make_generator(
@@ -1571,6 +1607,17 @@ class DiffPeakEngine:
                             point_count,
                             self.reward_config,
                         )
+                        metrics.update(prompt_quality(
+                            points[index], target, heatmaps[index],
+                            image_size=self.image_size,
+                            threshold=tuple(
+                                getattr(self.peak_extractor, f"{channel}_config", {}).get("threshold", 0.3)
+                                for channel in ("positive", "negative")
+                            ),
+                        ))
+                        penalty = self.reward_config.point_cost * point_count / self.reward_config.point_reference
+                        metrics["point_penalty"] = float(penalty)
+                        metrics["quality_reward"] = float(metrics["reward"]) + float(penalty)
                         rows.append(metrics)
                         point_counts.append(float(point_count))
                         if not prediction.any():
@@ -1591,6 +1638,9 @@ class DiffPeakEngine:
         if not rows:
             return None
         summary = aggregate_metrics(rows)
+        for key in (*PROMPT_METRIC_KEYS, "quality_reward", "point_penalty"):
+            values = [float(row[key]) for row in rows if math.isfinite(float(row[key]))]
+            summary[key] = _mean_of(values) if values else float("nan")
         summary["mean_point_count"] = _mean_of(point_counts)
         summary["empty_prediction_rate"] = float(empty_predictions) / float(len(rows))
         summary["empty_target_rate"] = float(empty_targets) / float(len(rows))
