@@ -1,6 +1,6 @@
 """ABC 联合预训练与 D 整体 GRPO 后训练。
 
-ABC 用一个总损失和优化器联合更新条件编码器、DiT 与 SAM 掩码解码器。
+ABC 用一个总损失和优化器更新条件编码器与 DiT，SAM 全部冻结但保留输入梯度。
 SAM 图像/提示编码器权重冻结，可微密集提示保留输入梯度。
 D 使用扩散转移及终端 Bernoulli 分割动作的组相对策略梯度；整个策略
 采用 eval 模式重放，并保存条件编码器、DiT、SAM 解码器的固定参考。
@@ -415,7 +415,7 @@ class DiffPeakEngine:
     def _set_requires_grad(self, stage: str) -> None:
         for parameter in self.sam.parameters():
             parameter.requires_grad_(False)
-        if stage in ("ABC", "D", "A", "C"):
+        if stage in ("D", "A", "C"):
             decoder = _decoder_module(self.sam)
             if decoder is None:
                 raise AttributeError("RoadSAM 缺少 mask decoder")
@@ -430,7 +430,7 @@ class DiffPeakEngine:
     def _set_train_modes(self, stage: str) -> None:
         """设置训练模式；冻结模块始终 eval。"""
         self.sam.eval()
-        if stage in ("ABC", "D", "A", "C"):
+        if stage in ("D", "A", "C"):
             decoder = _decoder_module(self.sam)
             if decoder is not None:
                 decoder.train(stage != "D")
@@ -1060,6 +1060,8 @@ class DiffPeakEngine:
         if getattr(self, "config", {}).get("training_protocol") == "joint_abc_v1":
             if payload.get("training_protocol") != "joint_abc_v1":
                 raise ValueError("旧分阶段快照不能 --resume 联合训练；请用 --init 迁移权重")
+        if stage == "ABC" and payload.get("abc_sam_frozen") is not True:
+            raise ValueError("此 ABC 快照曾训练 SAM，优化器参数集合已改变；请用 --init 加载权重")
         if stage != "D":
             return
         version = int(payload.get("format_version", 1) or 1)
@@ -1997,6 +1999,7 @@ class DiffPeakEngine:
             # 继续 --resume/--init；payload 同时记录骨干标识。
             "format_version": 4,
             "training_protocol": self.config.get("training_protocol"),
+            "abc_sam_frozen": True,
             "sam": {
                 "architecture": str(getattr(self.sam, "architecture", "")),
                 "config": str(getattr(self.sam, "config_name", "")),

@@ -177,10 +177,14 @@ class EnginePipelineTest(unittest.TestCase):
             config = self._make_config(root)
             engine = self._engine(config)
 
-            # ABC：条件编码器、DiT 与 SAM mask decoder 同时训练。
+            # ABC：只更新扩散分支，SAM 参数和 buffers 全部保持不变。
+            sam_before = copy.deepcopy(engine.sam.state_dict())
             abc_metrics = engine.run_stage("ABC")
             self.assertTrue(np.isfinite(abc_metrics["iou"]))
-            self.assertTrue(engine.sam.sam.mask_decoder.training)
+            self.assertFalse(engine.sam.sam.mask_decoder.training)
+            self.assertTrue(all(not p.requires_grad for p in engine.sam.parameters()))
+            for name, value in engine.sam.state_dict().items():
+                torch.testing.assert_close(value, sam_before[name], rtol=0, atol=0)
             self.assertTrue(engine.condition_encoder.training)
             self.assertTrue(engine.dit.training)
             payload = read_checkpoint(engine.output_dir / "last.pt")

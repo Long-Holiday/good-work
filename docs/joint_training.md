@@ -1,6 +1,6 @@
 # ABC 联合预训练与 D 后训练
 
-当前训练协议为 `training_protocol: joint_abc_v1`，入口只接受 `ABC`、`D` 或 `all`。这是本任务的联合监督预训练，不是从零预训练 SAM：仍加载官方 SAM2.1 权重，微调掩码解码器及其高分辨率投影；SAM 图像骨干和提示编码器权重冻结。
+当前训练协议为 `training_protocol: joint_abc_v1`，入口只接受 `ABC`、`D` 或 `all`。这是本任务的联合监督预训练，不是从零预训练 SAM：仍加载官方 SAM2.1 权重。ABC 将 SAM 全部冻结，只更新扩散分支（条件编码器与 DiT）；D 才微调 SAM 掩码解码器及其高分辨率投影，图像骨干和提示编码器保持冻结。
 
 ## 模型与预训练
 
@@ -16,7 +16,7 @@
 - `L_seg_reconstructed`：由带噪目标的一步重建热图进入 SAM，计算 BCE/Dice/clDice。
 - `L_seg_generated`：从纯噪声按完整采样调度生成热图，再进入 SAM 计算同样的分割损失。
 
-两条分割通路都反传到 DiT 与条件编码器；后者覆盖推理时的提示分布，不依赖单独 A 初始化或 C 适配。分割监督只计算每图有效区域。一个优化器包含条件编码器、DiT、SAM 解码器的全部可训练参数；梯度累积后统一更新，没有逐模块训练或交替冻结。
+两条分割通路都反传到 DiT 与条件编码器；后者覆盖推理时的提示分布，不依赖单独 A 初始化或 C 适配。分割监督只计算每图有效区域。ABC 优化器只包含条件编码器与 DiT，SAM 全部参数 requires_grad=False 并保持 eval。SAM 提示编码器和解码器前向仍保留计算图，不能包裹 no_grad 或 detach 输入热图；冻结权重不妨碍计算分割损失对热图的梯度。梯度累积后统一更新，没有逐模块训练或交替冻结。
 
 完整采样的反传比旧 B 训练昂贵。默认 ABC batch=1、累积=4 是保守起点，尚非 GPU 吞吐实测结论。DiT 激活检查点保留，但不能把旧四阶段显存报告当作新协议保证。
 
@@ -32,7 +32,7 @@ D 的动作包括扩散过程的高斯转移，以及 SAM logits 定义的终端
 
 ## 权重与恢复
 
-保存 `stage_ABC.pth`、`stage_D.pth` 以及 `last.pt`、`best.pt`。D 快照同时保存三个固定参考模块，恢复时严格要求参考完整。旧 A/B/C/D 优化器状态不能直接 `--resume` 新协议；可用显式新配置加 `--init` 只迁移兼容模型权重。
+保存 `stage_ABC.pth`、`stage_D.pth` 以及 `last.pt`、`best.pt`。D 快照同时保存三个固定参考模块，恢复时严格要求参考完整。旧 A/B/C/D 优化器状态不能直接 `--resume` 新协议；此前训练 SAM 的 ABC 快照也不能直接恢复到全冻结版本，因为优化器参数集合不同。新快照以 `abc_sam_frozen: true` 标识；旧快照可用显式新配置加 `--init` 只迁移兼容模型权重。
 
 ```bash
 conda run -n pytorch python train.py --config configs/3090.yaml --stage all

@@ -55,18 +55,18 @@ def _bare_engine() -> DiffPeakEngine:
 
 class FreezingTest(unittest.TestCase):
     def test_joint_stages_train_condition_dit_and_decoder(self) -> None:
-        # 联合协议下 ABC 与 D 都训练三个策略模块；冻结的只有 SAM image /
-        # prompt encoder。
+        # ABC 冻结整个 SAM；D 仍训练条件分支、DiT 和 SAM 解码器。
         for stage in ("ABC", "D"):
             with self.subTest(stage=stage):
                 engine = _bare_engine()
                 engine._set_requires_grad(stage)
 
-                self.assertTrue(
+                self.assertEqual(
                     all(
                         parameter.requires_grad
                         for parameter in engine.sam.sam.mask_decoder.parameters()
-                    )
+                    ),
+                    stage == "D",
                 )
                 self.assertTrue(
                     all(
@@ -87,13 +87,13 @@ class FreezingTest(unittest.TestCase):
                         parameter.requires_grad
                         for parameter in engine.sam.parameters()
                     ),
-                    True,
+                    stage == "D",
                 )
 
     def test_train_modes_train_abc_and_eval_all_during_d(self) -> None:
         expected = {
-            # ABC 端到端训练三个模块。
-            "ABC": (True, True, True),
+            # ABC 的 SAM 始终 eval，但保留对热图输入的梯度。
+            "ABC": (False, True, True),
             # D 的 rollout/replay 对整个策略使用 eval，保证两次前向一致；
             # 梯度仍然开启。
             "D": (False, False, False),

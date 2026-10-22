@@ -346,6 +346,22 @@ class RoadSAMArchitectureIntegrationTest(unittest.TestCase):
             )
         )
 
+    def test_decode_heatmaps_gradient_passes_through_fully_frozen_sam(self) -> None:
+        parameters = list(self.road_sam.parameters())
+        flags = [parameter.requires_grad for parameter in parameters]
+        self.addCleanup(lambda: [p.requires_grad_(flag) for p, flag in zip(parameters, flags)])
+        self.road_sam.requires_grad_(False).eval()
+        self.road_sam.zero_grad(set_to_none=True)
+        heatmaps = torch.rand(2, 2, 16, 16, requires_grad=True)
+        logits = self.road_sam.decode_heatmaps(
+            self.features, heatmaps, output_size=OUTPUT_SIZE
+        )
+        logits.square().mean().backward()
+        self.assertIsNotNone(heatmaps.grad)
+        self.assertTrue(bool(torch.isfinite(heatmaps.grad).all()))
+        self.assertGreater(float(heatmaps.grad.abs().sum()), 0)
+        self.assertTrue(all(p.grad is None for p in parameters))
+
     def test_decode_heatmaps_gradient_passes_through_frozen_prompt_encoder(self) -> None:
         """密集热图提示可微：冻结提示编码器只把梯度传回输入热图。"""
         self.road_sam.zero_grad(set_to_none=True)
