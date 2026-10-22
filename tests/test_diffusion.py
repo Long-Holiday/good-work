@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
 from diffpeak.models.diffusion import GaussianDiffusion  # noqa: E402
 
 
-class _ZeroUNet(nn.Module):
+class _ZeroDiT(nn.Module):
     """始终预测零噪声的占位去噪器。"""
 
     def forward(self, state: torch.Tensor, timestep, conditions) -> torch.Tensor:
@@ -38,7 +38,7 @@ class GaussianDiffusionTransitionTest(unittest.TestCase):
             min_std=0.02,
             heatmap_size=8,
         )
-        self.unet = _ZeroUNet()
+        self.dit = _ZeroDiT()
         self.conditions = [torch.zeros(2, 4, 8, 8) for _ in range(4)]
 
     def test_invalid_policy_variance_and_schedule_are_rejected(self) -> None:
@@ -79,7 +79,7 @@ class GaussianDiffusionTransitionTest(unittest.TestCase):
         state = torch.zeros(2, 2, 8, 8)
 
         mean, std = self.diffusion.transition(
-            self.unet, state, timestep=0, previous_timestep=-1, conditions=self.conditions
+            self.dit, state, timestep=0, previous_timestep=-1, conditions=self.conditions
         )
 
         self.assertEqual(tuple(mean.shape), tuple(state.shape))
@@ -97,7 +97,7 @@ class GaussianDiffusionTransitionTest(unittest.TestCase):
         for timestep, previous in ((10, 5), (1, 0), (25, 12)):
             with self.subTest(timestep=timestep):
                 _, std = self.diffusion.transition(
-                    self.unet,
+                    self.dit,
                     state,
                     timestep=timestep,
                     previous_timestep=previous,
@@ -112,7 +112,7 @@ class GaussianDiffusionTransitionTest(unittest.TestCase):
         state = torch.zeros(1, 2, 8, 8)
 
         _, std = diffusion.transition(
-            self.unet,
+            self.dit,
             state,
             timestep=25,
             previous_timestep=10,
@@ -190,7 +190,7 @@ class GaussianDiffusionSamplingTest(unittest.TestCase):
             min_std=0.02,
             heatmap_size=8,
         )
-        self.unet = _ZeroUNet()
+        self.dit = _ZeroDiT()
         self.conditions = [
             torch.zeros(2, 4, 8, 8),
             torch.zeros(2, 4, 4, 4),
@@ -202,7 +202,7 @@ class GaussianDiffusionSamplingTest(unittest.TestCase):
         generator = torch.Generator().manual_seed(7)
 
         heatmaps, records = self.diffusion.sample(
-            self.unet, self.conditions, generator=generator, record=True
+            self.dit, self.conditions, generator=generator, record=True
         )
 
         self.assertEqual(tuple(heatmaps.shape), (2, 2, 8, 8))
@@ -220,8 +220,35 @@ class GaussianDiffusionSamplingTest(unittest.TestCase):
             self.assertLess(record["timestep"], previous_timestep + 1)
             previous_timestep = record["timestep"]
 
+    def test_sampling_uses_background_prior_and_preserves_random_draws(self) -> None:
+        for steps in (1, 3, 10):
+            with self.subTest(sampling_steps=steps):
+                diffusion = GaussianDiffusion(timesteps=10, sampling_steps=steps)
+                seed = 17
+                expected_generator = torch.Generator().manual_seed(seed)
+                noise = torch.randn((2, 2, 8, 8), generator=expected_generator)
+                expected_state = noise - diffusion.alphas_cumprod[-1].sqrt()
+                heatmaps, records = diffusion.sample(
+                    self.dit, self.conditions,
+                    generator=torch.Generator().manual_seed(seed), record=True,
+                )
+                torch.testing.assert_close(records[0]["state"], expected_state)
+                mean, std = diffusion.transition(
+                    self.dit, expected_state, records[0]["timestep"],
+                    records[0]["previous_timestep"], self.conditions,
+                )
+                expected_action = mean + std * torch.randn(
+                    expected_state.shape, generator=expected_generator
+                )
+                torch.testing.assert_close(records[0]["action"], expected_action)
+                plain = diffusion.sample(
+                    self.dit, self.conditions,
+                    generator=torch.Generator().manual_seed(seed), record=False,
+                )
+                torch.testing.assert_close(plain, heatmaps)
+
     def test_sample_without_record_returns_heatmap_only(self) -> None:
-        heatmaps = self.diffusion.sample(self.unet, self.conditions)
+        heatmaps = self.diffusion.sample(self.dit, self.conditions)
 
         self.assertIsInstance(heatmaps, torch.Tensor)
         self.assertEqual(tuple(heatmaps.shape), (2, 2, 8, 8))
@@ -232,7 +259,7 @@ class GaussianDiffusionSamplingTest(unittest.TestCase):
         )
 
         heatmaps, records = diffusion.sample(
-            self.unet, self.conditions, record=True
+            self.dit, self.conditions, record=True
         )
 
         self.assertEqual(len(records), 1)
@@ -245,7 +272,7 @@ class GaussianDiffusionSamplingTest(unittest.TestCase):
     def test_training_losses_are_finite_for_zero_target(self) -> None:
         target = torch.zeros(2, 2, 8, 8)
 
-        losses = self.diffusion.training_losses(self.unet, self.conditions, target)
+        losses = self.diffusion.training_losses(self.dit, self.conditions, target)
 
         self.assertEqual(set(losses), {"diff", "heat"})
         self.assertTrue(torch.isfinite(losses["diff"]))
@@ -256,11 +283,11 @@ class GaussianDiffusionSamplingTest(unittest.TestCase):
     def test_training_losses_reject_wrong_channels(self) -> None:
         with self.assertRaises(ValueError):
             self.diffusion.training_losses(
-                self.unet, self.conditions, torch.zeros(2, 1, 8, 8)
+                self.dit, self.conditions, torch.zeros(2, 1, 8, 8)
             )
         with self.assertRaises(ValueError):
             self.diffusion.training_losses(
-                self.unet, self.conditions, torch.zeros(2, 2, 8)
+                self.dit, self.conditions, torch.zeros(2, 2, 8)
             )
 
 

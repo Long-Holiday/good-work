@@ -225,7 +225,7 @@ class CheckpointSAM2GuardTest(unittest.TestCase):
                     "sam.mask_decoder.iou_token.weight": torch.zeros(1),
                 },
                 "condition_encoder": {},
-                "unet": {},
+                "dit": {},
                 "diffusion": {},
             }
         }
@@ -250,7 +250,7 @@ class CheckpointSAM2GuardTest(unittest.TestCase):
             "models": {
                 "sam": {"sam.sam_mask_decoder.conv_s0.weight": torch.zeros(1)},
                 "condition_encoder": {},
-                "unet": {},
+                "dit": {},
                 "diffusion": {},
             },
         }

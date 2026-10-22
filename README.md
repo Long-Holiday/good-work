@@ -112,7 +112,7 @@ diffpeak/
   models/
     sam.py                 SAM2.1 封装：冻结图像编码器、高分辨率特征与可适配解码器
     conditioning.py        细节 CNN、多尺度条件与辅助头
-    unet.py                四尺度条件去噪网络
+    dit.py                 条件 DiT 去噪器（默认）
     diffusion.py           噪声监督、随机采样、轨迹对数概率
   grpo.py                  组内优势、裁剪策略损失与固定方差高斯 KL
   schedules.py             线性 warmup + cosine 退火
@@ -131,11 +131,11 @@ train.py / predict.py / evaluate.py
 | 阶段 | 可更新部分 | 监督 |
 |---|---|---|
 | A | 仅 SAM2 mask decoder | 真实提示分割 |
-| B | 细节/条件编码器 + 去噪 U-Net | 扩散 MSE + 热图重建 + 辅助 |
+| B | 细节/条件编码器 + 去噪 DiT | 扩散 MSE + 热图重建 + 辅助 |
 | C | 仅 SAM2 mask decoder | 扩散生成提示下的分割 |
-| D | 仅去噪 U-Net | GRPO + 固定参考策略 KL（可选监督锚定） |
+| D | 仅去噪 DiT | GRPO + 固定参考策略 KL（可选监督锚定） |
 
-图像编码器与提示编码器始终冻结。A 和 C 只训练 SAM2 解码器；B 才训练条件编码器与 U-Net；D 只训练 U-Net，条件模块和 SAM2 均冻结。SAM2 解码器依赖图像编码器输出的高分辨率特征，迁移时必须显式保留并传入，不能只保留 64×64 图像嵌入。
+图像编码器与提示编码器始终冻结。A 和 C 只训练 SAM2 解码器；B 才训练条件编码器与 DiT；D 只训练 DiT，条件模块和 SAM2 均冻结。SAM2 解码器依赖图像编码器输出的高分辨率特征，迁移时必须显式保留并传入，不能只保留 64×64 图像嵌入。
 
 正式训练使用线性 warmup + cosine 退火；各阶段数值集中于 [`configs/3090.yaml`](configs/3090.yaml)，选择依据与尚未验证的部分见 [`3090 探针记录`](docs/probe_3090.md)。B/C/D 验证基于生成提示；A 的真值提示验证单独作为诊断。
 
@@ -166,9 +166,9 @@ python predict.py --checkpoint runs/diffpeak/stage_D.pth --input DeepGlobe_Road/
 
 `predict.py`/`evaluate.py` 省略 `--config` 时使用 checkpoint 内的配置；显式传入 YAML 表示你主动变更协议。checkpoint 保存已解析的数据、划分、SAM2 和输出绝对路径；换机器时应显式提供含新路径的配置。恢复以完整 epoch 为单位，不承诺逐 batch 中断恢复。`train.py --resume` 会恢复 checkpoint 的优化器学习率与调度曲线，即使显式传入新 YAML；阶段内恢复应保持 batch size、梯度累积、划分长度和计划 epoch 数不变，变更训练预算请另用 `--init` 启动新实验。`evaluate.py` 的 `--limit` 只用于子集调试，不应与完整验证集结果混用。
 
-当前 3090 配置为 batch size 1、梯度累积 4、AMP，并在实测后关闭 U-Net 激活检查点；D 保留 `rl.amp_init_scale=64`。A/B/C 的监督有效批次为 4。D 每图 4 条轨迹串行采样、轨迹暂存 CPU，其组语义不同于监督批次。
+当前 3090 配置为 batch size 1、梯度累积 4、AMP；DiT 默认开启激活检查点（`model.dit.gradient_checkpointing=true`），D 保留 `rl.amp_init_scale=64`。A/B/C 的监督有效批次为 4。D 每图 4 条轨迹串行采样、轨迹暂存 CPU，其组语义不同于监督批次。
 
-从旧 DDPO 快照迁移时，使用 `python train.py --config configs/3090.yaml --stage D --init <旧快照>`，显式传入新的 GRPO 配置并只加载模型权重；省略 `--config` 会继承旧快照配置，而不会自动启用本次学习率与预热设置。**不要**把旧 DDPO 快照直接 `--resume` 到 GRPO D。优化器、调度器与 RNG 状态本身可技术性加载，但旧 DDPO 的更新目标与 GRPO 不同，不应沿用其优化器和调度状态；其中冻结的 `ref_unet` 权重仍可复用，旧配置也可能缺少 `rl.algorithm`、`rl.point_cost_warmup_steps` 等键。需要保留旧实验时，请使用独立 `output_dir`。
+**旧 U-Net（包括旧 DDPO）快照不支持加载到当前 DiT。** `--init` 和 `--resume` 都会明确拒绝，旧 `ref_dit` 也不能复用；请使用独立 `output_dir`，从官方 SAM2.1 权重启动新的 A→B→C→D 实验。后续只有参数结构匹配的 DiT 快照才可用于 `--init` 或 `--resume`；即使架构匹配，也不能把不同训练算法的优化器和调度状态当作 GRPO 状态继续恢复。
 
 ### 实验日志与 TensorBoard
 
@@ -214,13 +214,14 @@ tensorboard --logdir runs/diffpeak --port 6006
 - 固定峰值：平滑 sigma=0.5，h=0.05，绝对阈值 0.3，NMS 半径 4 热图像素。
 - 每通道峰数可变，无固定 K；不设置隐含 top-k。异常密集热图可能带来很高解码成本，需要监控。
 - 正点/负点一起输入 SAM2；没有正峰时输出空掩码，不强行补全全局最大点。点成本按提取出的峰总数统计：即使负点-only 候选被空掩码规则短路，冗余负峰仍受成本惩罚。
-- 保留既有四尺度残差 U-Net，不强制加入参考方案中的瓶颈注意力，以兼容已有预训练权重；20 步采样、峰值参数和可选低噪声热图重建沿用现有实现，均需进一步消融校准。
+- 默认去噪器为条件 DiT：双通道 256² 热图按 `patch_size=8` 切成 32×32 token，`hidden_size=256`、`depth=6`、`num_heads=8`、`mlp_ratio=4.0`；四尺度条件特征投影对齐后逐像素融合，时间步经 adaLN-Zero 注入。旧 `ConditionalUNet` 模块已移除，不保留别名。
+- 旧 U-Net checkpoint 与 DiT 参数结构不兼容，`--resume`/`--init` 会被严格加载显式拒绝，不会静默回退为随机权重；U-Net 时期的历史实验结果保留，但不能作为 DiT 的实测依据；架构对照需单独登记并匹配实验协议。20 步采样、峰值参数和可选低噪声热图重建沿用现有实现，均需进一步消融校准。
 - 默认奖励 `0.6*IoU + 0.4*clDice - point_cost*(Kpos+Kneg)/32`，其中 `reward.point_cost=0.05`。D 阶段 `rl.point_cost_warmup_steps=100` 时，策略点成本按**已处理的 D 组数**在 100 组内线性升到该值（第 1 组为 1/100）；`0` 表示禁用预热。组内奖励完全常量、没有实际 backward 的组也会推进预热，避免预热永远停在 0；验证始终使用未预热的基准成本。
 - 原始 `checkpoints/sam2.1_hiera_base_plus.pt` 在训练和预测构造时都需要保留，即便训练快照已经包含 SAM2 权重；SAM1 权重 `sam_vit_b_01ec64.pth` 不可替代。完整快照较大，实验磁盘空间需预留。
 - 可开启双向抽样路径代理（例如权重 0.5/0.3/0.2），**不是正式 APLS**；二值标注无法区分立交跨越。
 - D 阶段用 GRPO：同一影像的 G 条轨迹组成一个组，优势为 `(R_i - mean(R)) / max(std(R), advantage_std_delta)`，均值和标准差只来自该组。`rl.algorithm=grpo` 显式标识协议。动作维联合 log-prob 对所有热图维度**求和**，没有用均值替代联合密度；默认裁剪半径 `rl.ppo_clip=1e-4` 是高维策略的谨慎起点，需监控实际 KL、奖励方差与更新比例。键名保留 `ppo_clip` 只是为了兼容旧配置。
 - `rl.advantage_std_delta=1e-4` 是组内标准差的分母下限，不是“低方差组跳过阈值”：非零但方差很小的组仍按该下限缩放后参与学习，只有奖励完全相同的组优势为零。KL 同样对动作维度求和，再按样本/轨迹/时间步取平均。
-- 每条轨迹的旧策略 log-prob 在该组 rollout 时保存并冻结，重放时只重算当前策略；它与长期参考策略不是同一个对象。首次从 B/C 进入 D 时，参考 U-Net 从当前预训练 U-Net 深拷贝，之后永久冻结，只用于 KL。从已有 D 快照初始化或恢复时保留其中的 `ref_unet`，避免把已经后训练的策略误当作原始参考；旧快照缺少参考时才从加载后的 U-Net 建立新参考，应记录这一实验差异。对峰值提取/SAM2 奖励不反传；策略梯度来自保存动作的重新计分。
+- 每条轨迹的旧策略 log-prob 在该组 rollout 时保存并冻结，重放时只重算当前策略；它与长期参考策略不是同一个对象。首次从 B/C 进入 D 时，参考 DiT 从当前预训练 DiT 深拷贝，之后永久冻结，只用于 KL。从已有 D 快照初始化或恢复时保留其中的 `ref_dit`（DiT 状态），避免把已经后训练的策略误当作原始参考；缺失时才从加载后的 DiT 建立新参考，应记录这一实验差异。对峰值提取/SAM2 奖励不反传；策略梯度来自保存动作的重新计分。
 - `rl.anchor_weight` 默认 `0.0`，即不启用监督锚定。参考 GRPO 设计没有把目标热图 MSE 列为必需项；设为非零时是**可选**监督锚定，只作为稳定项，不是当前默认协议。
 - 推理默认沿用随机生成协议；确定性采样不能默认与训练等价。
 

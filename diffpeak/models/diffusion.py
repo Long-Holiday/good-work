@@ -144,15 +144,15 @@ class GaussianDiffusion(nn.Module):
 
     def _predict_eps_and_x0(
         self,
-        unet: nn.Module,
+        dit: nn.Module,
         state: Tensor,
         timestep: Tensor,
         conditions: Sequence[Tensor],
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """由去噪器预测噪声，并恢复 ``[-1, 1]`` 范围的干净热图潜变量。"""
-        # 网络卷积可由 autocast 加速；高维随机动作和转移系数保留 float32。
+        # 去噪网络可由 autocast 加速；高维随机动作和转移系数保留 float32。
         state = state.float()
-        eps = unet(state, timestep, conditions).float()
+        eps = dit(state, timestep, conditions).float()
         alpha_bar = self._extract(self.alphas_cumprod, timestep, state.shape).to(state.dtype)
         sqrt_alpha = self._extract(
             self.sqrt_alphas_cumprod, timestep, state.shape
@@ -178,14 +178,14 @@ class GaussianDiffusion(nn.Module):
     # ------------------------------------------------------------------
     def training_losses(
         self,
-        unet: nn.Module,
+        dit: nn.Module,
         conditions: Sequence[Tensor],
         target_heatmaps: Tensor,
     ) -> Dict[str, Tensor]:
         """计算扩散损失与热图重建损失。
 
         Args:
-            unet: 条件 U-Net。
+            dit: 条件去噪器（默认 DiT）。
             conditions: 四个尺度的条件特征。
             target_heatmaps: 目标双通道热图 ``B x 2 x 256 x 256``，范围 ``[0, 1]``。
 
@@ -210,7 +210,7 @@ class GaussianDiffusion(nn.Module):
         ).to(dtype)
         z_t = sqrt_alpha_bar * z0 + sqrt_one_minus * noise
 
-        eps_pred = unet(z_t, t, conditions)
+        eps_pred = dit(z_t, t, conditions)
         diff_loss = F.mse_loss(eps_pred, noise)
 
         # 固定仿射恢复干净热图，不做 min-max。
@@ -248,7 +248,7 @@ class GaussianDiffusion(nn.Module):
     # ------------------------------------------------------------------
     def transition(
         self,
-        unet: nn.Module,
+        dit: nn.Module,
         state: Tensor,
         timestep: Timestep,
         previous_timestep: Timestep,
@@ -257,7 +257,7 @@ class GaussianDiffusion(nn.Module):
         """一次 DDIM 随机转移的高斯均值与标准差。
 
         Args:
-            unet: 条件 U-Net。
+            dit: 条件去噪器（默认 DiT）。
             state: 当前带噪热图 ``z_t``。
             timestep: 当前时间步 ``t``（标量或长度 B 的张量）。
             previous_timestep: 上一时间步；允许 -1，此时视为 ``alpha_bar=1``。
@@ -284,7 +284,7 @@ class GaussianDiffusion(nn.Module):
         t = self._as_batch_timesteps(timestep, batch_size, device)
         previous = self._as_batch_timesteps(previous_timestep, batch_size, device)
 
-        eps, x0, alpha_t = self._predict_eps_and_x0(unet, state, t, conditions)
+        eps, x0, alpha_t = self._predict_eps_and_x0(dit, state, t, conditions)
 
         alpha_prev = self._extract(self.alphas_cumprod, previous, state.shape).to(state.dtype)
         alpha_prev = torch.where(
@@ -337,7 +337,7 @@ class GaussianDiffusion(nn.Module):
     @torch.no_grad()
     def sample(
         self,
-        unet: nn.Module,
+        dit: nn.Module,
         conditions: Sequence[Tensor],
         generator: Optional[torch.Generator] = None,
         record: bool = False,
@@ -345,7 +345,7 @@ class GaussianDiffusion(nn.Module):
         """DDIM 随机采样双通道热图。
 
         Args:
-            unet: 条件 U-Net。
+            dit: 条件去噪器（默认 DiT）。
             conditions: 四个尺度的条件特征。
             generator: 可选随机数生成器；允许 CPU 生成器配合 GPU 条件。
             record: 是否记录每步的 GRPO 轨迹信息。
@@ -372,6 +372,10 @@ class GaussianDiffusion(nn.Module):
         records: List[Dict[str, Any]] = []
         # 调度表是静态的，转成 Python 列表可避免每步 GPU 同步。
         schedule = self.sampling_schedule.tolist()
+        # 稀疏热图的背景 H=0 对应 z0=-1。非零终端 SNR 下，固定补偿
+        # 其残留均值；保持单位噪声方差，与全量配对验证的采样协议一致。
+        # 这是采样先验的背景近似，不使用目标标签，B/C/D 与推理统一启用。
+        state = state - self.alphas_cumprod[schedule[0]].to(device=device, dtype=dtype).sqrt()
 
         for index in range(self.sampling_steps):
             current = int(schedule[index])
@@ -379,7 +383,7 @@ class GaussianDiffusion(nn.Module):
             t = torch.full((batch_size,), current, device=device, dtype=torch.long)
             prev = torch.full((batch_size,), previous, device=device, dtype=torch.long)
 
-            mean, std = self.transition(unet, state, t, prev, conditions)
+            mean, std = self.transition(dit, state, t, prev, conditions)
             noise = self._randn(state.shape, device, dtype, generator)
             action = mean + std * noise
 

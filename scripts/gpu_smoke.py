@@ -8,11 +8,11 @@
 
     conda run -n pytorch python scripts/gpu_smoke.py
 
-阶段 B：128x128 输入 -> ConditionEncoder 多尺度条件 -> ConditionalUNet +
+阶段 B：128x128 输入 -> ConditionEncoder 多尺度条件 -> ConditionalDiT +
 GaussianDiffusion.training_losses + auxiliary_loss，AMP float16 + GradScaler
 前向/反向，检查损失、梯度有限且参数确实更新。
 
-阶段 D：U-Net eval、条件 detach，固定 CUDA generator 采样 G=2 轨迹
+阶段 D：DiT eval、条件 detach，固定 CUDA generator 采样 G=2 轨迹
 （timesteps=32, steps=4），检查记录 dtype、逐步重算 log-prob 的 ratio≈1，
 再用组内奖励 [0.4, 0.6] 走真实的 ``diffpeak.grpo`` 优势/裁剪/KL 工具，
 做 GRPO + KL + 扩散 anchor 组合反向，检查梯度有限、参数更新。
@@ -48,8 +48,8 @@ from diffpeak.grpo import (  # noqa: E402
 from diffpeak.losses import auxiliary_loss  # noqa: E402
 from diffpeak.models.conditioning import ConditionEncoder  # noqa: E402
 from diffpeak.models.diffusion import GaussianDiffusion  # noqa: E402
+from diffpeak.models.dit import ConditionalDiT  # noqa: E402
 from diffpeak.models.sam import SAM2ImageFeatures  # noqa: E402
-from diffpeak.models.unet import ConditionalUNet  # noqa: E402
 
 DEVICE = torch.device("cuda")
 IMAGE_SIZE = 128
@@ -59,6 +59,13 @@ GROUP = 2
 TIMESTEPS = 32
 SAMPLING_STEPS = 4
 SEED = 1234
+# 冒烟测试用的小 DiT：32x32 潜变量按 patch_size=4 得到 8x8 token。
+DIT_PATCH_SIZE = 4
+DIT_HIDDEN_SIZE = 128
+DIT_DEPTH = 2
+DIT_NUM_HEADS = 4
+DIT_MLP_RATIO = 4.0
+DIT_CONDITION_CHANNELS = (64, 128, 256, 256)
 
 
 def autocast():
@@ -204,7 +211,7 @@ def grpo_utility_checks() -> Dict[str, Any]:
 
 def phase_b(
     encoder: ConditionEncoder,
-    unet: ConditionalUNet,
+    dit: ConditionalDiT,
     diffusion: GaussianDiffusion,
     images: torch.Tensor,
     embedding: SAM2ImageFeatures,
@@ -215,14 +222,14 @@ def phase_b(
     started = time.perf_counter()
 
     encoder.train()
-    unet.train()
-    params = list(encoder.parameters()) + list(unet.parameters())
+    dit.train()
+    params = list(encoder.parameters()) + list(dit.parameters())
     optimizer = torch.optim.Adam(params, lr=2e-3)
     scaler = torch.amp.GradScaler("cuda")
 
     with autocast():
         conditions, aux_logits = encoder(images, embedding)
-        losses = diffusion.training_losses(unet, conditions, targets["heatmaps"])
+        losses = diffusion.training_losses(dit, conditions, targets["heatmaps"])
         aux = auxiliary_loss(aux_logits, targets["road"], targets["skeleton"])
         total = losses["diff"] + losses["heat"] + 0.5 * aux
 
@@ -279,13 +286,13 @@ def phase_b(
 
 def phase_d(
     encoder: ConditionEncoder,
-    unet: ConditionalUNet,
+    dit: ConditionalDiT,
     diffusion: GaussianDiffusion,
     images: torch.Tensor,
     embedding: SAM2ImageFeatures,
     targets: Dict[str, torch.Tensor],
 ) -> Dict[str, Any]:
-    """阶段 D：eval U-Net、detach 条件、记录式采样、重算与策略梯度反向。"""
+    """阶段 D：eval DiT、detach 条件、记录式采样、重算与策略梯度反向。"""
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
 
@@ -298,8 +305,8 @@ def phase_d(
     latent_size = int(conditions[0].shape[-1])
     assert latent_size == IMAGE_SIZE // 4, latent_size
 
-    unet.eval()
-    assert unet.gradient_checkpointing, "D 阶段要求 gradient_checkpointing=True"
+    dit.eval()
+    assert dit.gradient_checkpointing, "D 阶段要求 gradient_checkpointing=True"
 
     # 与 engine/inference.make_generator 一致：CPU generator，噪声生成后搬到 GPU。
     generator = torch.Generator(device="cpu")
@@ -307,7 +314,7 @@ def phase_d(
 
     with autocast():
         heatmaps, records = diffusion.sample(
-            unet, conditions, generator=generator, record=True
+            dit, conditions, generator=generator, record=True
         )
 
     assert list(heatmaps.shape) == [GROUP, 2, latent_size, latent_size], tuple(
@@ -343,7 +350,7 @@ def phase_d(
     generator.manual_seed(SEED)
     with autocast():
         heatmaps_repeat, _ = diffusion.sample(
-            unet, conditions, generator=generator, record=True
+            dit, conditions, generator=generator, record=True
         )
     repeat_diff = float((heatmaps - heatmaps_repeat).abs().max())
     assert repeat_diff < 1e-6, f"固定 generator 采样不可复现: {repeat_diff}"
@@ -359,13 +366,13 @@ def phase_d(
     )
     clip_epsilon = 1e-4  # 与 engine rl.ppo_clip（GRPO 裁剪半径）默认配置一致
 
-    # 合成参考 U-Net：微小扰动权重，专门让 KL 项有非零梯度可走。
-    ref_unet = copy.deepcopy(unet)
-    ref_unet.eval()
+    # 合成参考 DiT：微小扰动权重，专门让 KL 项有非零梯度可走。
+    ref_dit = copy.deepcopy(dit)
+    ref_dit.eval()
     ref_generator = torch.Generator(device="cuda")
     ref_generator.manual_seed(SEED + 1)
     with torch.no_grad():
-        for param in ref_unet.parameters():
+        for param in ref_dit.parameters():
             param.add_(torch.randn_like(param, generator=ref_generator) * 1e-4)
             param.requires_grad_(False)
 
@@ -376,13 +383,13 @@ def phase_d(
     policy_mean_grads: List[float] = []
     kl_mean_grads: List[float] = []
 
-    optimizer = torch.optim.Adam(unet.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(dit.parameters(), lr=1e-4)
     # 高维高斯 log-prob 对均值的梯度约为 noise/std（~50/元素），默认 65536
     # 的初始 scale 会把 fp16 中间梯度推到 inf。这里用保守 scale 且不增长。
     scaler = torch.amp.GradScaler(
         "cuda", init_scale=64.0, growth_interval=1000000
     )
-    before = snapshot(list(unet.parameters()))
+    before = snapshot(list(dit.parameters()))
 
     total_terms = float(len(records))
     policy_kl_loss = torch.zeros((), device=DEVICE, dtype=torch.float64)
@@ -393,7 +400,7 @@ def phase_d(
 
         with torch.no_grad(), autocast():
             ref_mean, _ = diffusion.transition(
-                ref_unet,
+                ref_dit,
                 state,
                 record["timestep"],
                 record["previous_timestep"],
@@ -401,10 +408,10 @@ def phase_d(
             )
         ref_mean_stats.append(float(ref_mean.double().abs().mean()))
 
-        # rollout 与 replay 使用同一 AMP 上下文和同一 eval U-Net。
+        # rollout 与 replay 使用同一 AMP 上下文和同一 eval DiT。
         with autocast():
             mean, std = diffusion.transition(
-                unet,
+                dit,
                 state,
                 record["timestep"],
                 record["previous_timestep"],
@@ -437,7 +444,7 @@ def phase_d(
     # 扩散 anchor：与 engine 的 _grpo_update 一致，只用噪声 MSE。
     with autocast():
         anchor_losses = diffusion.training_losses(
-            unet, conditions, targets["heatmaps"].expand(GROUP, -1, -1, -1)
+            dit, conditions, targets["heatmaps"].expand(GROUP, -1, -1, -1)
         )
     anchor = 0.1 * anchor_losses["diff"]
     combined = (policy_kl_loss + anchor.double()).float()
@@ -455,15 +462,15 @@ def phase_d(
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(combined).backward()
     scaler.unscale_(optimizer)
-    stats = grad_stats(list(unet.parameters()))
+    stats = grad_stats(list(dit.parameters()))
     assert stats["missing"] == 0, f"D 阶段有 {stats['missing']} 个参数没有梯度"
     assert stats["nonfinite"] == 0, f"D 阶段有 {stats['nonfinite']} 个参数梯度非有限"
     assert stats["global_norm"] > 0.0, "D 阶段梯度范数为 0"
 
     scaler.step(optimizer)
     scaler.update()
-    changed = changed_elements(before, list(unet.parameters()))
-    finite_after = all_finite(unet.parameters())
+    changed = changed_elements(before, list(dit.parameters()))
+    finite_after = all_finite(dit.parameters())
     assert finite_after, "D 阶段更新后参数出现非有限值"
     assert changed > 0, "D 阶段参数没有更新"
 
@@ -490,7 +497,7 @@ def phase_d(
             sum(kl_mean_grads) / len(kl_mean_grads), 6
         ),
         "kl_tool": "diffpeak.grpo.gaussian_kl_divergence",
-        "kl_reference": "deepcopy(unet) + 1e-4 合成扰动，仅用于打通 KL 梯度路径",
+        "kl_reference": "deepcopy(dit) + 1e-4 合成扰动，仅用于打通 KL 梯度路径",
         "anchor_diff": round(float(anchor_losses["diff"].detach()), 6),
         "combined_loss": round(float(combined.detach()), 6),
         "gradients": stats,
@@ -536,16 +543,24 @@ def main() -> None:
     utility_checks = grpo_utility_checks()
 
     encoder = ConditionEncoder().to(DEVICE)
-    # 默认通道 (64, 128, 256, 256)，gradient_checkpointing=True。
-    unet = ConditionalUNet().to(DEVICE)
+    # 小型 DiT（patch 4，hidden 128，depth 2），保持 CPU/GPU 冒烟可控。
+    dit = ConditionalDiT(
+        patch_size=DIT_PATCH_SIZE,
+        hidden_size=DIT_HIDDEN_SIZE,
+        depth=DIT_DEPTH,
+        num_heads=DIT_NUM_HEADS,
+        mlp_ratio=DIT_MLP_RATIO,
+        condition_channels=DIT_CONDITION_CHANNELS,
+        gradient_checkpointing=True,
+    ).to(DEVICE)
     diffusion = GaussianDiffusion(
         timesteps=TIMESTEPS,
         sampling_steps=SAMPLING_STEPS,
         heatmap_size=IMAGE_SIZE,
     ).to(DEVICE)
 
-    phase_b_result = phase_b(encoder, unet, diffusion, images, embedding, targets)
-    phase_d_result = phase_d(encoder, unet, diffusion, images, embedding, targets)
+    phase_b_result = phase_b(encoder, dit, diffusion, images, embedding, targets)
+    phase_d_result = phase_d(encoder, dit, diffusion, images, embedding, targets)
 
     elapsed = time.perf_counter() - started
     peak_mib = max(phase_b_result["peak_allocated_mib"], phase_d_result["peak_allocated_mib"])
@@ -567,10 +582,16 @@ def main() -> None:
             },
             "heatmap_target_shape": list(targets["heatmaps"].shape),
             "aux_target_shape": list(targets["road"].shape),
-            "unet_base_channels": unet.base_channels,
-            "unet_channels": [unet.base_channels * m for m in unet.channel_mult],
-            "condition_channels": list(unet.condition_channels),
-            "gradient_checkpointing": unet.gradient_checkpointing,
+            "denoiser": "ConditionalDiT",
+            "dit": {
+                "patch_size": DIT_PATCH_SIZE,
+                "hidden_size": DIT_HIDDEN_SIZE,
+                "depth": DIT_DEPTH,
+                "num_heads": DIT_NUM_HEADS,
+                "mlp_ratio": DIT_MLP_RATIO,
+                "condition_channels": list(DIT_CONDITION_CHANNELS),
+                "gradient_checkpointing": dit.gradient_checkpointing,
+            },
             "amp": "cuda autocast float16 + GradScaler",
             "diffusion": {"timesteps": TIMESTEPS, "sampling_steps": SAMPLING_STEPS},
             "phase_d_group_size": GROUP,

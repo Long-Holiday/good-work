@@ -48,8 +48,8 @@ def _bare_engine() -> DiffPeakEngine:
     engine.amp = False
     engine.sam = _TinySam()
     engine.condition_encoder = _TinyModule(3.0)
-    engine.unet = _TinyModule(4.0)
-    engine.ref_unet = None
+    engine.dit = _TinyModule(4.0)
+    engine.ref_dit = None
     return engine
 
 
@@ -61,7 +61,7 @@ class FreezingTest(unittest.TestCase):
             "C": (True, False, False),
             "D": (False, False, True),
         }
-        for stage, (decoder, condition, unet) in expected.items():
+        for stage, (decoder, condition, dit) in expected.items():
             with self.subTest(stage=stage):
                 engine = _bare_engine()
                 engine._set_requires_grad(stage)
@@ -83,9 +83,9 @@ class FreezingTest(unittest.TestCase):
                 self.assertTrue(
                     all(
                         parameter.requires_grad
-                        for parameter in engine.unet.parameters()
+                        for parameter in engine.dit.parameters()
                     )
-                    is unet
+                    is dit
                 )
                 self.assertEqual(
                     any(
@@ -95,12 +95,12 @@ class FreezingTest(unittest.TestCase):
                     decoder,
                 )
 
-    def test_train_modes_freeze_condition_and_unet_outside_b(self) -> None:
+    def test_train_modes_freeze_condition_and_dit_outside_b(self) -> None:
         for stage in ("A", "B", "C", "D"):
             with self.subTest(stage=stage):
                 engine = _bare_engine()
-                engine.ref_unet = nn.Module()
-                engine.ref_unet.train()
+                engine.ref_dit = nn.Module()
+                engine.ref_dit.train()
                 engine._set_train_modes(stage)
 
                 self.assertFalse(engine.sam.training)
@@ -108,8 +108,8 @@ class FreezingTest(unittest.TestCase):
                     engine.sam.sam.mask_decoder.training, stage in ("A", "C")
                 )
                 self.assertEqual(engine.condition_encoder.training, stage == "B")
-                self.assertEqual(engine.unet.training, stage == "B")
-                self.assertFalse(engine.ref_unet.training)
+                self.assertEqual(engine.dit.training, stage == "B")
+                self.assertFalse(engine.ref_dit.training)
 
 
 class ActiveGroupTest(unittest.TestCase):
@@ -132,8 +132,8 @@ class ActiveGroupTest(unittest.TestCase):
 
 
 class _FakeDiffusion:
-    def transition(self, unet, state, timestep, previous_timestep, conditions):
-        return state * unet.weight, torch.ones_like(state)
+    def transition(self, dit, state, timestep, previous_timestep, conditions):
+        return state * dit.weight, torch.ones_like(state)
 
     def log_prob(self, action, mean, std):
         standardized = (action - mean) / std
@@ -179,8 +179,8 @@ class _RecordingScheduler:
 
 def _update_engine() -> DiffPeakEngine:
     engine = _bare_engine()
-    engine.unet = _TinyModule(1.0)
-    engine.optimizer = torch.optim.AdamW([engine.unet.weight], lr=1e-3)
+    engine.dit = _TinyModule(1.0)
+    engine.optimizer = torch.optim.AdamW([engine.dit.weight], lr=1e-3)
     engine.scheduler = _RecordingScheduler()
     engine.scaler = _RecordingScaler()
     engine.grad_clip = 0.0
@@ -237,7 +237,7 @@ class GrpoUpdateTest(unittest.TestCase):
 
     def test_constant_group_skips_backward_and_optimizer(self) -> None:
         engine = _update_engine()
-        before = engine.unet.weight.detach().clone()
+        before = engine.dit.weight.detach().clone()
         state = torch.ones(2, 2, 2)
         step = {
             "state": state,
@@ -260,7 +260,7 @@ class GrpoUpdateTest(unittest.TestCase):
         self.assertEqual(stats["skipped_updates"], 1.0)
         self.assertEqual(engine.global_step, 0)
         self.assertEqual(engine.scheduler.steps, 0)
-        torch.testing.assert_close(engine.unet.weight.detach(), before)
+        torch.testing.assert_close(engine.dit.weight.detach(), before)
 
 
 class _GroupCondition(nn.Module):
@@ -270,7 +270,7 @@ class _GroupCondition(nn.Module):
 
 
 class _GroupDiffusion:
-    def sample(self, unet, conditions, generator=None, record=False):
+    def sample(self, dit, conditions, generator=None, record=False):
         return torch.zeros(2, 2, 2, 2), [{"dummy": torch.tensor(0.0)}]
 
 
@@ -289,7 +289,7 @@ class GrpoGroupDiagnosticsTest(unittest.TestCase):
         engine.reward_config = RewardConfig(point_cost=0.05)
         engine.image_size = 2
         engine.threshold = 0.5
-        engine.ref_unet = nn.Module()
+        engine.ref_dit = nn.Module()
         engine.peak_extractor = object()
         engine.diffusion = _GroupDiffusion()
         engine.condition_encoder = _GroupCondition()
@@ -499,7 +499,7 @@ class CheckpointMetadataTest(unittest.TestCase):
             engine.point_cost_warmup_steps = 10
             engine.reward_config = RewardConfig(point_cost=0.05)
             engine.diffusion = nn.Module()
-            engine.ref_unet = None
+            engine.ref_dit = None
 
             payload = engine._checkpoint_payload("D", 1, None)
 

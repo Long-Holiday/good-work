@@ -43,17 +43,19 @@
 | 阶段 | 可更新部分 | 提示来源 | 初始化 |
 |---|---|---|---|
 | A | SAM2 mask decoder | train 真值热图提取的提示 | SAM2.1 预训练权重 |
-| B | 条件编码器 + 去噪 U-Net | 监督热图、辅助目标 | A 的 `best.pt` |
+| B | 条件编码器 + 去噪 DiT | 监督热图、辅助目标 | A 的 `best.pt` |
 | C | SAM2 mask decoder | 冻结扩散模型生成的提示 | B 的 `best.pt` |
-| D | 去噪 U-Net | 同图 GRPO 采样轨迹 | C 的 `best.pt` |
+| D | 去噪 DiT | 同图 GRPO 采样轨迹 | C 的 `best.pt` |
 
-图像/提示编码器始终冻结；D 的条件模块和 SAM2 冻结，参考 U-Net 固定。A 的 GT-prompt 验证只用于阶段内诊断，**A 不进入自动分割排名**；B/C/D 使用自动提示验证，两类指标不能混称。
+图像/提示编码器始终冻结；D 的条件模块和 SAM2 冻结，参考 DiT 固定。A 的 GT-prompt 验证只用于阶段内诊断，**A 不进入自动分割排名**；B/C/D 使用自动提示验证，两类指标不能混称。
+
+去噪器现为 ConditionalDiT（DiT），参数结构与此前的 ConditionalUNet 不兼容；旧 U-Net 快照不能 `--resume`/`--init`，会被显式拒绝。旧架构已完成的实验结果保留为历史记录，不与 DiT 结果混排，也不作为 DiT 的初始化权重；如需 U-Net/DiT 对照，应单独登记架构因素并匹配数据、预算与评估协议。
 
 每阶段使用独立输出目录，用该阶段预先规定的 `best.pt` 初始化下一阶段；不要混用末轮和 best。当前 `--stage all` 按阶段末轮串联，采用 best 协议必须分阶段运行。D 配方消融从同种子、同一 C `best.pt` 出发；共享 A/B/C 只在训练定义确实未变时复用。
 
 A/B/C 学习率来自短程开发筛选，阶段长度与 warmup/cosine 调度尚未冻结；D 学习率只做了 32 组稳定性比较。这些值都不是最优或收敛结论。预实验后用开发种子 `2026` 一次性冻结实际长度，例如 D 可先看前 1–3 轮再决定。本文不规定固定 95 轮预算，也不要求花满候选长度；所有方法按冻结后的实际曝光和预算执行并报告实际值。不得在看到 test 后改阶段长度，也不得中途 `--resume` 改 epoch 预算后仍按原计划曲线报告。
 
-D 只按当前 GRPO 实现描述，不把 DDPO 或其他策略形式混入本协议：`rl.algorithm=grpo`；`group_size` 在同图组内标准化优势；`ppo_clip` 是 GRPO 裁剪半径（键名为兼容旧配置保留）；`advantage_std_delta` 只是优势分母的标准差下限，不是跳过阈值；`point_cost_warmup_steps` 按**已处理 D 组数**推进，常量奖励组或 AMP 跳步也推进，验证始终使用未预热基准成本；`anchor_weight=0` 为默认，非零只是可选监督锚定。联合动作 log-prob 按维度求和，不用 mean 偷换目标。“旧策略”和“参考策略”不同：组 rollout 的 `old_log_prob` 只在组内冻结，作概率比分母；参考 U-Net 在首次进入 D 时从预训练权重深拷贝并永久冻结，只用于 KL。从已有 D 快照 `--init` 会保留 `ref_unet`，不会自动重置；`--init` 只加载权重，不继承优化器。
+D 只按当前 GRPO 实现描述，不把 DDPO 或其他策略形式混入本协议：`rl.algorithm=grpo`；`group_size` 在同图组内标准化优势；`ppo_clip` 是 GRPO 裁剪半径（键名为兼容旧配置保留）；`advantage_std_delta` 只是优势分母的标准差下限，不是跳过阈值；`point_cost_warmup_steps` 按**已处理 D 组数**推进，常量奖励组或 AMP 跳步也推进，验证始终使用未预热基准成本；`anchor_weight=0` 为默认，非零只是可选监督锚定。联合动作 log-prob 按维度求和，不用 mean 偷换目标。“旧策略”和“参考策略”不同：组 rollout 的 `old_log_prob` 只在组内冻结，作概率比分母；参考 DiT 在首次进入 D 时从预训练权重深拷贝并永久冻结，只用于 KL。从已有 D 快照 `--init` 会保留 `ref_dit`，不会自动重置；`--init` 只加载权重，不继承优化器。
 
 ### 4.2 预算与 checkpoint 选择
 
@@ -71,7 +73,7 @@ D 配方消融从同一种子、同一 C checkpoint 出发，使用同一参考�
 |---|---|---|---|
 | M0 | 完整 A+B+C+D | 基准 | A |
 | A1 | A+B+C（无 GRPO） | 去掉 D | 复用 C |
-| A2 | 等额外曝光监督延训 | 用与 D 相同曝光轮数的监督 U-Net 代替 D，冻结范围同 D | C；需新增入口 |
+| A2 | 等额外曝光监督延训 | 用与 D 相同曝光轮数的监督 DiT 代替 D，冻结范围同 D | C；需新增入口 |
 | A3 | 无点数成本 | `reward.point_cost=0` | C→D |
 | A4 | 无 KL | `rl.kl_weight=0` | C→D；记录实际步数和调度差异 |
 | A5 | 无 C 适配 | B 后直接 D，控制 D 预算 | B |

@@ -1,5 +1,23 @@
 # 测试记录
 
+## DiT 架构替换验证（2026-10-22）
+
+- 默认去噪器替换为 `ConditionalDiT`，保留四尺度条件、双通道噪声预测、DDIM 与 GRPO 接口；既有采样背景先验回归仍通过。
+- 使用本地 `pytorch` 环境执行 `python -m pytest tests -q`：**300 passed、157 subtests passed**。微型 DiT 覆盖完整 A–D 控制流及精确断点恢复；新增测试覆盖动态尺寸、四尺度条件/时间步影响、反向梯度、eval 模式激活检查点、模型构建和旧 U-Net 快照拒绝。
+- `python scripts/gpu_smoke.py`：**passed=true**，RTX 3050 Laptop 4GB、PyTorch 2.14.0+cu130；使用小型 DiT、模拟 SAM2 特征，验证 AMP、B 阶段更新和 D 阶段采样/概率重算/策略梯度。
+- 默认 DiT（宽度 256、6 层、8 头、patch=8）在完整 256×256 热图与四尺度条件上通过 CUDA 前向及冻结输入的 eval 模式反向检查。此检查仅覆盖去噪器，不代表完整 SAM2 训练显存或吞吐。
+- 存在旧条件融合随机测试抖动：`tests/test_conditioning.py:114` 的随机初始化 + `torch.allclose` 断言在主流程的一次条件/SAM 定向回归中失败（39 passed / 1 failed），随后单独重跑通过；最终全量回归为上述 300 passed。未修改该旧测试或条件编码器实现，不能将通过结果理解为测试套件已无随机失败。
+- 补充检查点注意力头数校验：`num_heads` 改变不会改变参数形状，因此除严格权重加载外，还检查快照配置中的头数与当前 DiT 一致。
+- 尚未进行 DiT 的 3090 完整训练、收敛或精度评估。下方 U-Net 时期的硬件与训练记录是历史结果，不能作为当前 DiT 的验证依据。
+
+## DiT 旧接口清理验证（2026-10-22）
+
+- 删除旧 `diffpeak/models/unet.py` 及其导出；时间步正弦编码移至 `dit.py`，条件编码器测试独立为 `tests/test_conditioning.py`。
+- 模型工厂、engine、推理、扩散调用和训练快照统一使用 `dit` / `ref_dit`，不保留旧键或属性别名。旧键快照因缺少必需 `dit` 字段直接失败，参数仍严格加载。
+- 本地 `pytorch` 环境全量回归：`python -m pytest tests -q`，**297 passed、157 subtests passed，8.95 秒**。测试数量变化来自删除 UNet 专属测试、保留时间步编码测试。
+- `python -m compileall -q diffpeak scripts train.py predict.py evaluate.py` 与 `git diff --check` 通过。
+- 本轮尚未启动 Vast.ai 实例，未取得真实数据 B 阶段的收敛结果；CPU 测试通过不构成收敛证据。
+
 ## SAM2.1 与探针工具验证（2026-10-21）
 
 - 在本地 `pytorch` 环境安装官方 SAM2 固定提交 `2b90b9f5ceec907a1c18123530e92e794ad901a4`，`pip check` 通过。最初 build isolation 尝试额外安装 CUDA/PyTorch 导致临时目录空间不足；改用 `SAM2_BUILD_CUDA=0 ... pip install --no-build-isolation`，保留原 PyTorch 后成功。
@@ -100,7 +118,7 @@ conda run -n pytorch python -m compileall -q diffpeak tests scripts \
 conda run -n pytorch python scripts/gpu_smoke.py
 ```
 
-最终 `passed=true`，exit code 0，脚本内约 3.5 秒。输入 128²、提示潜变量/目标热图均为 32²；使用默认 U-Net 通道 64/128/256/256、梯度检查点、CUDA float16 autocast 和 GradScaler。SAM 编码特征使用随机张量模拟，**没有加载真实 SAM 或计算真实分割奖励**。
+**历史记录（U-Net 时期）。** 下表数值来自旧 `ConditionalUNet` 脚本：输入 128²、提示潜变量/目标热图均为 32²；U-Net 通道 64/128/256/256、梯度检查点、CUDA float16 autocast 和 GradScaler。SAM 编码特征使用随机张量模拟，**没有加载真实 SAM 或计算真实分割奖励**。当前 `scripts/gpu_smoke.py` 已改用小型 `ConditionalDiT`（patch 4、hidden 128、depth 2、4 heads，`condition_channels=(64,128,256,256)`）并默认开启梯度检查点；2026-10-22 已重新运行并通过（见文首验证记录）。下表中的参数计数、显存与耗时仍是 U-Net 历史值，不能作为 DiT 验收结果。
 
 | 检查 | 结果 |
 |---|---|

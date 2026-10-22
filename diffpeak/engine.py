@@ -3,16 +3,16 @@
 阶段职责
 --------
 * **A**：只训练 SAM mask decoder；提示来自真实目标热图。
-* **B**：训练扩散 U-Net、条件分支与辅助头；扩散 MSE + 热图重建 + 辅助损失。
+* **B**：训练扩散 DiT、条件分支与辅助头；扩散 MSE + 热图重建 + 辅助损失。
 * **C**：只训练 SAM mask decoder；提示来自冻结扩散模型生成的提示。
-* **D**：只训练扩散 U-Net；GRPO + 参考策略 KL + 扩散锚定，奖励来自冻结
+* **D**：只训练扩散 DiT；GRPO + 参考策略 KL + 扩散锚定，奖励来自冻结
   SAM 的解码结果。
 
 关键实现约定
 ------------
 * SAM 图像编码器与提示编码器始终冻结；冻结模块始终保持 ``eval``。
 * A/B/C 使用 AMP + ``GradScaler``。D 的 rollout 与 replay 使用**相同的**
-  autocast 上下文和 ``eval`` U-Net，保证更新前联合 log-prob 比值为 1。
+  autocast 上下文和 ``eval`` DiT，保证更新前联合 log-prob 比值为 1。
 * 梯度累积按实际尾组大小归一：``loss / len(group)``。
 * D 以“一张影像的 G 条轨迹”为一个 GRPO 组：先整组 rollout（``no_grad``），
   再逐轨迹、逐步重算并立即 ``backward``，每轮整组重放后更新一次优化器
@@ -33,7 +33,7 @@
   保存在 CPU。重放时一次只把一个时间步的张量搬到 GPU。
 * 策略使用 ``log_prob`` 返回的动作维**求和**，不做 mean；新旧概率差在
   float64 中计算，避免 2x256x256 维动作的精度损失。
-* 参考 U-Net 优先从 D 快照加载，否则在 D 开始时 ``deepcopy``；永久冻结，
+* 参考 DiT 优先从 D 快照加载，否则在 D 开始时 ``deepcopy``；永久冻结，
   KL 使用同方差高斯解析式。
 * 每个阶段使用线性 warmup + cosine 退火；终点乘子由 ``min_lr_ratio`` 控制。
 """
@@ -215,7 +215,7 @@ class DiffPeakEngine:
         )
         self.sam = self.models["sam"]
         self.condition_encoder = self.models["condition_encoder"]
-        self.unet = self.models["unet"]
+        self.dit = self.models["dit"]
         self.diffusion = self.models["diffusion"]
         self.reward_config = make_reward_config(self.config)
 
@@ -285,7 +285,7 @@ class DiffPeakEngine:
         self.scheduler_epochs = 0
         self.scheduler_lr_schedule = "cosine"
         self.scaler: Optional[Any] = None
-        self.ref_unet: Optional[torch.nn.Module] = None
+        self.ref_dit: Optional[torch.nn.Module] = None
         self.global_step = 0
         # 点成本预热按“已处理的 D 组数”推进，而不是按成功的 optimizer step；
         # 否则整组常量奖励且 KL/anchor 关闭时预热会永远停在 0。
@@ -454,7 +454,7 @@ class DiffPeakEngine:
         # A 阶段按设计只更新 SAM mask decoder；细节/条件分支属于 B 阶段。
         for parameter in self.condition_encoder.parameters():
             parameter.requires_grad_(stage == "B")
-        for parameter in self.unet.parameters():
+        for parameter in self.dit.parameters():
             parameter.requires_grad_(stage in ("B", "D"))
 
     def _set_train_modes(self, stage: str) -> None:
@@ -465,21 +465,21 @@ class DiffPeakEngine:
             if decoder is not None:
                 decoder.train()
         self.condition_encoder.train(stage == "B")
-        # D 的 rollout 与 replay 必须使用同一个 eval U-Net 分布。
-        self.unet.train(stage == "B")
-        if self.ref_unet is not None:
-            self.ref_unet.eval()
+        # D 的 rollout 与 replay 必须使用同一个 eval DiT 分布。
+        self.dit.train(stage == "B")
+        if self.ref_dit is not None:
+            self.ref_dit.eval()
 
     def _set_eval_all(self) -> None:
         for module in self.models.values():
             module.eval()
-        if self.ref_unet is not None:
-            self.ref_unet.eval()
+        if self.ref_dit is not None:
+            self.ref_dit.eval()
 
     def _trainable_parameters(self) -> List[torch.nn.Parameter]:
         parameters: List[torch.nn.Parameter] = []
         seen = set()
-        for module in (self.sam, self.condition_encoder, self.unet):
+        for module in (self.sam, self.condition_encoder, self.dit):
             for parameter in module.parameters():
                 if id(parameter) in seen:
                     continue
@@ -731,7 +731,7 @@ class DiffPeakEngine:
         if stage == "B":
             conditions, auxiliary_logits = self.condition_encoder(images, embeddings)
             diffusion_losses = self.diffusion.training_losses(
-                self.unet, conditions, target_heatmaps
+                self.dit, conditions, target_heatmaps
             )
             diffusion_loss = diffusion_losses["diff"]
             heat_loss = diffusion_losses["heat"]
@@ -756,7 +756,7 @@ class DiffPeakEngine:
                     stable_seed(self.seed, "C", int(epoch), *ids)
                 )
                 heatmaps = self.diffusion.sample(
-                    self.unet,
+                    self.dit,
                     conditions,
                     generator=generator,
                     record=False,
@@ -1065,8 +1065,8 @@ class DiffPeakEngine:
         """采样一组轨迹、计算 GRPO 优势，并做一次（或多次）更新。"""
         if self.group_size < 2:
             raise ValueError("D 阶段要求 rl.group_size >= 2 才能做组内相对优势")
-        if self.ref_unet is None:
-            raise RuntimeError("D 阶段缺少冻结参考 U-Net")
+        if self.ref_dit is None:
+            raise RuntimeError("D 阶段缺少冻结参考 DiT")
 
         images = batch["image"]
         target_heatmaps = batch["heatmaps"]
@@ -1114,7 +1114,7 @@ class DiffPeakEngine:
             )
             with torch.no_grad(), self._autocast():
                 heatmaps, trace = self.diffusion.sample(
-                    self.unet,
+                    self.dit,
                     conditions,
                     generator=generator,
                     record=True,
@@ -1364,7 +1364,7 @@ class DiffPeakEngine:
             if self.anchor_weight > 0:
                 with self._autocast():
                     anchor_losses = self.diffusion.training_losses(
-                        self.unet, conditions, target_heatmaps
+                        self.dit, conditions, target_heatmaps
                     )
                     anchor = anchor_losses["diff"] * self.anchor_weight
                 self.scaler.scale(anchor.float()).backward()
@@ -1414,10 +1414,10 @@ class DiffPeakEngine:
                             step["old_log_prob"].to(self.device).reshape(-1).double()
                         )
 
-                        # rollout 与 replay 使用同一 AMP 上下文和同一 eval U-Net。
+                        # rollout 与 replay 使用同一 AMP 上下文和同一 eval DiT。
                         with self._autocast():
                             mean, std = self.diffusion.transition(
-                                self.unet,
+                                self.dit,
                                 state,
                                 timestep,
                                 previous_timestep,
@@ -1468,7 +1468,7 @@ class DiffPeakEngine:
                         if has_kl:
                             with torch.no_grad(), self._autocast():
                                 reference_mean, _ = self.diffusion.transition(
-                                    self.ref_unet,
+                                    self.ref_dit,
                                     state,
                                     timestep,
                                     previous_timestep,
@@ -1564,7 +1564,7 @@ class DiffPeakEngine:
                             evaluation_seed(self.seed, identifier)
                         )
                         heatmaps = self.diffusion.sample(
-                            self.unet,
+                            self.dit,
                             conditions,
                             generator=generator,
                             record=False,
@@ -1661,14 +1661,14 @@ class DiffPeakEngine:
             # 避免同一输入在两次前向中产生非确定性差异。
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
-            if self.ref_unet is None:
-                self.ref_unet = copy.deepcopy(self.unet)
-            self.ref_unet = self.ref_unet.to(self.device)
-            self.ref_unet.eval()
-            for parameter in self.ref_unet.parameters():
+            if self.ref_dit is None:
+                self.ref_dit = copy.deepcopy(self.dit)
+            self.ref_dit = self.ref_dit.to(self.device)
+            self.ref_dit.eval()
+            for parameter in self.ref_dit.parameters():
                 parameter.requires_grad_(False)
         else:
-            self.ref_unet = None
+            self.ref_dit = None
 
         self._set_train_modes(stage)
         self._build_optimizer(stage, epochs, steps_per_epoch)
@@ -1707,9 +1707,9 @@ class DiffPeakEngine:
             )
         del probe_loader
         # run_stage 自身负责恢复模型权重，不能依赖 CLI 预加载；
-        # D 阶段的 ref_unet 也在这里严格恢复。
+        # D 阶段的 ref_dit 也在这里严格恢复。
         if resume_payload is not None:
-            # 先检查算法归属：旧 DDPO 的 D 阶段快照即使带有 ref_unet，也不能
+            # 先检查算法归属：旧 DDPO 的 D 阶段快照即使带有 ref_dit，也不能
             # 把其 optimizer/scheduler 状态直接接到 GRPO。
             self._validate_resume_algorithm(resume_payload)
             self.load_models_from_payload(
@@ -1897,13 +1897,13 @@ class DiffPeakEngine:
             "condition_encoder": self._to_cpu_tree(
                 self.condition_encoder.state_dict()
             ),
-            "unet": self._to_cpu_tree(self.unet.state_dict()),
+            "dit": self._to_cpu_tree(self.dit.state_dict()),
         }
         # 始终写入 diffusion 字段（包含 beta/alpha 调度 buffer），
         # 严格加载器要求四个必需模块齐全。
         states["diffusion"] = self._to_cpu_tree(self.diffusion.state_dict())
-        if self.ref_unet is not None:
-            states["ref_unet"] = self._to_cpu_tree(self.ref_unet.state_dict())
+        if self.ref_dit is not None:
+            states["ref_dit"] = self._to_cpu_tree(self.ref_dit.state_dict())
         return states
 
     def _resolved_config(self) -> Dict[str, Any]:
@@ -2152,7 +2152,7 @@ class DiffPeakEngine:
     ) -> Dict[str, Any]:
         """严格加载模型权重。
 
-        ``allow_missing_ref=True`` 时，D 快照缺少 ``ref_unet`` 也可只做
+        ``allow_missing_ref=True`` 时，D 快照缺少 ``ref_dit`` 也可只做
         ``--init``；真正的 ``--resume`` 由 :meth:`run_stage` 传 ``False``，
         以保持参考策略的严格恢复。
         """
@@ -2161,22 +2161,22 @@ class DiffPeakEngine:
         )
         source = payload["models"]
         payload_stage = str(payload.get("stage", "")).upper()
-        if include_ref and "ref_unet" in source:
-            if self.ref_unet is None:
-                self.ref_unet = copy.deepcopy(self.unet)
-            self.ref_unet.load_state_dict(source["ref_unet"], strict=True)
-            self.ref_unet = self.ref_unet.to(self.device).eval()
-            for parameter in self.ref_unet.parameters():
+        if include_ref and "ref_dit" in source:
+            if self.ref_dit is None:
+                self.ref_dit = copy.deepcopy(self.dit)
+            self.ref_dit.load_state_dict(source["ref_dit"], strict=True)
+            self.ref_dit = self.ref_dit.to(self.device).eval()
+            for parameter in self.ref_dit.parameters():
                 parameter.requires_grad_(False)
         elif include_ref and payload_stage == "D" and not allow_missing_ref:
-            raise ValueError("D 阶段 checkpoint 缺少 ref_unet，不能恢复 KL 参考策略")
+            raise ValueError("D 阶段 checkpoint 缺少 ref_dit，不能恢复 KL 参考策略")
         return report
 
     def load_init_weights(self, path: Union[str, Path]) -> Mapping[str, Any]:
         """``--init``：只加载模型权重，不恢复优化器/epoch/RNG。
 
-        快照含 ref_unet 时保留该冻结参考；缺失时允许只初始化当前策略，
-        随后由 ``_prepare_stage`` 从当前 U-Net 建立新的冻结参考模型。
+        快照含 ref_dit 时保留该冻结参考；缺失时允许只初始化当前策略，
+        随后由 ``_prepare_stage`` 从当前 DiT 建立新的冻结参考模型。
         """
         payload = read_checkpoint(path)
         report = self.load_models_from_payload(

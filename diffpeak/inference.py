@@ -44,7 +44,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from diffpeak.models import ConditionEncoder, ConditionalUNet, GaussianDiffusion, RoadSAM
+from diffpeak.models import ConditionEncoder, ConditionalDiT, GaussianDiffusion, RoadSAM
 from diffpeak.models.sam import (
     DEFAULT_SAM2_ARCHITECTURE,
     DEFAULT_SAM2_CONFIG,
@@ -115,7 +115,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "sam_config": DEFAULT_SAM2_CONFIG,
         "sam_architecture": DEFAULT_SAM2_ARCHITECTURE,
         "sam_apply_postprocessing": False,
-        "gradient_checkpointing": True,
+        # 默认去噪器：ConditionalDiT（潜在热图上的 patch Transformer）。
+        "dit": {
+            "patch_size": 8,
+            "hidden_size": 256,
+            "depth": 6,
+            "num_heads": 8,
+            "mlp_ratio": 4.0,
+            # 与 ConditionEncoder 的四尺度输出一致：256/128/64/32。
+            "condition_channels": (64, 128, 256, 256),
+            "gradient_checkpointing": True,
+        },
     },
     "diffusion": {"timesteps": 1000, "sampling_steps": 20, "min_std": 0.02},
     "peaks": {"sigma": 0.5, "h": 0.05, "threshold": 0.3, "min_distance": 4},
@@ -142,7 +152,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "A": {"epochs": 15, "lr": 0.0001},
         "B": {"epochs": 60, "lr": 0.0001},
         "C": {"epochs": 10, "lr": 0.00005},
-        # D 只训练扩散 U-Net；更小的学习率与更高预热/退火终点见 README。
+        # D 只训练扩散 DiT；更小的学习率与更高预热/退火终点见 README。
         "D": {
             "epochs": 10,
             "lr": 0.000001,
@@ -522,7 +532,7 @@ def build_models(
 
     Returns:
         ``(models, peak_extractor)``。``models`` 包含 ``sam``、
-        ``condition_encoder``、``unet``、``diffusion``。
+        ``condition_encoder``、``dit``、``diffusion``。
     """
     device = torch.device(device)
     if sam_checkpoint is not None:
@@ -541,11 +551,26 @@ def build_models(
 
     model_cfg = config.get("model", {})
     diffusion_cfg = config.get("diffusion", {})
+    dit_cfg = model_cfg.get("dit", {})
+    if not isinstance(dit_cfg, Mapping):
+        raise ValueError("model.dit 必须是映射")
     sam_config = str(model_cfg.get("sam_config", DEFAULT_SAM2_CONFIG))
     sam_architecture = str(
         model_cfg.get("sam_architecture", DEFAULT_SAM2_ARCHITECTURE)
     )
     _validate_sam_architecture(sam_config, sam_architecture)
+    # 梯度检查点只由 model.dit 控制，默认开启。DEFAULT_CONFIG 始终包含该
+    # 嵌套键，因此不再回退到旧 model.gradient_checkpointing（避免 merge 后
+    # 旧键看似可覆盖、实际被嵌套默认值遮蔽）。
+    dit_gradient_checkpointing = bool(
+        dit_cfg.get("gradient_checkpointing", True)
+    )
+    condition_channels = tuple(
+        int(channels)
+        for channels in dit_cfg.get(
+            "condition_channels", (64, 128, 256, 256)
+        )
+    )
     models: Dict[str, torch.nn.Module] = {
         "sam": RoadSAM(
             str(checkpoint),
@@ -555,9 +580,18 @@ def build_models(
             ),
             architecture=sam_architecture,
         ),
-        "condition_encoder": ConditionEncoder(),
-        "unet": ConditionalUNet(
-            gradient_checkpointing=bool(model_cfg.get("gradient_checkpointing", True))
+        # 条件编码器与 DiT 使用同一组四尺度通道，非默认配置也不会静默错配。
+        "condition_encoder": ConditionEncoder(
+            condition_channels=condition_channels
+        ),
+        "dit": ConditionalDiT(
+            patch_size=int(dit_cfg.get("patch_size", 8)),
+            hidden_size=int(dit_cfg.get("hidden_size", 256)),
+            depth=int(dit_cfg.get("depth", 6)),
+            num_heads=int(dit_cfg.get("num_heads", 8)),
+            mlp_ratio=float(dit_cfg.get("mlp_ratio", 4.0)),
+            condition_channels=condition_channels,
+            gradient_checkpointing=dit_gradient_checkpointing,
         ),
         "diffusion": GaussianDiffusion(
             timesteps=int(diffusion_cfg.get("timesteps", 1000)),
@@ -574,7 +608,15 @@ def build_models(
 
 def _load_state(module: torch.nn.Module, state: Mapping[str, Any], name: str) -> None:
     """严格加载权重；缺失/多余键直接报错，避免静默使用错误 checkpoint。"""
-    module.load_state_dict(state, strict=True)
+    try:
+        module.load_state_dict(state, strict=True)
+    except (RuntimeError, ValueError) as exc:
+        if name == "dit":
+            raise ValueError(
+                "checkpoint.models.dit 与当前 ConditionalDiT 不兼容："
+                f"{exc}。请使用相同 DiT 配置生成的训练快照。"
+            ) from exc
+        raise
 
 
 def _expects_sam2_state(module: torch.nn.Module) -> bool:
@@ -602,8 +644,9 @@ def load_checkpoint_models(
     """从本项目生成的训练快照中严格加载模型权重（不含优化器状态）。
 
     本项目的 ``last.pt`` / ``best.pt`` / ``stage_X.pth`` 必须包含
-    ``models.{sam, condition_encoder, unet, diffusion}``。缺字段或键不匹配
-    会立即失败，避免用随机或错误权重继续预测。``ref_unet`` 只存在于 D
+    ``models.{sam, condition_encoder, dit, diffusion}``。
+    缺字段或键不匹配会立即失败，避免用随机或错误权重继续预测。
+    ``ref_dit`` 只存在于 D
     阶段快照，由 ``include_ref`` 控制是否加载。
     """
     if not isinstance(payload, Mapping) or "models" not in payload:
@@ -611,7 +654,7 @@ def load_checkpoint_models(
     source = payload["models"]
     if not isinstance(source, Mapping):
         raise ValueError("checkpoint.models 必须是映射")
-    required = ("sam", "condition_encoder", "unet", "diffusion")
+    required = ("sam", "condition_encoder", "dit", "diffusion")
     missing = [name for name in required if name not in source]
     if missing:
         raise ValueError(
@@ -640,6 +683,17 @@ def load_checkpoint_models(
     if isinstance(saved_config, Mapping):
         saved_model_cfg = saved_config.get("model", {})
         if isinstance(saved_model_cfg, Mapping):
+            # 注意力头数不改变权重形状，strict=True 无法发现这种语义错配。
+            saved_dit = saved_model_cfg.get("dit", {})
+            target_dit = models.get("dit")
+            if isinstance(saved_dit, Mapping) and isinstance(target_dit, ConditionalDiT):
+                saved_heads = saved_dit.get("num_heads")
+                if saved_heads is not None and int(saved_heads) != target_dit.num_heads:
+                    raise ValueError(
+                        "checkpoint 的 DiT num_heads 与当前配置不一致："
+                        f"{saved_heads} != {target_dit.num_heads}；"
+                        "注意力头数必须与训练快照匹配。"
+                    )
             saved_architecture = saved_model_cfg.get("sam_architecture")
             target_architecture = getattr(models.get("sam"), "architecture", None)
             if (
@@ -653,7 +707,7 @@ def load_checkpoint_models(
                     "请使用匹配的 model.sam_architecture / sam_config 与权重。"
                 )
 
-    for name in ("sam", "condition_encoder", "unet"):
+    for name in ("sam", "condition_encoder", "dit"):
         if name not in models:
             raise ValueError(f"目标模型集合缺少 {name}")
         _load_state(models[name], source[name], name)
@@ -661,10 +715,10 @@ def load_checkpoint_models(
         raise ValueError("目标模型集合缺少 diffusion")
     _load_state(models["diffusion"], source["diffusion"], "diffusion")
 
-    if include_ref and "ref_unet" in source:
-        if "ref_unet" not in models:
-            raise ValueError("需要加载 ref_unet，但目标模型集合未创建参考 U-Net")
-        _load_state(models["ref_unet"], source["ref_unet"], "ref_unet")
+    if include_ref and "ref_dit" in source:
+        if "ref_dit" not in models:
+            raise ValueError("需要加载 ref_dit，但目标模型集合未创建参考 DiT")
+        _load_state(models["ref_dit"], source["ref_dit"], "ref_dit")
     return {}
 
 
@@ -1343,7 +1397,7 @@ class Predictor:
 
         self.sam = self.models["sam"]
         self.condition_encoder = self.models["condition_encoder"]
-        self.unet = self.models["unet"]
+        self.dit = self.models["dit"]
         self.diffusion = self.models["diffusion"]
 
     def _autocast(self):
@@ -1377,11 +1431,11 @@ class Predictor:
         with self._autocast():
             embeddings = encode_images(self.sam, tensor, valid_sizes)
             # 传入完整特征容器：开启高分辨率融合时条件编码器直接使用
-            # SAM2 的原始 FPN 1/4、1/8 特征；旧接口仍接受裸低分辨率张量。
+            # SAM2 的原始 FPN 1/4、1/8 特征。
             conditions, _ = self.condition_encoder(tensor, embeddings)
             conditions = [item.detach() for item in conditions]
             heatmaps = self.diffusion.sample(
-                self.unet,
+                self.dit,
                 conditions,
                 generator=generator,
                 record=False,

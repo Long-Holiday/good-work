@@ -7,9 +7,9 @@
 1. 固定 `splits/protocol_v1/*.json`（或登记过的等价三分清单）与依赖版本；不对官方无掩码 valid/test 计算指标，内部 test 只在全部选模完成后统一评估。划分与测试集使用历史见 [实验协议](experimental_protocol.md) 第 2 节。
 2. 先运行 `python check_targets.py --config configs/3090.yaml --samples 16`，检查目标点回提 precision / recall、数量、最大定位误差及无正峰率。少量样本仅用于排错，正式定阈值需覆盖整个内部验证集。若仍在用旧两分清单，这 16 张可能落入新 test，必须按协议登记用途，不能据此声称测试集从未被查看。
 3. A 阶段只训练 SAM2 解码器，确认真实提示下 SAM2 能学道路；SAM2 迁移后必须从 A 重新开始 A→B→C→D。A 的真值提示指标是受提示监督的诊断指标，不能与 B/C/D 自动生成提示成绩混称。
-4. B 阶段训练细节/条件编码器与去噪 U-Net。先检查扩散 MSE 与低中噪声重建，再看生成热图幅度、正负峰数与无正峰率；只看扩散 MSE 不足以选择最终模型。
+4. B 阶段训练细节/条件编码器与去噪 DiT。先检查扩散 MSE 与低中噪声重建，再看生成热图幅度、正负峰数与无正峰率；只看扩散 MSE 不足以选择最终模型。
 5. C 阶段只训练 SAM2 解码器，确认生成提示分布下解码器适配有效，再冻结解码器进入 D。
-6. D 阶段只训练扩散 U-Net，使用 GRPO。同时记录终端奖励、组内奖励标准差、零优势组比例、联合 log-ratio、KL、裁剪比例与点数。若同图四条轨迹奖励完全一致，优势为零是正确行为，不应替换成跨图基线；非零但方差低于 `advantage_std_delta` 的组只按该下限缩放，仍会参与学习，不能误记为“已跳过”。
+6. D 阶段只训练扩散 DiT，使用 GRPO。同时记录终端奖励、组内奖励标准差、零优势组比例、联合 log-ratio、KL、裁剪比例与点数。若同图四条轨迹奖励完全一致，优势为零是正确行为，不应替换成跨图基线；非零但方差低于 `advantage_std_delta` 的组只按该下限缩放，仍会参与学习，不能误记为“已跳过”。
 7. 完整实验以每张影像一次采样为主协议，多种子重复。不要用标注从多轨迹中挑最优结果当成无标注推理性能。
 
 ## 提示质量与奖励诊断
@@ -55,8 +55,8 @@ TensorBoard 和 epoch 汇总新增质量/成本的组内标准差、`advantage_p
 - `point_cost_warmup_steps` 按**已处理的 D 组数**推进，不依赖该组是否真正产生 optimizer step；这样常量奖励组或 AMP 溢出不会让预热永久停在 0。验证固定使用未预热的基准 `reward.point_cost`，避免同一 checkpoint 的验证奖励随预热进度漂移；`0` 表示禁用。
 - `anchor_weight` 默认 `0`；非零时是可选监督锚定（对目标热图额外加扩散 MSE），不是默认 GRPO 目标。
 - D 阶段的 `lr`、`warmup_ratio`、`min_lr_ratio` 在 `stages.D` 中覆盖全局值；具体数值以配置为准，不在文档中重复。
-- **两种“旧策略”不要混淆。** 组 rollout 时保存的 `old_log_prob` 在组内冻结并 detach，只作为概率比的分母；重放更新时重算当前策略。首次从 B/C 进入 D 时深拷贝当前预训练 U-Net 为长期参考，之后永久冻结，只用于 KL；从已有 D 快照初始化或恢复时保留其中的 `ref_unet`，缺失时才从已加载权重重建，需记录该协议差异。前者不是长期参考模型。
-- **从 DDPO 快照迁移。** 旧 DDPO 模型可以用 `--init` 只加载权重来启动新的 D 阶段；不支持把旧 DDPO 快照直接 `--resume` 当作 GRPO 训练继续，因为优化器/调度器/RNG 可加载并不代表旧策略轨迹、组采样或参考策略语义兼容。旧配置也可能缺少 `rl.algorithm` 与 `rl.point_cost_warmup_steps`，应显式提供新 YAML 并使用独立输出目录。
+- **两种“旧策略”不要混淆。** 组 rollout 时保存的 `old_log_prob` 在组内冻结并 detach，只作为概率比的分母；重放更新时重算当前策略。首次从 B/C 进入 D 时深拷贝当前预训练 DiT 为长期参考，之后永久冻结，只用于 KL；从已有 D 快照初始化或恢复时保留其中的 `ref_dit`，缺失时才从已加载权重重建，需记录该协议差异。前者不是长期参考模型。
+- **旧快照的架构限制。** 旧 U-Net/DDPO 快照不能通过 `--init` 或 `--resume` 加载到当前 DiT；应使用独立输出目录从官方 SAM2.1 权重重新执行 A→B→C→D。只有结构匹配的 DiT 权重才能用于后续初始化；不同训练算法的优化器/调度器/RNG 可技术性加载也不代表可按 GRPO 继续恢复。
 - 以上均为待验证起点，本文不声称已运行 GRPO 实验或取得改进。
 
 ## 实验运行目录、日志与 TensorBoard
@@ -132,7 +132,7 @@ tag 以阶段名为第一级，避免同一输出目录顺序执行 A→B→C→
 <stage>/system/<metric>         # 耗时/学习率/AMP/显存，例如 A/system/epoch_seconds
 ```
 
-- 阶段前缀使用实际的 `A`/`B`/`C`/`D`，因此 A/C 的 SAM2 解码器指标与 B/D 的 U-Net 指标不会混称。
+- 阶段前缀使用实际的 `A`/`B`/`C`/`D`，因此 A/C 的 SAM2 解码器指标与 B/D 的 DiT 指标不会混称。
 - epoch 级标量（`train_epoch`、`val_epoch`、按 epoch 统计的 `system`）使用 1-based epoch 作为 step，即第一个完整 epoch 为 1。
 - batch/group 标量使用 `global_step = epoch_index * len(loader) + index`：`epoch_index` 为该轮从 0 开始的内部序号，`index` 为该 epoch 内从 1 开始的 batch 序号；D 阶段以 `group_index` 替代 `batch_index`（`len(loader)` 为该阶段训练 loader 长度）。因此第一个 epoch 的第一个 batch/group 为 step 1，同一 session 内该轴单调递增且跨 epoch 不重叠。`metrics.jsonl` 中的 `epoch` 字段仍是 1-based。
 - `metrics.jsonl` 中指标记录的 `step` 与 TensorBoard 标量使用同一个 step。
@@ -167,7 +167,9 @@ tensorboard --logdir runs/diffpeak --port 6006
 
 ## 配置与内存
 
-输入 1024²、热图 256² 是当前硬编码的基础几何，不是可随意调换的缩放开关。3090 的 batch、AMP、U-Net 检查点、冻结 SAM2 编码器、串行轨迹和 CPU 暂存等取值统一见 `configs/3090.yaml`，已测范围见 [探针记录](probe_3090.md)。改变实验因素需单独登记，不能把降配悄悄混入主表。
+输入 1024²、热图 256² 是当前硬编码的基础几何，不是可随意调换的缩放开关。3090 的 batch、AMP、DiT 激活检查点、冻结 SAM2 编码器、串行轨迹和 CPU 暂存等取值统一见 `configs/3090.yaml`，已测范围见 [探针记录](probe_3090.md)。改变实验因素需单独登记，不能把降配悄悄混入主表。
+
+去噪器从 ConditionalUNet 换成 ConditionalDiT 是架构变更：旧 U-Net 的 checkpoint 参数结构与 DiT 不兼容，`--resume`/`--init` 会被严格加载显式拒绝，不会静默使用随机权重。U-Net 时期已完成的 A/B/C/D 结果与探针数字保留为历史记录，不能作为 DiT 的实测依据；U-Net/DiT 对照需单独登记架构因素并匹配实验协议。新实验需从官方 SAM2.1 权重重新执行 A→B→C→D。
 
 SAM2 替换 SAM1 是骨干变更：SAM1 的 checkpoint、A/B/C/D 快照和已有探针结果都不再适用，必须用 SAM2.1 Hiera-B+ 权重（`sam2.1_hiera_base_plus.pt`，官方配置 `configs/sam2.1/sam2.1_hiera_b+.yaml`）从 A 重新训练并重新测量。3090 探针脚本固定 `--cpu-threads 2 --interop-threads 1` 限制 CPU 线程；SAM1 历史数字与 SAM2 新探针分开保存，不交叉复用。
 

@@ -17,7 +17,7 @@ from torch import nn
 from diffpeak.engine import DiffPeakEngine
 from diffpeak.experiment_logging import ExperimentLogger
 from diffpeak.inference import DEFAULT_CONFIG, read_checkpoint
-from diffpeak.models import ConditionEncoder, ConditionalUNet, GaussianDiffusion
+from diffpeak.models import ConditionEncoder, ConditionalDiT, GaussianDiffusion
 from diffpeak.models.sam import SAM2ImageFeatures
 from diffpeak.prompts import PeakExtractor
 
@@ -54,9 +54,9 @@ def _build_tiny_models(config, device, sam_checkpoint=None):
         "condition_encoder": ConditionEncoder(
             sam_channels=4, condition_channels=(4, 8, 8, 8)
         ),
-        "unet": ConditionalUNet(
-            base_channels=4, channel_mult=(1, 2, 2, 2),
-            condition_channels=(4, 8, 8, 8), num_res_blocks=1,
+        "dit": ConditionalDiT(
+            hidden_size=32, depth=2, num_heads=4, patch_size=4,
+            condition_channels=(4, 8, 8, 8), gradient_checkpointing=True,
         ),
         "diffusion": GaussianDiffusion(timesteps=8, sampling_steps=2, heatmap_size=16),
     }
@@ -89,6 +89,11 @@ class EnginePipelineTest(unittest.TestCase):
         split = root / "split.json"
         split.write_text(json.dumps(entries), encoding="utf-8")
         config = copy.deepcopy(DEFAULT_CONFIG)
+        # 快照配置必须描述测试工厂实际构建的微型 DiT。
+        config["model"]["dit"].update(
+            hidden_size=32, depth=2, num_heads=4, patch_size=4,
+            condition_channels=(4, 8, 8, 8), gradient_checkpointing=True,
+        )
         config["data"].update(root=str(data), train_split=str(split), val_split=str(split), num_workers=0)
         config["output_dir"] = str(root / "run")
         checkpoint = root / "unused.pth"
@@ -149,7 +154,7 @@ class EnginePipelineTest(unittest.TestCase):
             checkpoint = read_checkpoint(continuous.output_dir / "last.pt")
             self.assertEqual(checkpoint["epoch"], 1)
             self.assertEqual(checkpoint["schedule"]["total_steps"], 2)
-            self.assertIn("ref_unet", checkpoint["models"])
+            self.assertIn("ref_dit", checkpoint["models"])
             continuous.run_stage("D", start_epoch=1, resume_payload=copy.deepcopy(checkpoint))
 
             config["output_dir"] = str(Path(temporary) / "resumed")
@@ -162,11 +167,11 @@ class EnginePipelineTest(unittest.TestCase):
             self.assertEqual(resumed.scheduler.state_dict(), continuous.scheduler.state_dict())
             self.assertEqual(resumed.optimizer.param_groups[0]["lr"], continuous.optimizer.param_groups[0]["lr"])
             self.assertEqual(uninterrupted.global_step, continuous.global_step)
-            for name, parameter in continuous.unet.state_dict().items():
-                torch.testing.assert_close(uninterrupted.unet.state_dict()[name], parameter, rtol=0, atol=0)
-                torch.testing.assert_close(resumed.unet.state_dict()[name], parameter, rtol=0, atol=0)
-            for name, parameter in continuous.ref_unet.state_dict().items():
-                torch.testing.assert_close(resumed.ref_unet.state_dict()[name], parameter, rtol=0, atol=0)
+            for name, parameter in continuous.dit.state_dict().items():
+                torch.testing.assert_close(uninterrupted.dit.state_dict()[name], parameter, rtol=0, atol=0)
+                torch.testing.assert_close(resumed.dit.state_dict()[name], parameter, rtol=0, atol=0)
+            for name, parameter in continuous.ref_dit.state_dict().items():
+                torch.testing.assert_close(resumed.ref_dit.state_dict()[name], parameter, rtol=0, atol=0)
 
     def test_stage_throughput_overrides_apply_before_loader_and_scheduler(self):
         with tempfile.TemporaryDirectory() as temporary, patch(

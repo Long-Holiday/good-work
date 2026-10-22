@@ -209,7 +209,7 @@ def _run_training(parser, args, config, preloaded, engine, experiment) -> None:
             raise ValueError("--resume 必须指向本项目生成的完整训练快照")
         # Also validate already-completed stages, which bypass run_stage below.
         engine._validate_resume_algorithm(resume_payload)
-        # run_stage 自身会严格加载模型权重（含 D 的 ref_unet）；
+        # run_stage 自身会严格加载模型权重（含 D 的 ref_dit）；
         # 这里不要预加载或删除 payload.models，避免重复加载/破坏严格恢复。
         resume_stage = str(resume_payload.get("stage", "")).upper()
         resume_epoch = int(resume_payload.get("epoch", 0))
