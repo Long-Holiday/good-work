@@ -501,3 +501,236 @@ class RoadSAM(nn.Module):
             for index, logits in enumerate(decoded)
         ]
         return torch.cat(outputs, dim=0)
+
+    @staticmethod
+    def _normalise_prompt_valid_sizes(
+        valid_sizes: Union[Sequence[Tuple[int, int]], Tensor],
+        batch_size: int,
+        output_size: Tuple[int, int],
+    ) -> List[Tuple[int, int]]:
+        """把 ``valid_sizes`` 校验为 ``output_size`` 坐标系下的 ``(h, w)``。
+
+        与 :meth:`encode` 的 ``valid_sizes`` 口径一致：数值单位是 SAM 输入
+        画布像素，``None`` 表示该样本满幅。密集热图提示会把这些尺寸按比例
+        缩放到热图分辨率后再屏蔽右下填充区。
+        """
+        out_height, out_width = int(output_size[0]), int(output_size[1])
+        raw = (
+            valid_sizes.detach().cpu().tolist()
+            if isinstance(valid_sizes, Tensor)
+            else valid_sizes
+        )
+        if _is_size_pair(raw):
+            if batch_size != 1:
+                raise ValueError("单个 (height, width) 只适用于 batch_size=1")
+            items: Sequence[object] = [raw]
+        else:
+            try:
+                items = list(raw)  # type: ignore[arg-type]
+            except TypeError as exc:
+                raise TypeError("valid_sizes 必须是序列或单个 (height, width)") from exc
+            if len(items) != batch_size:
+                raise ValueError(
+                    f"valid_sizes 长度 {len(items)} 与 batch_size {batch_size} 不一致"
+                )
+
+        normalised: List[Tuple[int, int]] = []
+        for item in items:
+            if item is None:
+                normalised.append((out_height, out_width))
+                continue
+            if isinstance(item, Tensor):
+                item = item.detach().cpu().tolist()
+            if not _is_size_pair(item):
+                raise ValueError("valid_sizes 的每个元素必须是 (height, width)")
+            height, width = int(item[0]), int(item[1])  # type: ignore[index]
+            if not (0 < height <= out_height and 0 < width <= out_width):
+                raise ValueError(
+                    "valid_size 必须在 "
+                    f"(0, {out_height}] x (0, {out_width}] 内，"
+                    f"实际为 {(height, width)}"
+                )
+            normalised.append((height, width))
+        return normalised
+
+    def decode_heatmaps(
+        self,
+        embeddings: Union[Tensor, SAM2ImageFeatures],
+        heatmaps: Tensor,
+        output_size: Tuple[int, int] = (1024, 1024),
+        valid_sizes: Optional[Union[Sequence[Tuple[int, int]], Tensor]] = None,
+        decoder: Optional[nn.Module] = None,
+    ) -> Tensor:
+        """用可微密集热图提示解码全部样本。
+
+        该路径用于联合 ABC 端到端训练：把扩散热图的**正负通道差**
+        ``heatmaps[:, 0] - heatmaps[:, 1]``（一通道输入则直接使用）作为 SAM
+        掩码提示，经冻结的提示编码器得到 dense embedding，再交给掩码解码器。
+        与 :meth:`decode` 不同：
+
+        * 不使用任何稀疏点提示（``points=None`` / ``boxes=None``）；
+        * 不跳过空热图样本，整批一次解码，因此每张图都有解码器梯度路径；
+        * 提示编码器在**不包裹** ``torch.no_grad()`` 的情况下执行。其权重仍然
+          冻结，但因输入 ``heatmaps`` 要求梯度，反向传播可以穿过冻结的掩码
+          下采样卷积回到热图，进而回到去噪器/条件编码器；
+        * 高分辨率 FPN 投影 ``conv_s0`` / ``conv_s1`` 取自 ``decoder``（默认
+          当前模型的掩码解码器），保证联合训练时这些参数仍可训练。
+
+        Args:
+            embeddings: ``encode`` 返回的 :class:`SAM2ImageFeatures`（含高分辨率
+                特征时最完整）；也接受裸低分辨率 ``B x 256 x 64 x 64`` 张量。
+            heatmaps: ``B x 2 x h x w`` 的正/负提示热图（通道 0 为正、1 为负），
+                或 ``B x 1 x h x w`` 的已签名掩码。范围约定为 ``[0, 1]``。
+            output_size: 输出 logits 的 ``(height, width)``，默认 1024。
+            valid_sizes: 可选的每样本有效区域 ``(height, width)``，单位为
+                ``output_size`` 画布像素；右下填充区会在送入提示编码器前清零。
+            decoder: 可选的掩码解码器覆盖模块（需提供与 SAM2 相同的
+                ``forward`` 签名以及 ``conv_s0`` / ``conv_s1``，例如强化学习
+                阶段冻结的参考解码器）。默认使用 ``self.mask_decoder``。
+
+        Returns:
+            ``B x 1 x H x W`` 的分割 logits（``H, W`` 来自 ``output_size``）。
+            当 ``heatmaps.requires_grad`` 时输出保留完整计算图。
+        """
+        low_res = low_res_features(embeddings)
+        if low_res.ndim != 4:
+            raise ValueError(
+                f"embeddings 应为 B x 256 x 64 x 64，实际为 {tuple(low_res.shape)}"
+            )
+        if len(output_size) != 2:
+            raise ValueError("output_size 应为 (H, W)")
+        if not torch.is_tensor(heatmaps):
+            raise TypeError(f"heatmaps 必须是张量，实际为 {type(heatmaps)!r}")
+        if heatmaps.ndim != 4 or heatmaps.shape[1] not in (1, 2):
+            raise ValueError(
+                "heatmaps 应为 B x 2 x H x W（或 B x 1 的已签名掩码），"
+                f"实际为 {tuple(heatmaps.shape)}"
+            )
+        if not heatmaps.is_floating_point():
+            raise TypeError(f"heatmaps 必须是浮点张量，实际 dtype 为 {heatmaps.dtype}")
+        batch_size = int(low_res.shape[0])
+        if int(heatmaps.shape[0]) != batch_size:
+            raise ValueError(
+                f"heatmaps batch {int(heatmaps.shape[0])} 与 embeddings "
+                f"batch {batch_size} 不一致"
+            )
+        if heatmaps.device != low_res.device:
+            # 移动是可微操作，不切断到原始 heatmaps 的梯度。
+            heatmaps = heatmaps.to(device=low_res.device)
+
+        # 官方约定通道 0 为正提示、通道 1 为负提示；有符号差值即掩码 logits。
+        if heatmaps.shape[1] == 2:
+            dense_mask = heatmaps[:, 0:1] - heatmaps[:, 1:2]
+        else:
+            dense_mask = heatmaps[:, 0:1]
+
+        out_height, out_width = int(output_size[0]), int(output_size[1])
+        heat_height, heat_width = int(dense_mask.shape[-2]), int(dense_mask.shape[-1])
+        sizes: Optional[List[Tuple[int, int]]] = None
+        if valid_sizes is not None:
+            sizes = self._normalise_prompt_valid_sizes(
+                valid_sizes, batch_size, (out_height, out_width)
+            )
+            valid = torch.zeros_like(dense_mask)
+            for index, (valid_height, valid_width) in enumerate(sizes):
+                scaled_height = max(
+                    1, min(heat_height, int(round(valid_height * heat_height / out_height)))
+                )
+                scaled_width = max(
+                    1, min(heat_width, int(round(valid_width * heat_width / out_width)))
+                )
+                valid[index, :, :scaled_height, :scaled_width] = 1.0
+            # 乘法保持可微，并让填充区的提示恰为 0（背景）。
+            dense_mask = dense_mask * valid
+
+        prompt_encoder = getattr(self.sam, "sam_prompt_encoder", None)
+        if prompt_encoder is None:
+            raise AttributeError("RoadSAM 缺少 sam_prompt_encoder，无法编码密集热图提示")
+        mask_input_size = getattr(prompt_encoder, "mask_input_size", (256, 256))
+        mask_input_size = (int(mask_input_size[0]), int(mask_input_size[1]))
+        mask_prompt = F.interpolate(
+            dense_mask,
+            size=mask_input_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        if sizes is not None:
+            # 双线性上采样会把有效区边界外的零向内侧扩散；在提示编码器的
+            # 输入分辨率上再次硬屏蔽，保证 padding 提示严格为 0。
+            prompt_valid = torch.zeros_like(mask_prompt)
+            for index, (valid_height, valid_width) in enumerate(sizes):
+                scaled_height = max(
+                    1,
+                    min(
+                        mask_input_size[0],
+                        int(
+                            round(
+                                valid_height * mask_input_size[0] / out_height
+                            )
+                        ),
+                    ),
+                )
+                scaled_width = max(
+                    1,
+                    min(
+                        mask_input_size[1],
+                        int(round(valid_width * mask_input_size[1] / out_width)),
+                    ),
+                )
+                prompt_valid[index, :, :scaled_height, :scaled_width] = 1.0
+            mask_prompt = mask_prompt * prompt_valid
+        # 与提示编码器参数 dtype 对齐；``.to`` 可微，不切断到热图的梯度。
+        try:
+            prompt_dtype = next(prompt_encoder.parameters()).dtype
+        except StopIteration:  # pragma: no cover - 无参数的测试替身
+            prompt_dtype = mask_prompt.dtype
+        if mask_prompt.dtype != prompt_dtype:
+            mask_prompt = mask_prompt.to(dtype=prompt_dtype)
+        # 关键：此处不能使用 torch.no_grad()。提示编码器参数已冻结，但保留
+        # 计算图后，梯度可以穿过冻结权重回传到 mask_prompt / heatmaps。
+        sparse_embeddings, dense_embeddings = prompt_encoder(
+            points=None, boxes=None, masks=mask_prompt
+        )
+
+        decoder_module = self.mask_decoder if decoder is None else decoder
+        if not callable(decoder_module):
+            raise TypeError("decoder 必须是可调用的掩码解码器模块")
+
+        high_res = (
+            embeddings.high_res if isinstance(embeddings, SAM2ImageFeatures) else None
+        )
+        if bool(getattr(self.sam, "use_high_res_features_in_sam", False)) and high_res is None:
+            raise ValueError(
+                "SAM2.1 解码器需要高分辨率特征；请传入 RoadSAM.encode 的 "
+                "SAM2ImageFeatures，而不是裸低分辨率张量"
+            )
+
+        high_res_features = None
+        if high_res is not None:
+            conv_s0 = getattr(decoder_module, "conv_s0", None)
+            conv_s1 = getattr(decoder_module, "conv_s1", None)
+            if conv_s0 is None or conv_s1 is None:
+                raise ValueError(
+                    "decoder 缺少 conv_s0 / conv_s1，无法复用高分辨率 FPN 投影"
+                )
+            high_res_features = [
+                conv_s0(high_res[0]),
+                conv_s1(high_res[1]),
+            ]
+
+        image_pe = prompt_encoder.get_dense_pe()
+        low_res_logits, _, _, _ = decoder_module(
+            image_embeddings=low_res,
+            image_pe=image_pe,
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+            repeat_image=False,
+            high_res_features=high_res_features,
+        )
+        return F.interpolate(
+            low_res_logits,
+            size=(out_height, out_width),
+            mode="bilinear",
+            align_corners=False,
+        )

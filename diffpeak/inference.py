@@ -55,6 +55,7 @@ from diffpeak.prompts import PeakExtractor
 
 __all__ = [
     "DEFAULT_CONFIG",
+    "JOINT_ABC_PROTOCOL",
     "Predictor",
     "aggregate_metrics",
     "build_models",
@@ -90,14 +91,21 @@ __all__ = [
     "seed_everything",
     "stable_seed",
     "unique_output_path",
+    "uses_joint_abc_protocol",
     "warn_protocol_differences",
 ]
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
+# 联合 ABC 端到端训练协议的根级标记。训练与推理必须使用同一标记，推理才会
+# 走可微密集热图提示路径；旧快照没有该字段时继续使用点提示路径。
+JOINT_ABC_PROTOCOL = "joint_abc_v1"
+
 # 根配置的完整默认值。YAML 中缺少的可选项会自动补齐。
 DEFAULT_CONFIG: Dict[str, Any] = {
     "seed": 42,
+    # 联合 ABC 端到端协议标记：推理据此选择密集热图提示解码路径。
+    "training_protocol": "joint_abc_v1",
     "output_dir": "runs/diffpeak",
     "logging": {"tensorboard": True, "log_every": 10, "flush_secs": 30},
     "data": {
@@ -138,6 +146,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "heat_weight": 0.1,
         "aux_weight": 0.2,
         "cldice_weight": 0.2,
+        # 联合 ABC：目标热图（含 teacher forcing）与采样热图两条分割路径。
+        "seg_weight": 1.0,
+        "sampled_seg_weight": 1.0,
         "save_every": 1,
         # 线性 warmup + cosine 退火；显式 warmup_steps 优先于 warmup_ratio。
         "warmup_steps": 0,
@@ -149,15 +160,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "deterministic": False,
     },
     "stages": {
-        "A": {"epochs": 15, "lr": 0.0001},
-        "B": {"epochs": 60, "lr": 0.0001},
-        "C": {"epochs": 10, "lr": 0.00005},
-        # D 只训练扩散 DiT；更小的学习率与更高预热/退火终点见 README。
+        # 联合 ABC：条件编码器、DiT 与 SAM 掩码解码器在同一步端到端训练。
+        "ABC": {
+            "epochs": 60,
+            "lr": 0.0001,
+            "batch_size": 1,
+            "accumulation_steps": 4,
+        },
+        # D 只训练扩散 DiT；更小的学习率见 README。
         "D": {
             "epochs": 10,
-            "lr": 0.000001,
-            "warmup_ratio": 0.1,
-            "min_lr_ratio": 0.1,
+            "lr": 0.0000003,
+            "batch_size": 1,
         },
     },
     "rl": {
@@ -240,7 +254,24 @@ def load_config(path: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
         loaded = yaml.safe_load(handle) or {}
     if not isinstance(loaded, Mapping):
         raise ValueError(f"配置文件顶层必须是映射：{config_path}")
-    return _deep_update(json.loads(json.dumps(DEFAULT_CONFIG)), loaded)
+    result = _deep_update(json.loads(json.dumps(DEFAULT_CONFIG)), loaded)
+    # 历史四阶段 YAML 不能被新增默认 marker 静默改成密集提示模型。
+    if "training_protocol" not in loaded and any(
+        stage in loaded.get("stages", {}) for stage in ("A", "B", "C")
+    ):
+        result.pop("training_protocol", None)
+    return result
+
+
+def uses_joint_abc_protocol(config: Mapping[str, Any]) -> bool:
+    """判断配置是否声明联合 ABC 端到端协议（``training_protocol``）。
+
+    该标记位于配置根部而非 ``train`` 下，因此训练快照、推理 YAML 与评测
+    入口读取的是同一个不随阶段覆盖的字段。缺省或旧配置返回 ``False``，
+    保持点提示推理路径不变。
+    """
+    value = config.get("training_protocol")
+    return isinstance(value, str) and value.strip().lower() == JOINT_ABC_PROTOCOL
 
 
 def find_existing_path(
@@ -427,6 +458,7 @@ def config_from_checkpoint(
 
 # 影响推理结果的协议字段：显式配置可以覆盖它们，但与训练快照不同时需提示。
 _PROTOCOL_KEYS: Tuple[str, ...] = (
+    "training_protocol",
     "data.sampling_config",
     "model.sam_config",
     "model.sam_architecture",
@@ -1357,6 +1389,9 @@ class Predictor:
             if threshold is not None
             else config.get("inference", {}).get("threshold", 0.5)
         )
+        # 联合 ABC 快照使用采样热图作为可微密集提示；旧快照仍用峰值点提示。
+        self.joint_abc = uses_joint_abc_protocol(config)
+        self.prompt_mode = "heatmap" if self.joint_abc else "points"
 
         checkpoint_path = resolve_sam_checkpoint(config, config_dir)
         self.models, self.peak_extractor = build_models(
@@ -1446,13 +1481,23 @@ class Predictor:
                 image_size=self.image_size,
                 valid_sizes=valid_sizes,
             )[0]
-            prompt = points_to_prompt(points, self.device)
-            logits, _ = decode_with_prompts(
-                self.sam,
-                embeddings,
-                [prompt],
-                output_size=(self.image_size, self.image_size),
-            )
+            if self.joint_abc:
+                # 与训练同一路径：扩散热图的符号差作为冻结 SAM 提示编码器
+                # 的密集掩码提示，所有样本（包括空热图）都参与解码。
+                logits = self.sam.decode_heatmaps(
+                    embeddings,
+                    heatmaps,
+                    output_size=(self.image_size, self.image_size),
+                    valid_sizes=valid_sizes,
+                )
+            else:
+                prompt = points_to_prompt(points, self.device)
+                logits, _ = decode_with_prompts(
+                    self.sam,
+                    embeddings,
+                    [prompt],
+                    output_size=(self.image_size, self.image_size),
+                )
             probability = torch.sigmoid(logits[0, 0])
 
         probability_np = crop_resize_probability(
@@ -1462,15 +1507,23 @@ class Predictor:
         point_payload = map_points_to_original(
             points, original_size, resized_size
         )
+        peak_point_count = int(point_payload["point_count"])
+        # 联合 ABC 使用密集热图提示，实际点成本必须为 0；峰值点仅作为诊断
+        # 保留（与 engine 验证阶段的 point_count 口径一致）。旧点提示路径
+        # 仍按实际点数计费。
+        billed_point_count = 0 if self.joint_abc else peak_point_count
 
         result: Dict[str, Any] = {
             "image_id": identifier,
             "mask": (mask.astype(np.uint8) * 255),
             "probability": probability_np,
             "points": point_payload,
+            # point_count 参与奖励/评估的点成本，dense 协议下恒为 0。
+            "point_count": billed_point_count,
+            # 实际提取到的峰值点数，供 prompt_quality 等诊断使用。
+            "peak_point_count": peak_point_count,
             "positive_count": int(point_payload["positive_count"]),
             "negative_count": int(point_payload["negative_count"]),
-            "point_count": int(point_payload["point_count"]),
             "has_positive": bool(point_payload["positive_count"] > 0),
             "original_size": (int(original_size[0]), int(original_size[1])),
             "resized_size": (int(resized_size[0]), int(resized_size[1])),
@@ -1479,6 +1532,8 @@ class Predictor:
                 int(self.image_size - resized_size[0]),
             ),
             "threshold": float(self.threshold),
+            # 诊断：heatmap 表示联合 ABC 的密集提示；points 表示旧点提示路径。
+            "prompt_mode": self.prompt_mode,
         }
         if return_heatmaps:
             result["heatmaps"] = heatmaps.detach().float().cpu().numpy()

@@ -1,5 +1,6 @@
 # SAM 2.1 Hiera-B+，输入 1024 / 热图 256；SAM1 历史探针不等于 SAM2 参数实测。
 # 运行选择与尚待确认的效果参数集中记录于 docs/probe_3090.md。
+training_protocol: joint_abc_v1
 seed: 42
 output_dir: runs/diffpeak
 
@@ -37,7 +38,7 @@ model:
   sam_config: configs/sam2.1/sam2.1_hiera_b+.yaml
   sam_architecture: sam2.1_hiera_base_plus
   sam_apply_postprocessing: false
-  # 默认去噪器为 ConditionalDiT；旧 ConditionalUNet 快照不兼容，需从 A 重训。
+  # 默认去噪器为 ConditionalDiT；旧 ConditionalUNet 快照不兼容，需从 ABC 重训。
   dit:
     patch_size: 8
     hidden_size: 256
@@ -54,7 +55,7 @@ diffusion:
   sampling_steps: 20
   min_std: 0.02
 
-# A–D 及推理共享；进入 D 后不要单独修改。
+# ABC/D 及推理共享；进入 D 后不要单独修改。
 peaks:
   sigma: 0.5
   h: 0.05
@@ -68,6 +69,8 @@ train:
   amp_init_scale: 1024.0
   weight_decay: 0.01
   grad_clip: 1.0
+  seg_weight: 1.0
+  sampled_seg_weight: 1.0
   heat_weight: 0.1
   aux_weight: 0.2
   cldice_weight: 0.2
@@ -79,18 +82,10 @@ train:
   warmup_ratio: 0.05
   min_lr_ratio: 0.05
 
-# LR 来自同预算开发筛选；epochs 暂沿用原计划，不代表已验证最优长度。
+# 新联合训练预算与显存尚待实测；不沿用旧分模块吞吐结论。
 stages:
-  # A：只训练 SAM mask decoder，使用真实目标热图提取的提示。
-  A: {epochs: 15, lr: 0.0003, batch_size: 2, accumulation_steps: 2}
-  # B：训练条件编码器与去噪 DiT（扩散 MSE + 热图重建 + 辅助）。
-  B: {epochs: 60, lr: 0.0001, batch_size: 2, accumulation_steps: 2}
-  # C：只训练 SAM mask decoder，提示来自冻结扩散模型。
-  # 保持 A/B/C 有效 batch=4；batch8 吞吐仅小幅更快，未验证质量。
-  C: {epochs: 10, lr: 0.0001, batch_size: 4, accumulation_steps: 1}
-  # D：batch8 是吞吐候选；LR3e-7按较低KL保守选择，不代表效果最优。
-  # batch变化会改变每轮更新数/调度；100组点成本预热后的稳态仍待确认。
-  D: {epochs: 10, lr: 0.0000003, batch_size: 8, accumulation_steps: 1, warmup_ratio: 0.1, min_lr_ratio: 0.1}
+  ABC: {epochs: 60, lr: 0.0001, batch_size: 1, accumulation_steps: 4}
+  D: {epochs: 10, lr: 0.0000003, batch_size: 1, accumulation_steps: 1, warmup_ratio: 0.1, min_lr_ratio: 0.1}
 
 rl:
   # 当前只实现 GRPO；显式写入算法名，避免旧 DDPO 配置被误读为新协议。
@@ -102,7 +97,7 @@ rl:
   ppo_clip: 0.0001
   kl_weight: 0.01
   # 建议默认 0.0：参考 GRPO 设计不含监督锚定项。
-  # 设为非零时是可选监督锚定，对目标热图额外加扩散 MSE。
+  # 设为非零时是可选监督锚定，对整个 ABC 额外加联合监督损失。
   anchor_weight: 0.0
   update_epochs: 1
   # 组内奖励标准差下限，只作为优势分母的 clamp；
@@ -118,7 +113,8 @@ reward:
   iou_weight: 0.6
   cldice_weight: 0.4
   path_weight: 0.0
-  point_cost: 0.05
+  # 密集提示不消耗离散点；峰值仅作诊断。
+  point_cost: 0.0
   point_reference: 32
   path_samples: 32
   path_match_radius: 8

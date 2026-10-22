@@ -30,6 +30,18 @@ class _ZeroDiT(nn.Module):
         return torch.zeros_like(state)
 
 
+class _TrainableDiT(nn.Module):
+    """输出依赖参数与第一尺度条件的占位去噪器，用于检查采样梯度。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, state: torch.Tensor, timestep, conditions) -> torch.Tensor:
+        # 条件通道数可能多于潜变量通道数，取前 latent_channels 个通道。
+        return self.scale * conditions[0][:, : state.shape[1]].to(state.dtype)
+
+
 class GaussianDiffusionTransitionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.diffusion = GaussianDiffusion(
@@ -269,6 +281,62 @@ class GaussianDiffusionSamplingTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(records[0]["old_log_prob"]).all())
         self.assertTrue(torch.isfinite(heatmaps).all())
 
+    def test_sample_differentiable_matches_sample_and_propagates_gradients(self) -> None:
+        """同一 generator 下可微采样与 ``sample`` 数值一致，但保留计算图。"""
+        dit = _TrainableDiT()
+        conditions = [
+            torch.randn_like(item).requires_grad_(True) for item in self.conditions
+        ]
+        seed = 23
+
+        plain = self.diffusion.sample(
+            dit,
+            conditions,
+            generator=torch.Generator().manual_seed(seed),
+            record=False,
+        )
+        differentiable = self.diffusion.sample_differentiable(
+            dit,
+            conditions,
+            generator=torch.Generator().manual_seed(seed),
+            record=False,
+        )
+
+        self.assertFalse(plain.requires_grad)
+        self.assertTrue(differentiable.requires_grad)
+        torch.testing.assert_close(differentiable, plain)
+
+        differentiable.square().sum().backward()
+        self.assertIsNotNone(dit.scale.grad)
+        self.assertTrue(bool(torch.count_nonzero(dit.scale.grad)))
+        self.assertIsNotNone(conditions[0].grad)
+        self.assertTrue(bool(torch.count_nonzero(conditions[0].grad)))
+
+    def test_sample_differentiable_supports_recording(self) -> None:
+        dit = _TrainableDiT()
+        conditions = [
+            torch.zeros(2, 4, 8, 8),
+            torch.zeros(2, 4, 4, 4),
+            torch.zeros(2, 4, 2, 2),
+            torch.zeros(2, 4, 1, 1),
+        ]
+
+        heatmaps, records = self.diffusion.sample_differentiable(
+            dit,
+            conditions,
+            generator=torch.Generator().manual_seed(5),
+            record=True,
+        )
+
+        self.assertTrue(heatmaps.requires_grad)
+        self.assertEqual(len(records), self.diffusion.sampling_steps)
+        for record in records:
+            self.assertFalse(record["state"].requires_grad)
+            self.assertFalse(record["action"].requires_grad)
+            self.assertTrue(torch.isfinite(record["old_log_prob"]).all())
+        heatmaps.sum().backward()
+        self.assertIsNotNone(dit.scale.grad)
+
     def test_training_losses_are_finite_for_zero_target(self) -> None:
         target = torch.zeros(2, 2, 8, 8)
 
@@ -279,6 +347,28 @@ class GaussianDiffusionSamplingTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(losses["heat"]))
         self.assertGreaterEqual(float(losses["diff"].item()), 0.0)
         self.assertGreaterEqual(float(losses["heat"].item()), 0.0)
+
+    def test_training_losses_can_return_differentiable_heat_prediction(self) -> None:
+        """``return_prediction=True`` 额外返回可反传的 ``heat_pred``。"""
+        dit = _TrainableDiT()
+        target = torch.rand(2, 2, 8, 8)
+        conditions = [torch.randn_like(item) for item in self.conditions]
+
+        losses = self.diffusion.training_losses(
+            dit, conditions, target, return_prediction=True
+        )
+
+        self.assertEqual(set(losses), {"diff", "heat", "heat_pred"})
+        prediction = losses["heat_pred"]
+        self.assertEqual(tuple(prediction.shape), tuple(target.shape))
+        self.assertTrue(torch.isfinite(prediction).all())
+        self.assertTrue(torch.all(prediction >= 0.0))
+        self.assertTrue(torch.all(prediction <= 1.0))
+        self.assertTrue(prediction.requires_grad)
+
+        (losses["diff"] + losses["heat"] + prediction.sum()).backward()
+        self.assertIsNotNone(dit.scale.grad)
+        self.assertTrue(bool(torch.count_nonzero(dit.scale.grad)))
 
     def test_training_losses_reject_wrong_channels(self) -> None:
         with self.assertRaises(ValueError):

@@ -2,11 +2,11 @@
 
 用法示例（在项目根目录执行）::
 
-    # 顺序执行 A -> B -> C -> D
+    # 顺序执行 ABC 联合预训练 -> D 后训练
     python train.py --config configs/3090.yaml --stage all
 
-    # 只跑 B，并用 A 阶段权重初始化
-    python train.py --config configs/3090.yaml --stage B --init runs/diffpeak/stage_A.pth
+    # 只跑 D，并用联合预训练权重初始化
+    python train.py --config configs/3090.yaml --stage D --init runs/diffpeak/stage_ABC.pth
 
     # 恢复某阶段中断前的 last.pt（不传 --config 时使用 checkpoint 内配置）
     python train.py --resume runs/diffpeak/last.pt
@@ -80,7 +80,7 @@ def _parse_stages(value: str) -> List[str]:
     unknown = requested - set(STAGE_ORDER)
     if unknown:
         raise ValueError(f"未知阶段：{sorted(unknown)}")
-    # 固定按 A/B/C/D 顺序执行，避免跨阶段依赖被颠倒。
+    # 固定按 ABC/D 顺序执行，避免跨阶段依赖被颠倒。
     return [stage for stage in STAGE_ORDER if stage in requested]
 
 
@@ -115,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--stage",
         type=str,
         default="all",
-        help="all 或逗号分隔的阶段子集，例如 A、B,C、all。",
+        help="all 或逗号分隔的阶段子集，例如 ABC、D、ABC,D。",
     )
     parser.add_argument("--resume", type=str, default=None, help="完整快照，用于阶段内恢复。")
     parser.add_argument("--init", type=str, default=None, help="仅加载模型权重的上一阶段快照。")
@@ -239,7 +239,7 @@ def _run_training(parser, args, config, preloaded, engine, experiment) -> None:
     print(f"执行阶段：{','.join(selected)}", flush=True)
 
     has_weights = args.init is not None or args.resume is not None
-    if not has_weights and selected and selected[0] != "A":
+    if not has_weights and selected and selected[0] != "ABC":
         warnings.warn(
             f"阶段 {selected[0]} 没有 --init/--resume，将从当前初始化权重开始。",
             RuntimeWarning,
@@ -255,7 +255,8 @@ def _run_training(parser, args, config, preloaded, engine, experiment) -> None:
                     if resume_payload is None:
                         raise RuntimeError("已完成的 resume 阶段缺少模型 payload")
                     engine.load_models_from_payload(
-                        resume_payload, include_ref=True
+                        resume_payload, include_ref=True,
+                        allow_missing_ref=stage != "D",
                     )
                     # 下一阶段使用新优化器，但保留历史指标与 RNG 连续性。
                     engine.history = list(resume_payload.get("history", []))

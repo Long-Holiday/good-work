@@ -181,6 +181,7 @@ class GaussianDiffusion(nn.Module):
         dit: nn.Module,
         conditions: Sequence[Tensor],
         target_heatmaps: Tensor,
+        return_prediction: bool = False,
     ) -> Dict[str, Tensor]:
         """计算扩散损失与热图重建损失。
 
@@ -188,9 +189,13 @@ class GaussianDiffusion(nn.Module):
             dit: 条件去噪器（默认 DiT）。
             conditions: 四个尺度的条件特征。
             target_heatmaps: 目标双通道热图 ``B x 2 x 256 x 256``，范围 ``[0, 1]``。
+            return_prediction: 为 ``True`` 时在返回值中加入 ``"heat_pred"``，
+                即由当前去噪器恢复的 ``[0, 1]`` 热图。该张量保留计算图，可直接
+                作为可微密集提示送入冻结的 SAM 提示编码器（联合 ABC 训练）。
 
         Returns:
-            ``{"diff": 扩散 MSE, "heat": 热图重建损失}``。
+            ``{"diff": 扩散 MSE, "heat": 热图重建损失}``；当
+            ``return_prediction=True`` 时额外包含 ``"heat_pred"``。
         """
         if target_heatmaps.ndim != 4 or target_heatmaps.shape[1] != 2:
             raise ValueError(
@@ -241,7 +246,10 @@ class GaussianDiffusion(nn.Module):
         time_weight = (t < self.heat_loss_max_timestep).to(per_sample_heat.dtype)
         heat_loss = (per_sample_heat * time_weight).sum() / time_weight.sum().clamp_min(1.0)
 
-        return {"diff": diff_loss, "heat": heat_loss}
+        losses = {"diff": diff_loss, "heat": heat_loss}
+        if return_prediction:
+            losses["heat_pred"] = heat_pred
+        return losses
 
     # ------------------------------------------------------------------
     # 转移与对数概率
@@ -334,32 +342,14 @@ class GaussianDiffusion(nn.Module):
     # ------------------------------------------------------------------
     # 采样
     # ------------------------------------------------------------------
-    @torch.no_grad()
-    def sample(
+    def _sample_impl(
         self,
         dit: nn.Module,
         conditions: Sequence[Tensor],
-        generator: Optional[torch.Generator] = None,
-        record: bool = False,
+        generator: Optional[torch.Generator],
+        record: bool,
     ) -> Union[Tensor, Tuple[Tensor, List[Dict[str, Any]]]]:
-        """DDIM 随机采样双通道热图。
-
-        Args:
-            dit: 条件去噪器（默认 DiT）。
-            conditions: 四个尺度的条件特征。
-            generator: 可选随机数生成器；允许 CPU 生成器配合 GPU 条件。
-            record: 是否记录每步的 GRPO 轨迹信息。
-
-        Returns:
-            ``record=False`` 时返回 ``B x 2 x 256 x 256`` 热图；
-            ``record=True`` 时返回 ``(heatmaps, records)``。records 中每项包含
-            ``state``、``action``、``timestep``、``previous_timestep``、
-            ``old_log_prob``，其中张量均已移到 CPU 以节省显存。
-
-            采样从 ``timesteps-1`` 开始，最后一步的 ``previous_timestep`` 为
-            ``-1``，因此返回的热图对应 ``alpha_bar=1`` 的干净端点；末步仍会
-            加入 ``min_std`` 的策略探索噪声，符合 GRPO 的非零方差要求。
-        """
+        """采样实现；梯度开关由调用方（``sample`` / ``sample_differentiable``）控制。"""
         if len(conditions) != 4:
             raise ValueError("conditions 必须包含四个尺度")
         reference = conditions[0]
@@ -404,3 +394,47 @@ class GaussianDiffusion(nn.Module):
         if record:
             return heatmaps, records
         return heatmaps
+
+    def sample(
+        self,
+        dit: nn.Module,
+        conditions: Sequence[Tensor],
+        generator: Optional[torch.Generator] = None,
+        record: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, List[Dict[str, Any]]]]:
+        """DDIM 随机采样双通道热图（不构建计算图）。
+
+        Args:
+            dit: 条件去噪器（默认 DiT）。
+            conditions: 四个尺度的条件特征。
+            generator: 可选随机数生成器；允许 CPU 生成器配合 GPU 条件。
+            record: 是否记录每步的 GRPO 轨迹信息。
+
+        Returns:
+            ``record=False`` 时返回 ``B x 2 x 256 x 256`` 热图；
+            ``record=True`` 时返回 ``(heatmaps, records)``。records 中每项包含
+            ``state``、``action``、``timestep``、``previous_timestep``、
+            ``old_log_prob``，其中张量均已移到 CPU 以节省显存。
+
+            采样从 ``timesteps-1`` 开始，最后一步的 ``previous_timestep`` 为
+            ``-1``，因此返回的热图对应 ``alpha_bar=1`` 的干净端点；末步仍会
+            加入 ``min_std`` 的策略探索噪声，符合 GRPO 的非零方差要求。
+        """
+        with torch.no_grad():
+            return self._sample_impl(dit, conditions, generator, record)
+
+    def sample_differentiable(
+        self,
+        dit: nn.Module,
+        conditions: Sequence[Tensor],
+        generator: Optional[torch.Generator] = None,
+        record: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, List[Dict[str, Any]]]]:
+        """与 :meth:`sample` 完全相同的 DDIM 采样，但保留计算图。
+
+        用于联合 ABC 端到端训练：采样热图作为冻结 SAM 提示编码器的可微密集
+        输入，梯度可以经冻结的提示编码器回传到 DiT 与条件编码器。除不包裹
+        ``torch.no_grad()`` 外，随机数消耗、调度和返回值与 :meth:`sample`
+        逐位一致；固定 ``generator`` 时两者输出相同。
+        """
+        return self._sample_impl(dit, conditions, generator, record)

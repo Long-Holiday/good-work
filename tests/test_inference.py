@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from diffpeak.inference import (  # noqa: E402
+    JOINT_ABC_PROTOCOL,
     Predictor,
     aggregate_metrics,
     decode_with_prompts,
@@ -39,7 +40,9 @@ from diffpeak.inference import (  # noqa: E402
     prepare_image_file,
     save_mask_file,
     stable_seed,
+    uses_joint_abc_protocol,
 )
+from diffpeak.prompts import PeakExtractor  # noqa: E402
 
 
 class PrepareImageTest(unittest.TestCase):
@@ -368,6 +371,132 @@ class InferenceWithoutGroundTruthTest(unittest.TestCase):
 
         self.assertEqual(original, (10, 16))
         self.assertEqual(tuple(tensor.shape), (1, 3, 32, 32))
+
+
+class JointABCRoutingTest(unittest.TestCase):
+    """根级 ``training_protocol`` 决定推理使用密集热图还是点提示。"""
+
+    class _DummySam:
+        no_positive_logit = -20.0
+
+        def __init__(self) -> None:
+            self.heatmap_calls = []
+            self.point_calls = []
+
+        def encode(self, images, valid_sizes=None):
+            return torch.zeros(images.shape[0], 256, 4, 4)
+
+        def decode_heatmaps(
+            self,
+            embeddings,
+            heatmaps,
+            output_size=(1024, 1024),
+            valid_sizes=None,
+            *,
+            decoder=None,
+        ):
+            self.heatmap_calls.append(
+                {
+                    "heatmaps": heatmaps.detach().clone(),
+                    "output_size": output_size,
+                    "valid_sizes": valid_sizes,
+                    "decoder": decoder,
+                }
+            )
+            return torch.zeros(embeddings.shape[0], 1, *output_size)
+
+        def decode(self, embeddings, points, output_size=(1024, 1024)):
+            self.point_calls.append(points)
+            return torch.zeros(embeddings.shape[0], 1, *output_size)
+
+    class _DummyConditionEncoder:
+        def __call__(self, images, embeddings):
+            batch = images.shape[0]
+            return [torch.zeros(batch, 4, 4, 4) for _ in range(4)], []
+
+    class _DummyDiffusion:
+        def __init__(self, heatmaps: torch.Tensor) -> None:
+            self.heatmaps = heatmaps
+
+        def sample(self, dit, conditions, generator=None, record=False):
+            return self.heatmaps.clone()
+
+    def _predictor(self, protocol):
+        predictor = object.__new__(Predictor)
+        predictor.config = (
+            {"training_protocol": protocol} if protocol is not None else {}
+        )
+        predictor.config_dir = None
+        predictor.device = torch.device("cpu")
+        predictor.seed = 7
+        predictor.image_size = 1024
+        predictor.amp = False
+        predictor.threshold = 0.5
+        predictor.joint_abc = uses_joint_abc_protocol(predictor.config)
+        predictor.prompt_mode = "heatmap" if predictor.joint_abc else "points"
+        predictor.sam = self._DummySam()
+        predictor.condition_encoder = self._DummyConditionEncoder()
+        predictor.dit = object()
+        heatmaps = torch.zeros(1, 2, 4, 4)
+        heatmaps[0, 0, 2, 2] = 1.0
+        predictor.diffusion = self._DummyDiffusion(heatmaps)
+        predictor.peak_extractor = PeakExtractor({})
+        return predictor
+
+    def test_marker_uses_dense_heatmap_decode_and_keeps_point_diagnostics(self) -> None:
+        predictor = self._predictor(JOINT_ABC_PROTOCOL)
+
+        result = Predictor.predict_array(
+            predictor,
+            np.zeros((8, 8, 3), dtype=np.uint8),
+            image_id="scene",
+        )
+
+        self.assertEqual(result["prompt_mode"], "heatmap")
+        self.assertEqual(result["image_id"], "scene")
+        self.assertEqual(predictor.sam.point_calls, [])
+        self.assertEqual(len(predictor.sam.heatmap_calls), 1)
+        call = predictor.sam.heatmap_calls[0]
+        self.assertEqual(tuple(call["heatmaps"].shape), (1, 2, 4, 4))
+        self.assertEqual(call["output_size"], (1024, 1024))
+        self.assertEqual(call["valid_sizes"], [tuple(result["resized_size"])])
+        self.assertIsNone(call["decoder"])
+        # 点仍被提取并写入诊断字段，但不再用于解码，也不产生点成本。
+        self.assertGreaterEqual(result["points"]["point_count"], 1)
+        self.assertGreaterEqual(result["positive_count"], 1)
+        self.assertEqual(result["peak_point_count"], result["points"]["point_count"])
+        self.assertEqual(result["point_count"], 0)
+
+    def test_marker_missing_or_other_keeps_point_count_billing(self) -> None:
+        predictor = self._predictor(None)
+
+        result = Predictor.predict_array(
+            predictor,
+            np.zeros((8, 8, 3), dtype=np.uint8),
+            image_id="scene",
+        )
+
+        self.assertEqual(result["prompt_mode"], "points")
+        self.assertEqual(predictor.sam.heatmap_calls, [])
+        self.assertEqual(len(predictor.sam.point_calls), 1)
+        self.assertEqual(result["points"]["point_count"], 1)
+        self.assertEqual(result["point_count"], 1)
+        self.assertEqual(result["peak_point_count"], 1)
+
+    def test_marker_matching_is_exact_and_case_insensitive(self) -> None:
+        self.assertTrue(uses_joint_abc_protocol({"training_protocol": JOINT_ABC_PROTOCOL}))
+        self.assertTrue(
+            uses_joint_abc_protocol({"training_protocol": " Joint_ABC_V1 "})
+        )
+        for config in (
+            {},
+            {"training_protocol": None},
+            {"training_protocol": ""},
+            {"training_protocol": "legacy"},
+            {"training_protocol": 1},
+        ):
+            with self.subTest(config=config):
+                self.assertFalse(uses_joint_abc_protocol(config))
 
 
 class FileAndSeedTest(unittest.TestCase):

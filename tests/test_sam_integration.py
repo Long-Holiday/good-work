@@ -346,6 +346,61 @@ class RoadSAMArchitectureIntegrationTest(unittest.TestCase):
             )
         )
 
+    def test_decode_heatmaps_gradient_passes_through_frozen_prompt_encoder(self) -> None:
+        """密集热图提示可微：冻结提示编码器只把梯度传回输入热图。"""
+        self.road_sam.zero_grad(set_to_none=True)
+        generator = torch.Generator().manual_seed(7)
+        heatmaps = torch.rand(2, 2, 16, 16, generator=generator, requires_grad=True)
+
+        logits = self.road_sam.decode_heatmaps(
+            self.features, heatmaps, output_size=OUTPUT_SIZE
+        )
+
+        self.assertEqual(tuple(logits.shape), (2, 1, *OUTPUT_SIZE))
+        self.assertTrue(logits.requires_grad)
+        logits.mean().backward()
+
+        self.assertIsNotNone(heatmaps.grad)
+        self.assertTrue(bool(torch.count_nonzero(heatmaps.grad)))
+        # 提示编码器权重冻结，不能累积梯度。
+        self.assertTrue(
+            all(
+                p.grad is None
+                for p in self.road_sam.sam.sam_prompt_encoder.parameters()
+            )
+        )
+        # 但掩码解码器（含高分辨率投影）仍获得可训练梯度。
+        decoder = self.road_sam.sam.sam_mask_decoder
+        self.assertTrue(
+            any(
+                p.grad is not None and bool(torch.count_nonzero(p.grad))
+                for p in decoder.parameters()
+            )
+        )
+        self.assertTrue(
+            all(bool(torch.isfinite(p.grad).all()) for p in decoder.parameters() if p.grad is not None)
+        )
+
+    def test_decode_heatmaps_decodes_empty_maps_without_sparse_points(self) -> None:
+        """空热图也整批解码，且不依赖任何稀疏点提示。"""
+        self.road_sam.zero_grad(set_to_none=True)
+        heatmaps = torch.zeros(2, 2, 16, 16)
+
+        logits = self.road_sam.decode_heatmaps(
+            self.features, heatmaps, output_size=OUTPUT_SIZE
+        )
+
+        self.assertEqual(tuple(logits.shape), (2, 1, *OUTPUT_SIZE))
+        self.assertTrue(bool(torch.isfinite(logits).all()))
+        self.assertTrue(logits.requires_grad)
+        logits.mean().backward()
+        self.assertTrue(
+            any(
+                p.grad is not None and bool(torch.count_nonzero(p.grad))
+                for p in self.road_sam.sam.sam_mask_decoder.parameters()
+            )
+        )
+
     def test_random_weights_are_not_pretrained(self) -> None:
         """显式记录：本测试使用随机初始化，不是预训练效果验证。
 

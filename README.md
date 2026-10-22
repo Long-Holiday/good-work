@@ -1,8 +1,8 @@
 # DiffPeak-SAM
 
-依据 [`docs/model_grpo.md`](docs/model_grpo.md) 的 GRPO 后训练设计实现：**条件扩散生成双通道提示热图 → h-maxima + 距离 NMS → 道路适配 SAM2.1 → 同图组内 GRPO 后训练**。分割骨干为官方 **SAM2.1 Hiera-B+（base_plus）**。旧 SAM1/DDPO 猜想稿已移除，历史版本可从 Git 查看。
+**ABC 联合预训练 → D 整体 GRPO 后训练**：条件编码器与 DiT 生成双通道热图，通过可微密集提示连接 SAM2.1 Hiera-B+，联合优化道路分割。峰值提取保留为诊断，不再阻断训练梯度。当前协议见 [`docs/joint_training.md`](docs/joint_training.md)；旧四阶段实验与 `docs/model_grpo.md` 作为历史记录。
 
-> 验证状态：SAM2.1 接入后完整回归测试 **293 项、169 项子测试通过**，包括已安装官方 SAM2 模块的梯度集成测试；3090 上真实 SAM2 权重的 A/B 全尺寸探针已完成实际更新、显存和吞吐检查。学习率与 C/D 验收继续进行，短程结果不代表完整训练收敛或多种子效果。SAM2 实测与 SAM1 历史基线分开记录于 [`docs/probe_3090.md`](docs/probe_3090.md)。历史测试见 [`docs/testing.md`](docs/testing.md)，日志使用见 [`docs/experiments.md`](docs/experiments.md)。
+> 旧四阶段的 GPU 探针与测试结果不代表新联合训练已收敛；新协议需要重新测量完整采样反传的显存、吞吐及验证集质量。历史实测见 [`docs/probe_3090.md`](docs/probe_3090.md)，日志使用见 [`docs/experiments.md`](docs/experiments.md)。
 
 ## 1. 环境与权重（自行安装）
 
@@ -72,7 +72,7 @@ SAM2 以官方源码安装，版本固定在 commit `2b90b9f5ceec907a1c18123530e
 https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt
 ```
 
-**SAM1 与 SAM2 的 checkpoint 不兼容**：`sam_vit_b_01ec64.pth` 等 SAM1 权重不能加载到 SAM2 结构，已有的 SAM1 训练快照也不能用于继续 SAM2 的 A/B/C/D。切换后必须用 SAM2.1 权重从 A 重新开始，并重新测量运行时与显存。代码不会自动下载权重。只加载可信的 checkpoint，训练快照使用 PyTorch 序列化，不能把陌生来源文件当成安全输入。
+**SAM1 与 SAM2 的 checkpoint 不兼容**：`sam_vit_b_01ec64.pth` 等 SAM1 权重不能加载到 SAM2 结构，已有的 SAM1 训练快照也不能用于继续 SAM2 的 ABC/D。切换后必须用 SAM2.1 权重从 ABC 重新开始，并重新测量运行时与显存。代码不会自动下载权重。只加载可信的 checkpoint，训练快照使用 PyTorch 序列化，不能把陌生来源文件当成安全输入。
 
 ## 2. 数据与划分
 
@@ -130,27 +130,23 @@ train.py / predict.py / evaluate.py
 
 | 阶段 | 可更新部分 | 监督 |
 |---|---|---|
-| A | 仅 SAM2 mask decoder | 真实提示分割 |
-| B | 细节/条件编码器 + 去噪 DiT | 扩散 MSE + 热图重建 + 辅助 |
-| C | 仅 SAM2 mask decoder | 扩散生成提示下的分割 |
-| D | 仅去噪 DiT | GRPO + 固定参考策略 KL（可选监督锚定） |
+| ABC | 条件编码器 + DiT + SAM2 mask decoder | 一个总 loss：扩散、热图、辅助、重建提示分割、纯噪声采样提示分割 |
+| D | 同一个整体的全部可训练参数 | 扩散转移与 SAM 分割动作的 GRPO + 固定参考 KL（可选 ABC 监督锚定） |
 
-图像编码器与提示编码器始终冻结。A 和 C 只训练 SAM2 解码器；B 才训练条件编码器与 DiT；D 只训练 DiT，条件模块和 SAM2 均冻结。SAM2 解码器依赖图像编码器输出的高分辨率特征，迁移时必须显式保留并传入，不能只保留 64×64 图像嵌入。
+SAM 图像编码器和提示编码器权重冻结，掩码解码器及其高分辨率投影参加两个阶段的联合训练。冻结提示编码器保留对输入热图的梯度。ABC 每个微批只对总 loss 反传，统一优化器更新；D 不再只训练 DiT。
 
-正式训练使用线性 warmup + cosine 退火；各阶段数值集中于 [`configs/3090.yaml`](configs/3090.yaml)，选择依据与尚未验证的部分见 [`3090 探针记录`](docs/probe_3090.md)。B/C/D 验证基于生成提示；A 的真值提示验证单独作为诊断。
+两个阶段均使用从纯噪声生成的密集提示验证；评估和预测沿用同一通路。采用线性 warmup + cosine；[`configs/3090.yaml`](configs/3090.yaml) 的新预算是待实测的起点，不能沿用旧四阶段的显存与学习率结论。
 
 ```bash
 # 推荐先检查目标热图回提（不需要 SAM2 权重）
 python check_targets.py --config configs/3090.yaml --samples 16
 
-# 完整顺序训练；各阶段保留 stage_A.pth ... stage_D.pth
-python train.py --config configs/3090.yaml --stage all
+# 完整训练：ABC 联合预训练后自动进行 D 整体后训练
+conda run -n pytorch python train.py --config configs/3090.yaml --stage all
 
-# 或分阶段执行；--init 只加载模型，不恢复优化器
-python train.py --config configs/3090.yaml --stage A
-python train.py --config configs/3090.yaml --stage B --init runs/diffpeak/stage_A.pth
-python train.py --config configs/3090.yaml --stage C --init runs/diffpeak/stage_B.pth
-python train.py --config configs/3090.yaml --stage D --init runs/diffpeak/stage_C.pth
+# 也可分别启动预训练和后训练；ABC 内没有模块训练切换
+conda run -n pytorch python train.py --config configs/3090.yaml --stage ABC
+conda run -n pytorch python train.py --config configs/3090.yaml --stage D --init runs/diffpeak/stage_ABC.pth
 
 # 阶段内恢复，默认用 checkpoint 保存的配置
 python train.py --resume runs/diffpeak/last.pt
@@ -221,15 +217,15 @@ tensorboard --logdir runs/diffpeak --port 6006
 - 可开启双向抽样路径代理（例如权重 0.5/0.3/0.2），**不是正式 APLS**；二值标注无法区分立交跨越。
 - D 阶段用 GRPO：同一影像的 G 条轨迹组成一个组，优势为 `(R_i - mean(R)) / max(std(R), advantage_std_delta)`，均值和标准差只来自该组。`rl.algorithm=grpo` 显式标识协议。动作维联合 log-prob 对所有热图维度**求和**，没有用均值替代联合密度；默认裁剪半径 `rl.ppo_clip=1e-4` 是高维策略的谨慎起点，需监控实际 KL、奖励方差与更新比例。键名保留 `ppo_clip` 只是为了兼容旧配置。
 - `rl.advantage_std_delta=1e-4` 是组内标准差的分母下限，不是“低方差组跳过阈值”：非零但方差很小的组仍按该下限缩放后参与学习，只有奖励完全相同的组优势为零。KL 同样对动作维度求和，再按样本/轨迹/时间步取平均。
-- 每条轨迹的旧策略 log-prob 在该组 rollout 时保存并冻结，重放时只重算当前策略；它与长期参考策略不是同一个对象。首次从 B/C 进入 D 时，参考 DiT 从当前预训练 DiT 深拷贝，之后永久冻结，只用于 KL。从已有 D 快照初始化或恢复时保留其中的 `ref_dit`（DiT 状态），避免把已经后训练的策略误当作原始参考；缺失时才从加载后的 DiT 建立新参考，应记录这一实验差异。对峰值提取/SAM2 奖励不反传；策略梯度来自保存动作的重新计分。
+- 每条轨迹的旧策略 log-prob 在该组 rollout 时保存并冻结，重放时只重算当前策略；它与长期参考策略不是同一个对象。首次从 ABC 进入 D 时，条件编码器、DiT 和 SAM 解码器分别深拷贝为固定 KL 参考。D 快照保存全部参考，恢复时严格加载。奖励本身不反传，扩散转移和 SAM 终端分割动作各自通过保存动作的重新计分获得策略梯度。
 - `rl.anchor_weight` 默认 `0.0`，即不启用监督锚定。参考 GRPO 设计没有把目标热图 MSE 列为必需项；设为非零时是**可选**监督锚定，只作为稳定项，不是当前默认协议。
 - 推理默认沿用随机生成协议；确定性采样不能默认与训练等价。
 
 ## 6. 实验注意事项
 
-消融与主流模型比较按 [实验协议](docs/experimental_protocol.md) 冻结数据、预算、模型选择及评估口径。运行参数集中于配置，资源实测及开发筛选集中于 [3090 探针记录](docs/probe_3090.md)，避免在多份文档维护重复参数表。SAM2 替换 SAM1 属于骨干变更：旧 SAM1 快照、A/B/C/D 结果和探针数据全部失效，必须用 SAM2.1 权重从 A 重新执行 A→B→C→D，并重新测量吞吐与显存。探针工具已归档到 `experiments/3090-throughput-probes-20261021` 分支，主分支仅保留训练实现。正式训练建议用 `--cpu-threads 2 --interop-threads 1` 限制 CPU 线程；SAM1 与 SAM2 的 worker 数、吞吐和显存均按骨干分开记录，参见实测文档。
+消融与主流模型比较按 [实验协议](docs/experimental_protocol.md) 冻结数据、预算、模型选择及评估口径。运行参数集中于配置，资源实测及开发筛选集中于 [3090 探针记录](docs/probe_3090.md)，避免在多份文档维护重复参数表。SAM2 替换 SAM1 属于骨干变更：旧 SAM1 快照、A/B/C/D 结果和探针数据全部失效，必须用 SAM2.1 权重执行 ABC 联合预训练 → D 后训练，并重新测量吞吐与显存。探针工具已归档到 `experiments/3090-throughput-probes-20261021` 分支，主分支仅保留训练实现。正式训练建议用 `--cpu-threads 2 --interop-threads 1` 限制 CPU 线程；SAM1 与 SAM2 的 worker 数、吞吐和显存均按骨干分开记录，参见实测文档。
 
-先做 A→B→C 的监督链条再进行 D；D 可能因组内奖励相同、优势为零而停滞，不保证必然改善。先检查目标热图的 `target_recovery_report`，确保随机目标峰经最终提取器仍可恢复。困难负点只在具备阶段性假阳性数据时启用，不把普通背景采样冒充困难负点挖掘。
+先完成 ABC 联合监督预训练再进行 D；D 可能因组内奖励相同、优势为零而停滞，不保证必然改善。先检查目标热图的 `target_recovery_report`，确保随机目标峰经最终提取器仍可恢复。困难负点只在具备阶段性假阳性数据时启用，不把普通背景采样冒充困难负点挖掘。
 
 D 阶段至少记录终端奖励、组内奖励标准差、无效（零优势）组比例、正负点数、联合 log-ratio、KL 与裁剪比例。`advantage_std_delta` 只限制标准差分母；若许多组奖励完全相同，应检查探索是否不足，而不是把它当作已发生的学习。点成本预热只在前 100 个已处理 D 组内改变成本权重，比较实验时应固定该协议或显式设为 0。
 

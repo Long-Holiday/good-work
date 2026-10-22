@@ -1,41 +1,10 @@
-"""DiffPeak-SAM 四阶段训练引擎。
+"""ABC 联合预训练与 D 整体 GRPO 后训练。
 
-阶段职责
---------
-* **A**：只训练 SAM mask decoder；提示来自真实目标热图。
-* **B**：训练扩散 DiT、条件分支与辅助头；扩散 MSE + 热图重建 + 辅助损失。
-* **C**：只训练 SAM mask decoder；提示来自冻结扩散模型生成的提示。
-* **D**：只训练扩散 DiT；GRPO + 参考策略 KL + 扩散锚定，奖励来自冻结
-  SAM 的解码结果。
-
-关键实现约定
-------------
-* SAM 图像编码器与提示编码器始终冻结；冻结模块始终保持 ``eval``。
-* A/B/C 使用 AMP + ``GradScaler``。D 的 rollout 与 replay 使用**相同的**
-  autocast 上下文和 ``eval`` DiT，保证更新前联合 log-prob 比值为 1。
-* 梯度累积按实际尾组大小归一：``loss / len(group)``。
-* D 以“一张影像的 G 条轨迹”为一个 GRPO 组：先整组 rollout（``no_grad``），
-  再逐轨迹、逐步重算并立即 ``backward``，每轮整组重放后更新一次优化器
-  （每组执行 ``update_epochs`` 轮，默认 1）。
-  因此 ``train.accumulation_steps`` 只作用于 A/B/C；D 的组语义不同。
-* 吞吐参数可按阶段覆盖：``stages.<stage>.batch_size``、
-  ``stages.<stage>.accumulation_steps``、``stages.<stage>.num_workers``。
-  每次 ``run_stage`` 开始时在构建 DataLoader 和优化器/调度器之前解析，
-  未配置的键回退到 ``train``/``data`` 的全局值；阶段之间不会继承覆盖。
-  注意 D 的点成本预热按**已处理的 DataLoader 批次**推进：每个批次计 1 组，
-  即使该批次包含多张影像。因此提高 ``stages.D.batch_size`` 不会减少达到
-  ``point_cost_warmup_steps`` 所需的批次数/更新次数，但每个计数单位会覆盖
-  更多影像；需要按影像口径比较预热进度时应自行换算。
-* GRPO 优势为同图奖励的组内标准化值
-  ``(R_i - mean) / max(std, advantage_std_delta)``；组内奖励完全相同时
-  优势为零，策略项自动跳过（KL 与扩散锚定仍保留）。
-* 轨迹中的状态/动作/旧 log-prob 由 ``GaussianDiffusion.sample(record=True)``
-  保存在 CPU。重放时一次只把一个时间步的张量搬到 GPU。
-* 策略使用 ``log_prob`` 返回的动作维**求和**，不做 mean；新旧概率差在
-  float64 中计算，避免 2x256x256 维动作的精度损失。
-* 参考 DiT 优先从 D 快照加载，否则在 D 开始时 ``deepcopy``；永久冻结，
-  KL 使用同方差高斯解析式。
-* 每个阶段使用线性 warmup + cosine 退火；终点乘子由 ``min_lr_ratio`` 控制。
+ABC 用一个总损失和优化器联合更新条件编码器、DiT 与 SAM 掩码解码器。
+SAM 图像/提示编码器权重冻结，可微密集提示保留输入梯度。
+D 使用扩散转移及终端 Bernoulli 分割动作的组相对策略梯度；整个策略
+采用 eval 模式重放，并保存条件编码器、DiT、SAM 解码器的固定参考。
+旧 A/B/C 损失辅助实现仅供历史测试，不再作为训练入口。
 """
 
 from __future__ import annotations
@@ -96,7 +65,7 @@ from diffpeak.schedules import resolve_warmup_steps, warmup_cosine_factor
 
 __all__ = ["DiffPeakEngine", "STAGE_ORDER"]
 
-STAGE_ORDER: Tuple[str, ...] = ("A", "B", "C", "D")
+STAGE_ORDER: Tuple[str, ...] = ("ABC", "D")
 
 
 def _decoder_module(sam: torch.nn.Module) -> Optional[torch.nn.Module]:
@@ -286,6 +255,8 @@ class DiffPeakEngine:
         self.scheduler_lr_schedule = "cosine"
         self.scaler: Optional[Any] = None
         self.ref_dit: Optional[torch.nn.Module] = None
+        self.ref_condition_encoder: Optional[torch.nn.Module] = None
+        self.ref_sam_decoder: Optional[torch.nn.Module] = None
         self.global_step = 0
         # 点成本预热按“已处理的 D 组数”推进，而不是按成功的 optimizer step；
         # 否则整组常量奖励且 KL/anchor 关闭时预热会永远停在 0。
@@ -444,29 +415,28 @@ class DiffPeakEngine:
     def _set_requires_grad(self, stage: str) -> None:
         for parameter in self.sam.parameters():
             parameter.requires_grad_(False)
-        if stage in ("A", "C"):
+        if stage in ("ABC", "D", "A", "C"):
             decoder = _decoder_module(self.sam)
             if decoder is None:
                 raise AttributeError("RoadSAM 缺少 mask decoder")
             for parameter in decoder.parameters():
                 parameter.requires_grad_(True)
 
-        # A 阶段按设计只更新 SAM mask decoder；细节/条件分支属于 B 阶段。
         for parameter in self.condition_encoder.parameters():
-            parameter.requires_grad_(stage == "B")
+            parameter.requires_grad_(stage in ("ABC", "B", "D"))
         for parameter in self.dit.parameters():
-            parameter.requires_grad_(stage in ("B", "D"))
+            parameter.requires_grad_(stage in ("ABC", "B", "D"))
 
     def _set_train_modes(self, stage: str) -> None:
         """设置训练模式；冻结模块始终 eval。"""
         self.sam.eval()
-        if stage in ("A", "C"):
+        if stage in ("ABC", "D", "A", "C"):
             decoder = _decoder_module(self.sam)
             if decoder is not None:
-                decoder.train()
-        self.condition_encoder.train(stage == "B")
-        # D 的 rollout 与 replay 必须使用同一个 eval DiT 分布。
-        self.dit.train(stage == "B")
+                decoder.train(stage != "D")
+        self.condition_encoder.train(stage in ("ABC", "B"))
+        # D 的 rollout 与 replay 对整个策略使用 eval，梯度仍然开启。
+        self.dit.train(stage in ("ABC", "B"))
         if self.ref_dit is not None:
             self.ref_dit.eval()
 
@@ -694,6 +664,48 @@ class DiffPeakEngine:
         with torch.no_grad():
             embeddings = encode_images(self.sam, images, valid_sizes)
 
+        if stage == "ABC":
+            conditions, auxiliary_logits = self.condition_encoder(images, embeddings)
+            losses = self.diffusion.training_losses(
+                self.dit, conditions, target_heatmaps, return_prediction=True
+            )
+            # 单步重建监督与纯噪声采样监督同时训练，避免只依赖带真值的 z_t。
+            reconstructed = self.sam.decode_heatmaps(
+                embeddings, losses["heat_pred"],
+                output_size=tuple(masks.shape[-2:]), valid_sizes=valid_sizes,
+            )
+            generated_heatmaps = self.diffusion.sample_differentiable(
+                self.dit, conditions,
+                generator=make_generator(stable_seed(self.seed, "ABC", epoch, *ids)),
+            )
+            generated = self.sam.decode_heatmaps(
+                embeddings, generated_heatmaps,
+                output_size=tuple(masks.shape[-2:]), valid_sizes=valid_sizes,
+            )
+            # 有效区域逐图归一，右下 padding 不参与分割损失。
+            def seg_loss(logits):
+                return torch.stack([
+                    segmentation_loss(
+                        logits[i:i + 1, :, :h, :w], masks[i:i + 1, :, :h, :w],
+                        cldice_weight=self.cldice_weight,
+                    )
+                    for i, (h, w) in enumerate(valid_sizes)
+                ]).mean()
+
+            segmentation = seg_loss(reconstructed)
+            sampled_segmentation = seg_loss(generated)
+            auxiliary = auxiliary_loss(auxiliary_logits, masks, skeletons)
+            total = (
+                losses["diff"] + self.heat_weight * losses["heat"]
+                + self.aux_weight * auxiliary
+                + float(self.train_cfg.get("seg_weight", 1.0)) * segmentation
+                + float(self.train_cfg.get("sampled_seg_weight", 1.0)) * sampled_segmentation
+            )
+            return {
+                "loss": total, "diff": losses["diff"], "heat": losses["heat"],
+                "aux": auxiliary, "seg": segmentation, "sampled_seg": sampled_segmentation,
+            }
+
         if stage == "A":
             # 按设计 A 阶段只训练 SAM mask decoder；条件/细节编码器和辅助头
             # 属于 B 阶段，这里不做无用 forward，也不把 aux 损失加进来。
@@ -840,6 +852,7 @@ class DiffPeakEngine:
                 record = {
                     "loss": _scalar(loss),
                     "seg": _scalar(loss_dict.get("seg")),
+                    "sampled_seg": _scalar(loss_dict.get("sampled_seg")),
                     "aux": _scalar(loss_dict.get("aux")),
                     "diff": _scalar(loss_dict.get("diff")),
                     "heat": _scalar(loss_dict.get("heat")),
@@ -877,7 +890,7 @@ class DiffPeakEngine:
                 )
 
         stats: Dict[str, float] = {}
-        for key in ("loss", "seg", "aux", "diff", "heat", "points"):
+        for key in ("loss", "seg", "sampled_seg", "aux", "diff", "heat", "points"):
             values = [
                 record[key]
                 for record in records
@@ -943,6 +956,11 @@ class DiffPeakEngine:
             "lr",
             "grpo",
             "kl",
+            "diffusion_grpo",
+            "terminal_grpo",
+            "diffusion_kl",
+            "terminal_kl",
+            "terminal_foreground_rate",
             "anchor",
             "logratio_abs_mean",
             "logratio_abs_max",
@@ -1039,6 +1057,9 @@ class DiffPeakEngine:
         ``--init`` 只加载权重，不经过这里，因此旧 DDPO 快照仍可作为初始化。
         """
         stage = str(payload.get("stage", "")).upper()
+        if getattr(self, "config", {}).get("training_protocol") == "joint_abc_v1":
+            if payload.get("training_protocol") != "joint_abc_v1":
+                raise ValueError("旧分阶段快照不能 --resume 联合训练；请用 --init 迁移权重")
         if stage != "D":
             return
         version = int(payload.get("format_version", 1) or 1)
@@ -1063,6 +1084,9 @@ class DiffPeakEngine:
 
     def _grpo_group(self, batch: Mapping[str, Any], epoch: int) -> Dict[str, Any]:
         """采样一组轨迹、计算 GRPO 优势，并做一次（或多次）更新。"""
+        if getattr(self, "config", {}).get("training_protocol") == "joint_abc_v1":
+            from diffpeak.joint_rl import joint_grpo_group
+            return joint_grpo_group(self, batch, epoch)
         if self.group_size < 2:
             raise ValueError("D 阶段要求 rl.group_size >= 2 才能做组内相对优势")
         if self.ref_dit is None:
@@ -1579,12 +1603,16 @@ class DiffPeakEngine:
                     prompts = [
                         points_to_prompt(item, self.device) for item in points
                     ]
-                    logits, _ = decode_with_prompts(
-                        self.sam,
-                        embeddings,
-                        prompts,
-                        output_size=(self.image_size, self.image_size),
-                    )
+                    if self.config.get("training_protocol") == "joint_abc_v1":
+                        logits = self.sam.decode_heatmaps(
+                            embeddings, heatmaps,
+                            output_size=(self.image_size, self.image_size), valid_sizes=valid_sizes,
+                        )
+                    else:
+                        logits, _ = decode_with_prompts(
+                            self.sam, embeddings, prompts,
+                            output_size=(self.image_size, self.image_size),
+                        )
                     probabilities = torch.sigmoid(logits)
 
                     for index in range(int(images.shape[0])):
@@ -1600,7 +1628,8 @@ class DiffPeakEngine:
                         target = (
                             prepared["mask"][index, 0, :height, :width] > 0.5
                         ).detach().cpu().numpy()
-                        point_count = int(points[index][1].numel())
+                        point_count = (0 if self.config.get("training_protocol") == "joint_abc_v1"
+                                       else int(points[index][1].numel()))
                         metrics = compute_image_metrics(
                             prediction,
                             target,
@@ -1667,8 +1696,19 @@ class DiffPeakEngine:
             self.ref_dit.eval()
             for parameter in self.ref_dit.parameters():
                 parameter.requires_grad_(False)
+            for name, module in (
+                ("ref_condition_encoder", self.condition_encoder),
+                ("ref_sam_decoder", _decoder_module(self.sam)),
+            ):
+                reference = getattr(self, name, None)
+                if reference is None:
+                    reference = copy.deepcopy(module)
+                reference.to(self.device).eval().requires_grad_(False)
+                setattr(self, name, reference)
         else:
             self.ref_dit = None
+            self.ref_condition_encoder = None
+            self.ref_sam_decoder = None
 
         self._set_train_modes(stage)
         self._build_optimizer(stage, epochs, steps_per_epoch)
@@ -1685,7 +1725,9 @@ class DiffPeakEngine:
         """运行一个阶段；返回最后一个验证 epoch 的指标。"""
         stage = str(stage).upper()
         if stage not in STAGE_ORDER:
-            raise ValueError(f"未知阶段：{stage}")
+            raise ValueError(f"未知阶段：{stage}；请使用 ABC 联合预训练或 D 后训练")
+        if self.config.get("training_protocol") != "joint_abc_v1":
+            raise ValueError("训练配置需设置 training_protocol: joint_abc_v1，并定义 stages.ABC/D")
         if stage not in self.stage_cfgs:
             raise ValueError(f"配置缺少 stages.{stage}")
         # 必须在 probe_loader（用于计算调度步数）和 _prepare_stage（构建
@@ -1904,6 +1946,10 @@ class DiffPeakEngine:
         states["diffusion"] = self._to_cpu_tree(self.diffusion.state_dict())
         if self.ref_dit is not None:
             states["ref_dit"] = self._to_cpu_tree(self.ref_dit.state_dict())
+        for name in ("ref_condition_encoder", "ref_sam_decoder"):
+            reference = getattr(self, name, None)
+            if reference is not None:
+                states[name] = self._to_cpu_tree(reference.state_dict())
         return states
 
     def _resolved_config(self) -> Dict[str, Any]:
@@ -1949,7 +1995,8 @@ class DiffPeakEngine:
         payload: Dict[str, Any] = {
             # v3：SAM2.1 迁移。SAM 权重键与 SAM1 完全不兼容，v2 快照不能
             # 继续 --resume/--init；payload 同时记录骨干标识。
-            "format_version": 3,
+            "format_version": 4,
+            "training_protocol": self.config.get("training_protocol"),
             "sam": {
                 "architecture": str(getattr(self.sam, "architecture", "")),
                 "config": str(getattr(self.sam, "config_name", "")),
@@ -2170,6 +2217,18 @@ class DiffPeakEngine:
                 parameter.requires_grad_(False)
         elif include_ref and payload_stage == "D" and not allow_missing_ref:
             raise ValueError("D 阶段 checkpoint 缺少 ref_dit，不能恢复 KL 参考策略")
+        if include_ref:
+            for name, module in (
+                ("ref_condition_encoder", self.condition_encoder),
+                ("ref_sam_decoder", _decoder_module(self.sam)),
+            ):
+                if name in source:
+                    reference = copy.deepcopy(module)
+                    reference.load_state_dict(source[name], strict=True)
+                    reference.to(self.device).eval().requires_grad_(False)
+                    setattr(self, name, reference)
+                elif payload_stage == "D" and not allow_missing_ref and self.config.get("training_protocol") == "joint_abc_v1":
+                    raise ValueError(f"联合 D 快照缺少 {name}，不能恢复固定参考策略")
         return report
 
     def load_init_weights(self, path: Union[str, Path]) -> Mapping[str, Any]:

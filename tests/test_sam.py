@@ -294,10 +294,22 @@ class _FakeSAM2ImageEncoder(nn.Module):
 
 
 class _FakeSAM2PromptEncoder(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        # 官方 PromptEncoder 的掩码输入是其图像嵌入网格的 4 倍。
+        self.mask_input_size = (8, 8)
+        self.last_masks = None
+
     def get_dense_pe(self) -> torch.Tensor:
         return torch.zeros(1, 256, 4, 4)
 
     def forward(self, points=None, boxes=None, masks=None):
+        if masks is not None:
+            self.last_masks = masks
+            batch = masks.shape[0]
+            # 让 dense embedding 直接依赖掩码提示，验证输入侧梯度路径。
+            dense = masks.repeat(1, 256, 1, 1)
+            return torch.zeros(batch, 0, 256), dense
         coords, _ = points
         batch = coords.shape[0]
         return (
@@ -329,6 +341,7 @@ class _FakeSAM2MaskDecoder(nn.Module):
             {
                 "multimask_output": bool(multimask_output),
                 "repeat_image": bool(repeat_image),
+                "sparse_tokens": tuple(sparse_prompt_embeddings.shape),
                 "high_res_shapes": (
                     None
                     if high_res_features is None
@@ -337,6 +350,14 @@ class _FakeSAM2MaskDecoder(nn.Module):
             }
         )
         mask = image_embeddings[:, :1]
+        if dense_prompt_embeddings is not None:
+            # 让输出依赖 dense 提示，便于验证热图 -> 冻结提示编码器 -> 解码器。
+            mask = mask + F.interpolate(
+                dense_prompt_embeddings[:, :1],
+                size=mask.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
         if high_res_features is not None:
             for level in high_res_features:
                 mask = mask + F.interpolate(
@@ -449,6 +470,118 @@ class FakeSAM2FeatureContractTest(unittest.TestCase):
         features = model.encode(torch.ones(1, 3, 1024, 1024))
         with self.assertRaises(ValueError):
             model.decode(features.low_res, [self._positive_prompt()])
+
+    def test_decode_heatmaps_uses_signed_prompt_and_backpropagates_to_inputs(self) -> None:
+        model = _fake_road_sam()
+        features = model.encode(torch.ones(2, 3, 1024, 1024))
+        positive = torch.rand(2, 1, 4, 4, requires_grad=True)
+        negative = torch.rand(2, 1, 4, 4, requires_grad=True)
+        heatmaps = torch.cat([positive, negative], dim=1)
+
+        logits = model.decode_heatmaps(features, heatmaps, output_size=(8, 6))
+
+        self.assertEqual(tuple(logits.shape), (2, 1, 8, 6))
+        self.assertTrue(logits.requires_grad)
+        # 密集提示是正负通道差，并缩放到 prompt_encoder.mask_input_size。
+        expected = F.interpolate(
+            positive - negative, size=(8, 8), mode="bilinear", align_corners=False
+        )
+        torch.testing.assert_close(model.sam.sam_prompt_encoder.last_masks, expected)
+        # 不做跨样本补齐，也没有任何稀疏点 token。
+        decoder = model.sam.sam_mask_decoder
+        self.assertEqual(len(decoder.calls), 1)
+        self.assertEqual(decoder.calls[0]["sparse_tokens"], (2, 0, 256))
+        self.assertFalse(decoder.calls[0]["multimask_output"])
+        self.assertFalse(decoder.calls[0]["repeat_image"])
+        self.assertEqual(
+            decoder.calls[0]["high_res_shapes"], [(2, 32, 8, 8), (2, 64, 4, 4)]
+        )
+
+        logits.sum().backward()
+        # 提示编码器权重冻结，但输入热图必须获得非零梯度。
+        self.assertIsNotNone(positive.grad)
+        self.assertIsNotNone(negative.grad)
+        self.assertTrue(bool(torch.count_nonzero(positive.grad)))
+        self.assertTrue(bool(torch.count_nonzero(negative.grad)))
+        self.assertIsNotNone(decoder.conv_s0.weight.grad)
+        self.assertIsNotNone(decoder.conv_s1.weight.grad)
+        self.assertIsNone(model.sam.no_mem_embed.grad)
+
+    def test_decode_heatmaps_decodes_all_samples_including_empty_maps(self) -> None:
+        model = _fake_road_sam()
+        features = model.encode(torch.ones(2, 3, 1024, 1024))
+        heatmaps = torch.zeros(2, 2, 4, 4)
+
+        logits = model.decode_heatmaps(features, heatmaps, output_size=(8, 8))
+
+        self.assertEqual(tuple(logits.shape), (2, 1, 8, 8))
+        self.assertTrue(torch.isfinite(logits).all())
+        # 空热图不能被短路跳过：整批一次解码。
+        self.assertEqual(len(model.sam.sam_mask_decoder.calls), 1)
+        self.assertEqual(
+            model.sam.sam_mask_decoder.calls[0]["sparse_tokens"], (2, 0, 256)
+        )
+
+    def test_decode_heatmaps_masks_padding_from_valid_sizes(self) -> None:
+        model = _fake_road_sam()
+        features = model.encode(torch.ones(1, 3, 1024, 1024))
+        heatmaps = torch.zeros(1, 2, 4, 4)
+        heatmaps[:, 0] = 1.0  # 正通道全 1，负通道全 0，符号掩码为 1。
+
+        model.decode_heatmaps(
+            features,
+            heatmaps,
+            output_size=(4, 4),
+            valid_sizes=[(2, 3)],
+        )
+
+        mask = model.sam.sam_prompt_encoder.last_masks
+        self.assertEqual(tuple(mask.shape), (1, 1, 8, 8))
+        # valid=2x3 在 4x4 画布上按比例缩放为 4x6（mask_input_size=8）。
+        self.assertTrue(torch.all(mask[:, :, :4, :6] > 0))
+        self.assertTrue(torch.equal(mask[:, :, 4:, :], torch.zeros_like(mask[:, :, 4:, :])))
+        self.assertTrue(torch.equal(mask[:, :, :, 6:], torch.zeros_like(mask[:, :, :, 6:])))
+
+    def test_decode_heatmaps_decoder_override_uses_its_high_res_projections(self) -> None:
+        model = _fake_road_sam()
+        features = model.encode(torch.ones(2, 3, 1024, 1024))
+        default_decoder = model.sam.sam_mask_decoder
+        override = _FakeSAM2MaskDecoder()
+        for parameter in override.parameters():
+            parameter.requires_grad_(False)
+        heatmaps = torch.rand(2, 2, 4, 4, requires_grad=True)
+
+        logits = model.decode_heatmaps(
+            features, heatmaps, output_size=(8, 8), decoder=override
+        )
+
+        self.assertEqual(tuple(logits.shape), (2, 1, 8, 8))
+        self.assertEqual(default_decoder.calls, [])
+        self.assertEqual(len(override.calls), 1)
+        self.assertEqual(override.calls[0]["high_res_shapes"], [(2, 32, 8, 8), (2, 64, 4, 4)])
+
+        logits.sum().backward()
+        # 参考解码器冻结，但热图仍能通过冻结的提示编码器获得梯度。
+        self.assertIsNotNone(heatmaps.grad)
+        self.assertTrue(bool(torch.count_nonzero(heatmaps.grad)))
+        self.assertTrue(all(parameter.grad is None for parameter in override.parameters()))
+
+    def test_decode_heatmaps_rejects_invalid_shapes(self) -> None:
+        model = _fake_road_sam()
+        features = model.encode(torch.ones(2, 3, 1024, 1024))
+        with self.assertRaises(ValueError):
+            model.decode_heatmaps(features, torch.zeros(2, 3, 4, 4))
+        with self.assertRaises(ValueError):
+            model.decode_heatmaps(features, torch.zeros(1, 2, 4, 4))
+        with self.assertRaises(TypeError):
+            model.decode_heatmaps(features, torch.zeros(2, 2, 4, 4, dtype=torch.uint8))
+        with self.assertRaises(ValueError):
+            model.decode_heatmaps(
+                features,
+                torch.zeros(2, 2, 4, 4),
+                output_size=(8, 8),
+                valid_sizes=[(8, 8), (0, 4)],
+            )
 
     def test_train_mode_keeps_frozen_sam2_modules_in_eval(self) -> None:
         model = _fake_road_sam()

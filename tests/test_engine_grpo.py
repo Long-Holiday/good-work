@@ -54,14 +54,10 @@ def _bare_engine() -> DiffPeakEngine:
 
 
 class FreezingTest(unittest.TestCase):
-    def test_stage_trainability_matches_design(self) -> None:
-        expected = {
-            "A": (True, False, False),
-            "B": (False, True, True),
-            "C": (True, False, False),
-            "D": (False, False, True),
-        }
-        for stage, (decoder, condition, dit) in expected.items():
+    def test_joint_stages_train_condition_dit_and_decoder(self) -> None:
+        # 联合协议下 ABC 与 D 都训练三个策略模块；冻结的只有 SAM image /
+        # prompt encoder。
+        for stage in ("ABC", "D"):
             with self.subTest(stage=stage):
                 engine = _bare_engine()
                 engine._set_requires_grad(stage)
@@ -71,32 +67,38 @@ class FreezingTest(unittest.TestCase):
                         parameter.requires_grad
                         for parameter in engine.sam.sam.mask_decoder.parameters()
                     )
-                    is decoder
                 )
                 self.assertTrue(
                     all(
                         parameter.requires_grad
                         for parameter in engine.condition_encoder.parameters()
                     )
-                    is condition
                 )
                 self.assertTrue(
                     all(
                         parameter.requires_grad
                         for parameter in engine.dit.parameters()
                     )
-                    is dit
                 )
+                # 只有 mask decoder 可训练，SAM 其余参数保持冻结。
+                self.assertFalse(engine.sam.backbone.requires_grad)
                 self.assertEqual(
                     any(
                         parameter.requires_grad
                         for parameter in engine.sam.parameters()
                     ),
-                    decoder,
+                    True,
                 )
 
-    def test_train_modes_freeze_condition_and_dit_outside_b(self) -> None:
-        for stage in ("A", "B", "C", "D"):
+    def test_train_modes_train_abc_and_eval_all_during_d(self) -> None:
+        expected = {
+            # ABC 端到端训练三个模块。
+            "ABC": (True, True, True),
+            # D 的 rollout/replay 对整个策略使用 eval，保证两次前向一致；
+            # 梯度仍然开启。
+            "D": (False, False, False),
+        }
+        for stage, (decoder, condition, dit) in expected.items():
             with self.subTest(stage=stage):
                 engine = _bare_engine()
                 engine.ref_dit = nn.Module()
@@ -104,11 +106,9 @@ class FreezingTest(unittest.TestCase):
                 engine._set_train_modes(stage)
 
                 self.assertFalse(engine.sam.training)
-                self.assertEqual(
-                    engine.sam.sam.mask_decoder.training, stage in ("A", "C")
-                )
-                self.assertEqual(engine.condition_encoder.training, stage == "B")
-                self.assertEqual(engine.dit.training, stage == "B")
+                self.assertEqual(engine.sam.sam.mask_decoder.training, decoder)
+                self.assertEqual(engine.condition_encoder.training, condition)
+                self.assertEqual(engine.dit.training, dit)
                 self.assertFalse(engine.ref_dit.training)
 
 
@@ -466,6 +466,7 @@ class CheckpointMetadataTest(unittest.TestCase):
             engine.sam.architecture = "sam2.1_hiera_base_plus"
             engine.sam.config_name = "configs/sam2.1/sam2.1_hiera_b+.yaml"
             engine.config = {
+                "training_protocol": "joint_abc_v1",
                 "data": {"train_split": "train.txt", "val_split": None},
                 "model": {"sam_checkpoint": "sam.pth"},
                 "output_dir": str(output_dir),
@@ -503,7 +504,8 @@ class CheckpointMetadataTest(unittest.TestCase):
 
             payload = engine._checkpoint_payload("D", 1, None)
 
-            self.assertEqual(payload["format_version"], 3)
+            self.assertEqual(payload["format_version"], 4)
+            self.assertEqual(payload["training_protocol"], "joint_abc_v1")
             self.assertEqual(
                 payload["sam"]["architecture"], "sam2.1_hiera_base_plus"
             )
@@ -540,6 +542,18 @@ class CheckpointMetadataTest(unittest.TestCase):
 
         with self.assertRaises(ValueError) as caught:
             engine._restore_resume(old_payload)
+
+        self.assertIn("--init", str(caught.exception))
+
+    def test_staged_checkpoint_cannot_resume_joint_protocol(self) -> None:
+        engine = _bare_engine()
+        engine.config = {"training_protocol": "joint_abc_v1"}
+        engine._stage = "D"
+
+        with self.assertRaises(ValueError) as caught:
+            engine._validate_resume_algorithm(
+                {"stage": "ABC", "format_version": 3}
+            )
 
         self.assertIn("--init", str(caught.exception))
 
