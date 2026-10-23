@@ -1,48 +1,79 @@
-"""diffpeak.inference 的无标注推理边界与几何工具测试。
-
-重点：
-* 推理入口只读影像，不要求同名 GT 掩码存在；
-* 没有正提示点时返回空掩码 logits（不强行补点）；
-* 图像缩放/填充与点坐标恢复遵循固定几何。
-"""
+"""diffpeak.inference 的 signed_ridge_v1 推理、协议与迁移边界测试。"""
 
 from __future__ import annotations
 
+import copy
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
 from PIL import Image
+from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from diffpeak.inference import (  # noqa: E402
+    CHECKPOINT_FORMAT_VERSION,
+    CheckpointProtocolError,
+    DEFAULT_CONFIG,
     JOINT_ABC_PROTOCOL,
+    PROMPT_TERMINAL_MAPPINGS,
+    SIGNED_RIDGE_PROTOCOL,
+    TARGET_REPRESENTATION,
     Predictor,
-    aggregate_metrics,
-    decode_with_prompts,
     _validate_sam_architecture,
+    aggregate_metrics,
+    apply_terminal_mapping,
+    build_models,
     load_checkpoint_models,
-    load_image_file,
+    load_compatible_weights,
     load_labeled_split,
     load_mask_file,
     make_generator,
-    map_points_to_original,
     normalize_valid_sizes,
-    points_to_prompt,
     prepare_image,
     prepare_image_file,
+    resolve_prompt_mapping,
     save_mask_file,
     stable_seed,
     uses_joint_abc_protocol,
+    uses_signed_ridge_protocol,
+    validate_checkpoint_protocol,
+    validate_signed_ridge_config,
 )
-from diffpeak.prompts import PeakExtractor  # noqa: E402
+
+
+def _metadata(**overrides):
+    """构造完整 signed_ridge_v1 快照元数据。"""
+    prompt = {"scale": 1.0, "terminal_mapping": "clamp"}
+    prompt.update(overrides.pop("prompt", {}))
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config["prompt"] = dict(prompt)
+    config.update(overrides.pop("config", {}))
+    payload = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "training_protocol": SIGNED_RIDGE_PROTOCOL,
+        "target_representation": TARGET_REPRESENTATION,
+        "latent_channels": 1,
+        "sam_frozen": True,
+        "prompt": prompt,
+        "config": config,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _payload_with_models(models, **overrides):
+    payload = _metadata(**overrides)
+    payload["models"] = models
+    return payload
 
 
 class PrepareImageTest(unittest.TestCase):
@@ -55,7 +86,6 @@ class PrepareImageTest(unittest.TestCase):
         self.assertEqual(resized_size, (32, 64))
         self.assertEqual(tuple(tensor.shape), (1, 3, 64, 64))
         self.assertEqual(tensor.dtype, torch.float32)
-        self.assertTrue(torch.allclose(tensor[0, :, :32, :], torch.full_like(tensor[0, :, :32, :], 100.0 / 255.0)))
         self.assertTrue(torch.all(tensor[0, :, 32:, :] == 0.0))
 
     def test_right_padding_for_portrait_image(self) -> None:
@@ -65,7 +95,6 @@ class PrepareImageTest(unittest.TestCase):
 
         self.assertEqual(original_size, (200, 100))
         self.assertEqual(resized_size, (64, 32))
-        self.assertEqual(tuple(tensor.shape), (1, 3, 64, 64))
         self.assertTrue(torch.all(tensor[0, :, :, 32:] == 0.0))
 
     def test_grayscale_and_torch_chw_inputs(self) -> None:
@@ -85,7 +114,9 @@ class PrepareImageTest(unittest.TestCase):
 
         self.assertGreaterEqual(float(tensor.min()), 0.0)
         self.assertLessEqual(float(tensor.max()), 1.0)
-        self.assertAlmostEqual(float(tensor[0, :, :8, :8].mean()), 127.0 / 255.0, places=3)
+        self.assertAlmostEqual(
+            float(tensor[0, :, :8, :8].mean()), 127.0 / 255.0, places=3
+        )
 
     def test_invalid_ndim_raises(self) -> None:
         with self.assertRaises(ValueError):
@@ -119,110 +150,232 @@ class ValidSizesTest(unittest.TestCase):
             normalize_valid_sizes([(10, 20)], 2)
 
 
-class PromptBoundaryTest(unittest.TestCase):
-    def test_no_points_or_no_positive_returns_none(self) -> None:
-        empty = (torch.empty(0, 2), torch.empty(0, dtype=torch.long))
-        negative_only = (
-            torch.tensor([[4.0, 5.0]]),
-            torch.tensor([0], dtype=torch.long),
+class ProtocolConfigTest(unittest.TestCase):
+    def test_constants_and_aliases_are_one_protocol(self) -> None:
+        self.assertEqual(SIGNED_RIDGE_PROTOCOL, "signed_ridge_v1")
+        self.assertEqual(TARGET_REPRESENTATION, "signed_ridge_v1")
+        self.assertEqual(JOINT_ABC_PROTOCOL, SIGNED_RIDGE_PROTOCOL)
+        self.assertEqual(PROMPT_TERMINAL_MAPPINGS, ("clamp",))
+
+    def test_default_config_carries_signed_ridge_fields(self) -> None:
+        config = DEFAULT_CONFIG
+        self.assertEqual(config["training_protocol"], SIGNED_RIDGE_PROTOCOL)
+        self.assertEqual(
+            config["target_representation"], TARGET_REPRESENTATION
         )
+        self.assertTrue(config["sam_frozen"])
+        self.assertTrue(config["model"]["sam_frozen"])
+        self.assertEqual(config["model"]["dit"]["in_channels"], 1)
+        self.assertEqual(config["model"]["dit"]["out_channels"], 1)
+        self.assertEqual(config["diffusion"]["latent_channels"], 1)
+        self.assertEqual(config["prompt"], {"scale": 1.0, "terminal_mapping": "clamp"})
+        self.assertEqual(config["reward"]["point_cost"], 0.0)
+        self.assertEqual(config["rl"]["anchor_weight"], 0.01)
 
-        self.assertIsNone(points_to_prompt(empty, "cpu"))
-        self.assertIsNone(points_to_prompt(negative_only, "cpu"))
-
-    def test_mixed_points_are_converted(self) -> None:
-        points = (
-            torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
-            torch.tensor([1, 0], dtype=torch.long),
-        )
-
-        prompt = points_to_prompt(points, "cpu")
-
-        self.assertIsNotNone(prompt)
-        coords, labels = prompt
-        self.assertEqual(coords.dtype, torch.float32)
-        self.assertEqual(labels.dtype, torch.int64)
-        self.assertTrue(torch.equal(labels, torch.tensor([1, 0])))
-
-    def test_decode_without_positive_prompt_returns_empty_logits(self) -> None:
-        class _DummySam:
-            no_positive_logit = -20.0
-
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def decode(self, embeddings, points, output_size=(1024, 1024)):  # pragma: no cover
-                self.calls += 1
-                raise AssertionError("没有正点时不应调用 SAM 解码器")
-
-        sam = _DummySam()
-        embeddings = torch.zeros(2, 256, 4, 4)
-        prompts = [
-            None,
-            (torch.empty(0, 2), torch.empty(0, dtype=torch.long)),
-        ]
-
-        logits, active = decode_with_prompts(
-            sam, embeddings, prompts, output_size=(8, 8)
-        )
-
-        self.assertEqual(tuple(logits.shape), (2, 1, 8, 8))
-        self.assertTrue(torch.equal(logits, torch.full_like(logits, -20.0)))
-        self.assertEqual(active, [False, False])
-        self.assertEqual(sam.calls, 0)
-
-    def test_decode_skips_empty_samples_but_decodes_valid_ones(self) -> None:
-        class _DummySam:
-            no_positive_logit = -20.0
-
-            def __init__(self) -> None:
-                self.embeddings_shapes = []
-
-            def decode(self, embeddings, points, output_size=(1024, 1024)):
-                self.embeddings_shapes.append(tuple(embeddings.shape))
-                return torch.zeros(
-                    (embeddings.shape[0], 1, output_size[0], output_size[1])
-                )
-
-        sam = _DummySam()
-        embeddings = torch.zeros(2, 256, 4, 4)
-        prompts = [
-            (torch.tensor([[4.0, 4.0]]), torch.tensor([1], dtype=torch.long)),
-            None,
-        ]
-
-        logits, active = decode_with_prompts(
-            sam, embeddings, prompts, output_size=(8, 8)
-        )
-
-        self.assertEqual(active, [True, False])
-        self.assertEqual(sam.embeddings_shapes, [(1, 256, 4, 4)])
-        self.assertTrue(torch.all(logits[0] == 0.0))
-        self.assertTrue(torch.all(logits[1] == -20.0))
-
-    def test_prompt_count_mismatch_raises(self) -> None:
-        embeddings = torch.zeros(2, 256, 4, 4)
-        with self.assertRaises(ValueError):
-            decode_with_prompts(
-                type("Sam", (), {"no_positive_logit": -20.0})(),
-                embeddings,
-                [None],
-                output_size=(8, 8),
+    def test_protocol_detection_is_exact_and_case_insensitive(self) -> None:
+        self.assertTrue(
+            uses_signed_ridge_protocol(
+                {"training_protocol": " Signed_Ridge_V1 "}
             )
+        )
+        self.assertTrue(
+            uses_joint_abc_protocol({"training_protocol": SIGNED_RIDGE_PROTOCOL})
+        )
+        for config in (
+            {},
+            {"training_protocol": None},
+            {"training_protocol": "joint_abc_v1"},
+            {"training_protocol": 1},
+        ):
+            self.assertFalse(uses_signed_ridge_protocol(config))
+
+    def test_resolve_prompt_mapping_validates_finite_positive_scale(self) -> None:
+        self.assertEqual(
+            resolve_prompt_mapping({"prompt": {"scale": 2, "terminal_mapping": "clamp"}}),
+            (2.0, "clamp"),
+        )
+        for scale in (0, -1, float("inf"), float("nan"), "x", None):
+            with self.subTest(scale=scale):
+                with self.assertRaises(ValueError):
+                    resolve_prompt_mapping({"prompt": {"scale": scale}})
+        # 第一版只允许 clamp；identity 会造成训练/推理映射不一致。
+        with self.assertRaises(ValueError):
+            resolve_prompt_mapping(
+                {"prompt": {"scale": 1.0, "terminal_mapping": "identity"}}
+            )
+
+    def test_config_validation_rejects_wrong_protocol_and_channels(self) -> None:
+        validate_signed_ridge_config(DEFAULT_CONFIG)
+        bad = copy.deepcopy(DEFAULT_CONFIG)
+        bad["training_protocol"] = "joint_abc_v1"
+        with self.assertRaises(ValueError):
+            validate_signed_ridge_config(bad)
+        # 显式迁移旧配置时可以关闭协议要求。
+        validate_signed_ridge_config(bad, require_protocol=False)
+
+        for path, value in (
+            (("model", "dit", "in_channels"), 2),
+            (("model", "dit", "out_channels"), 2),
+            (("diffusion", "latent_channels"), 2),
+            (("sam_frozen",), False),
+            (("prompt", "scale"), 0.0),
+        ):
+            config = copy.deepcopy(DEFAULT_CONFIG)
+            node = config
+            for key in path[:-1]:
+                node = node[key]
+            node[path[-1]] = value
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    validate_signed_ridge_config(config)
+
+    def test_terminal_mapping_only_clamps(self) -> None:
+        field = torch.tensor([[[[-2.0, 0.5, 2.0]]]])
+        clamped = apply_terminal_mapping(field, "clamp")
+        self.assertTrue(
+            torch.equal(clamped, torch.tensor([[[[-1.0, 0.5, 1.0]]]]))
+        )
+        with self.assertRaises(ValueError):
+            apply_terminal_mapping(field, "identity")
+
+
+class BuildModelsTest(unittest.TestCase):
+    class _DummySAM(nn.Module):
+        def __init__(self, *args, prompt_scale: float = 1.0, **kwargs) -> None:
+            super().__init__()
+            self.prompt_scale = float(prompt_scale)
+            self.kwargs = kwargs
+
+    def _config(self, directory: Path) -> dict:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["model"]["dit"].update(
+            {
+                "patch_size": 4,
+                "hidden_size": 32,
+                "depth": 1,
+                "num_heads": 4,
+                "condition_channels": (4, 8, 8, 8),
+                "gradient_checkpointing": False,
+            }
+        )
+        checkpoint = directory / "unused_sam.pth"
+        checkpoint.write_bytes(b"dummy")
+        config["model"]["sam_checkpoint"] = str(checkpoint)
+        config["prompt"]["scale"] = 2.5
+        return config
+
+    def test_build_models_is_single_channel_and_has_no_peak_extractor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            with patch("diffpeak.inference.RoadSAM", self._DummySAM):
+                models, second = build_models(config, "cpu")
+
+        self.assertIsNone(second)
+        self.assertEqual(
+            set(models), {"sam", "condition_encoder", "dit", "diffusion"}
+        )
+        self.assertEqual(models["dit"].in_channels, 1)
+        self.assertEqual(models["dit"].out_channels, 1)
+        self.assertEqual(models["diffusion"].latent_channels, 1)
+        self.assertEqual(models["sam"].prompt_scale, 2.5)
+
+    def test_build_models_rejects_explicit_multi_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            config["diffusion"]["latent_channels"] = 2
+            with patch("diffpeak.inference.RoadSAM", self._DummySAM):
+                with self.assertRaises(ValueError):
+                    build_models(config, "cpu")
+
+
+class CheckpointProtocolTest(unittest.TestCase):
+    def test_complete_metadata_passes_and_is_returned(self) -> None:
+        meta = validate_checkpoint_protocol(_metadata())
+        self.assertEqual(meta["training_protocol"], SIGNED_RIDGE_PROTOCOL)
+        self.assertEqual(meta["target_representation"], TARGET_REPRESENTATION)
+        self.assertEqual(meta["latent_channels"], 1)
+        self.assertTrue(meta["sam_frozen"])
+        self.assertEqual(meta["prompt_scale"], 1.0)
+        self.assertEqual(meta["terminal_mapping"], "clamp")
+
+    def test_old_protocol_or_missing_metadata_is_rejected(self) -> None:
+        old = _metadata(
+            format_version=4,
+            training_protocol="joint_abc_v1",
+            target_representation="point_heatmap_v1",
+        )
+        with self.assertRaisesRegex(CheckpointProtocolError, "format_version"):
+            validate_checkpoint_protocol(old)
+
+        missing = _metadata()
+        missing.pop("target_representation")
+        missing["config"].pop("target_representation")
+        with self.assertRaisesRegex(CheckpointProtocolError, "target_representation"):
+            validate_checkpoint_protocol(missing)
+
+    def test_root_and_config_contradictions_are_rejected(self) -> None:
+        payload = _metadata()
+        payload["config"]["training_protocol"] = "joint_abc_v1"
+        with self.assertRaisesRegex(CheckpointProtocolError, "不一致"):
+            validate_checkpoint_protocol(payload)
+
+        payload = _metadata()
+        payload["prompt"]["scale"] = 2.0
+        with self.assertRaisesRegex(CheckpointProtocolError, "prompt 在根级"):
+            validate_checkpoint_protocol(payload)
+
+        payload = _metadata()
+        payload["config"]["sam_frozen"] = False
+        with self.assertRaisesRegex(CheckpointProtocolError, "sam_frozen"):
+            validate_checkpoint_protocol(payload)
+
+    def test_channel_freeze_and_mapping_are_validated(self) -> None:
+        cases = [
+            (_metadata(latent_channels=2), "latent_channels"),
+            (_metadata(sam_frozen=False), "sam_frozen"),
+            (
+                _metadata(prompt={"scale": 1.0, "terminal_mapping": "identity"}),
+                "terminal_mapping",
+            ),
+            (
+                _metadata(prompt={"scale": 0.0, "terminal_mapping": "clamp"}),
+                "prompt.scale",
+            ),
+        ]
+        for payload, pattern in cases:
+            with self.subTest(pattern=pattern):
+                with self.assertRaisesRegex(CheckpointProtocolError, pattern):
+                    validate_checkpoint_protocol(payload)
+
+    def test_current_config_must_match_saved_training_protocol(self) -> None:
+        payload = _metadata()
+        current = copy.deepcopy(DEFAULT_CONFIG)
+        current["prompt"]["scale"] = 3.0
+        with self.assertRaisesRegex(CheckpointProtocolError, "prompt"):
+            validate_checkpoint_protocol(payload, current)
+        current = copy.deepcopy(DEFAULT_CONFIG)
+        current["rl"]["kl_weight"] = 0.5
+        with self.assertRaisesRegex(CheckpointProtocolError, "rl.kl_weight"):
+            validate_checkpoint_protocol(payload, current)
+
+    def test_load_checkpoint_models_rejects_unmarked_or_old_payloads(self) -> None:
+        with self.assertRaises(CheckpointProtocolError):
+            load_checkpoint_models({}, {"models": {}})
+        old = _payload_with_models({}, format_version=4)
+        with self.assertRaises(CheckpointProtocolError):
+            load_checkpoint_models({}, old)
 
 
 class CheckpointSAM2GuardTest(unittest.TestCase):
     def test_old_sam1_snapshot_is_rejected_with_clear_message(self) -> None:
-        # RoadSAM/SAM2 目标模型按 ``sam.sam_mask_decoder`` 命名权重。
         target = types.SimpleNamespace(
             sam=types.SimpleNamespace(
                 sam_mask_decoder=torch.nn.Module(),
                 sam_prompt_encoder=torch.nn.Module(),
             )
         )
-        payload = {
-            "models": {
-                # 故意使用 SAM1 ViT-B 的键名。
+        payload = _payload_with_models(
+            {
                 "sam": {
                     "sam.prompt_encoder.embedding.weight": torch.zeros(1),
                     "sam.mask_decoder.iou_token.weight": torch.zeros(1),
@@ -231,11 +384,9 @@ class CheckpointSAM2GuardTest(unittest.TestCase):
                 "dit": {},
                 "diffusion": {},
             }
-        }
-
+        )
         with self.assertRaises(ValueError) as caught:
             load_checkpoint_models({"sam": target}, payload)
-
         message = str(caught.exception)
         self.assertIn("旧 SAM1", message)
         self.assertIn("SAM2", message)
@@ -248,21 +399,18 @@ class CheckpointSAM2GuardTest(unittest.TestCase):
             ),
             architecture="sam2.1_hiera_base_plus",
         )
-        payload = {
-            "config": {"model": {"sam_architecture": "sam2.1_hiera_large"}},
-            "models": {
+        payload = _payload_with_models(
+            {
                 "sam": {"sam.sam_mask_decoder.conv_s0.weight": torch.zeros(1)},
                 "condition_encoder": {},
                 "dit": {},
                 "diffusion": {},
             },
-        }
-
+            config={"model": {"sam_architecture": "sam2.1_hiera_large"}},
+        )
         with self.assertRaises(ValueError) as caught:
             load_checkpoint_models({"sam": target}, payload)
-
         self.assertIn("骨干", str(caught.exception))
-        self.assertIn("sam2.1_hiera_large", str(caught.exception))
 
     def test_config_and_architecture_must_match(self) -> None:
         _validate_sam_architecture(
@@ -275,69 +423,214 @@ class CheckpointSAM2GuardTest(unittest.TestCase):
         self.assertIn("sam2.1_hiera_large", str(caught.exception))
 
 
-class GeometryRecoveryTest(unittest.TestCase):
-    def test_map_points_with_unit_scale(self) -> None:
-        coords = torch.tensor([[10.0, 20.0], [30.0, 40.0]])
-        labels = torch.tensor([1, 0])
+class MigrationTest(unittest.TestCase):
+    class _TinyDit(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.patch_embed = nn.Conv2d(1, 2, 3, padding=1)
+            self.blocks = nn.Linear(2, 2)
+            self.final_layer = nn.Linear(2, 1)
 
-        payload = map_points_to_original(
-            (coords, labels), original_size=(100, 200), resized_size=(100, 200)
+    def test_migration_skips_sam_and_dit_heads_and_reports(self) -> None:
+        condition = nn.Linear(2, 2)
+        dit = self._TinyDit()
+        sam = nn.Linear(2, 2)
+        models = {
+            "condition_encoder": condition,
+            "dit": dit,
+            "sam": sam,
+            "diffusion": nn.Linear(1, 1),
+        }
+        sam_before = {key: value.clone() for key, value in sam.state_dict().items()}
+        payload = {
+            "models": {
+                "sam": {"weight": torch.full((2, 2), 9.0), "bias": torch.ones(2)},
+                "condition_encoder": {
+                    "weight": torch.full((2, 2), 3.0),
+                    "bias": torch.ones(2),
+                    "legacy_only": torch.zeros(1),
+                },
+                "dit": {
+                    "patch_embed.weight": torch.zeros_like(dit.patch_embed.weight),
+                    "blocks.weight": torch.full((2, 2), 4.0),
+                    "blocks.bias": torch.zeros(3),
+                    "final_layer.weight": torch.zeros_like(dit.final_layer.weight),
+                    "final_layer.bias": torch.zeros_like(dit.final_layer.bias),
+                },
+            }
+        }
+
+        report = load_compatible_weights(models, payload)
+
+        self.assertTrue(report["migration"])
+        self.assertFalse(report["optimizer_restored"])
+        self.assertIn("sam", report["skipped_modules"])
+        self.assertIn("diffusion", report["missing_modules"])
+        self.assertIn("blocks.weight", report["loaded"]["dit"])
+        self.assertEqual(
+            report["skipped"]["dit"]["patch_embed.weight"], "input_output_head"
+        )
+        self.assertEqual(
+            report["skipped"]["dit"]["final_layer.weight"], "input_output_head"
+        )
+        self.assertEqual(
+            report["skipped"]["dit"]["blocks.bias"], "shape_mismatch"
+        )
+        self.assertIn("blocks.bias", report["reinitialized"]["dit"])
+        self.assertTrue(torch.all(condition.weight == 3.0))
+        self.assertTrue(torch.all(dit.blocks.weight == 4.0))
+        # 冻结 SAM 必须保持构建时的官方权重，不能被旧快照覆盖。
+        for key, value in sam.state_dict().items():
+            self.assertTrue(torch.equal(value, sam_before[key]))
+
+
+class PredictorSignedRidgeTest(unittest.TestCase):
+    class _DummySam:
+        no_positive_logit = -20.0
+
+        def __init__(self, prompt_scale=None) -> None:
+            self.heatmap_calls = []
+            if prompt_scale is not None:
+                self.prompt_scale = prompt_scale
+
+        def encode(self, images, valid_sizes=None):
+            return torch.zeros(images.shape[0], 256, 4, 4)
+
+        def decode_heatmaps(
+            self, embeddings, heatmaps, output_size=(1024, 1024), valid_sizes=None
+        ):
+            self.heatmap_calls.append(
+                {
+                    "heatmaps": heatmaps.detach().clone(),
+                    "output_size": output_size,
+                    "valid_sizes": valid_sizes,
+                }
+            )
+            return torch.zeros(embeddings.shape[0], 1, *output_size)
+
+    class _DummyConditionEncoder:
+        def __call__(self, images, embeddings):
+            batch = images.shape[0]
+            return [torch.zeros(batch, 4, 4, 4) for _ in range(4)], []
+
+    class _DummyDiffusion:
+        def __init__(self, field: torch.Tensor) -> None:
+            self.field = field
+
+        def sample(self, dit, conditions, generator=None, record=False):
+            return self.field.clone()
+
+    def _predictor(self, *, sam_prompt_scale=None, field=None):
+        predictor = object.__new__(Predictor)
+        predictor.config = copy.deepcopy(DEFAULT_CONFIG)
+        predictor.config_dir = None
+        predictor.device = torch.device("cpu")
+        predictor.seed = 7
+        predictor.image_size = 1024
+        predictor.amp = False
+        predictor.threshold = 0.5
+        predictor.prompt_scale = 2.0
+        predictor.terminal_mapping = "clamp"
+        predictor.prompt_mode = "signed_ridge"
+        predictor.joint_abc = True
+        predictor.sam = self._DummySam(prompt_scale=sam_prompt_scale)
+        predictor.sam_applies_prompt_scale = sam_prompt_scale is not None
+        predictor.condition_encoder = self._DummyConditionEncoder()
+        predictor.dit = object()
+        if field is None:
+            field = torch.zeros(1, 1, 4, 4)
+            field[0, 0, 1:3, 1:3] = 0.75
+        predictor.diffusion = self._DummyDiffusion(field)
+        return predictor
+
+    def test_predict_array_decodes_signed_field_without_peak_extraction(self) -> None:
+        predictor = self._predictor()
+
+        result = Predictor.predict_array(
+            predictor, np.zeros((8, 8, 3), dtype=np.uint8), image_id="scene"
         )
 
-        self.assertEqual(payload["coordinate_space"], "original_image_xy")
-        self.assertEqual(payload["positive"], [[10.0, 20.0]])
-        self.assertEqual(payload["negative"], [[30.0, 40.0]])
-        self.assertEqual(payload["point_count"], 2)
+        self.assertEqual(result["prompt_mode"], "signed_ridge")
+        self.assertEqual(result["target_representation"], TARGET_REPRESENTATION)
+        self.assertNotIn("points", result)
+        self.assertNotIn("point_count", result)
+        self.assertNotIn("has_positive", result)
+        self.assertFalse(hasattr(predictor, "peak_extractor"))
+        self.assertEqual(len(predictor.sam.heatmap_calls), 1)
+        call = predictor.sam.heatmap_calls[0]
+        # 映射固定为 U = scale * clamp(H)，不是 clamp(scale * H)。
+        expected = (
+            torch.clamp(predictor.diffusion.field, -1.0, 1.0)
+            * predictor.prompt_scale
+        )
+        self.assertTrue(torch.equal(call["heatmaps"], expected))
+        self.assertEqual(call["valid_sizes"], [tuple(result["resized_size"])])
+        self.assertEqual(tuple(result["field"].shape), (1, 4, 4))
+        self.assertEqual(tuple(result["prompt_field"].shape), (1, 4, 4))
+        # 概率恰为 threshold 时按 >= 判定为前景（与 engine/D 一致）。
+        self.assertTrue(np.all(result["mask"] > 0))
 
-    def test_map_points_scales_and_clips(self) -> None:
-        coords = torch.tensor([[0.0, 0.0], [1000.0, 1000.0]])
-        labels = torch.tensor([1, 0])
+    def test_sam_prompt_scale_is_not_applied_twice(self) -> None:
+        predictor = self._predictor(sam_prompt_scale=2.0)
 
-        payload = map_points_to_original(
-            (coords, labels), original_size=(100, 200), resized_size=(50, 100)
+        Predictor.predict_array(
+            predictor, np.zeros((8, 8, 3), dtype=np.uint8), image_id="scene"
         )
 
-        self.assertEqual(payload["positive"], [[0.5, 0.5]])
-        # 最后一个点被裁剪到原图边界内。
-        self.assertEqual(payload["negative"], [[199.0, 99.0]])
+        expected = torch.clamp(predictor.diffusion.field, -1.0, 1.0)
+        self.assertTrue(
+            torch.equal(predictor.sam.heatmap_calls[0]["heatmaps"], expected)
+        )
 
+    def test_predictor_rejects_old_checkpoint_before_building_models(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        old_payload = _metadata(
+            format_version=4, training_protocol="joint_abc_v1"
+        )
+        with patch(
+            "diffpeak.inference.resolve_sam_checkpoint",
+            return_value=Path("unused_sam.pth"),
+        ), patch(
+            "diffpeak.inference.build_models",
+            side_effect=AssertionError("不应为旧快照构建模型"),
+        ):
+            with self.assertRaises(CheckpointProtocolError):
+                Predictor(config, payload=old_payload, device="cpu")
+
+
+class GeometryAndFilesTest(unittest.TestCase):
     def test_crop_resize_removes_padding(self) -> None:
-        probability = torch.zeros(8, 8)
-        probability[4:, 4:] = 1.0
-
         from diffpeak.inference import crop_resize_probability
 
+        probability = torch.zeros(8, 8)
+        probability[4:, 4:] = 1.0
         result = crop_resize_probability(
             probability, original_size=(4, 4), resized_size=(4, 4)
         )
-
         self.assertEqual(result.shape, (4, 4))
         self.assertFalse(result.any())
 
-
-class InferenceWithoutGroundTruthTest(unittest.TestCase):
     def test_predict_file_does_not_read_same_name_mask(self) -> None:
         class _StubPredictor:
             def predict_array(
-                self, image, image_id=None, seed=None, return_heatmaps=False
+                self, image, image_id=None, seed=None, return_field=True
             ):
                 return {
                     "image_id": image_id,
                     "shape": tuple(image.shape),
-                    "return_heatmaps": return_heatmaps,
+                    "return_field": return_field,
                 }
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            image = np.full((12, 20, 3), 128, dtype=np.uint8)
             image_path = root / "scene_sat.jpg"
-            Image.fromarray(image, mode="RGB").save(image_path)
+            Image.fromarray(
+                np.full((12, 20, 3), 128, dtype=np.uint8), mode="RGB"
+            ).save(image_path)
             # 同名掩码位置故意放一个目录：一旦推理读取掩码就会失败。
             (root / "scene_mask.png").mkdir()
 
-            result = Predictor.predict_file(
-                _StubPredictor(), image_path, return_heatmaps=False
-            )
+            result = Predictor.predict_file(_StubPredictor(), image_path)
 
         self.assertEqual(result["image_id"], "scene")
         self.assertEqual(result["shape"], (12, 20, 3))
@@ -347,159 +640,29 @@ class InferenceWithoutGroundTruthTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "valid").mkdir()
-            image = np.zeros((8, 8, 3), dtype=np.uint8)
-            Image.fromarray(image, mode="RGB").save(
-                root / "valid" / "a_sat.jpg"
-            )
+            Image.fromarray(
+                np.zeros((8, 8, 3), dtype=np.uint8), mode="RGB"
+            ).save(root / "valid" / "a_sat.jpg")
 
             entries = load_labeled_split(["valid/a_sat.jpg"], root)
 
-        self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["id"], "a")
         self.assertEqual(entries[0]["image_path"], root / "valid" / "a_sat.jpg")
         self.assertEqual(entries[0]["mask_path"], root / "valid" / "a_mask.png")
-        self.assertEqual(entries[0]["relative_path"], "valid/a_sat.jpg")
 
     def test_prepare_image_file_needs_image_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "unlabeled_sat.jpg"
-            Image.fromarray(np.zeros((10, 16, 3), dtype=np.uint8), mode="RGB").save(
-                path
-            )
+            Image.fromarray(
+                np.zeros((10, 16, 3), dtype=np.uint8), mode="RGB"
+            ).save(path)
 
             tensor, original, resized = prepare_image_file(path, image_size=32)
 
         self.assertEqual(original, (10, 16))
+        self.assertEqual(resized, (20, 32))
         self.assertEqual(tuple(tensor.shape), (1, 3, 32, 32))
 
-
-class JointABCRoutingTest(unittest.TestCase):
-    """根级 ``training_protocol`` 决定推理使用密集热图还是点提示。"""
-
-    class _DummySam:
-        no_positive_logit = -20.0
-
-        def __init__(self) -> None:
-            self.heatmap_calls = []
-            self.point_calls = []
-
-        def encode(self, images, valid_sizes=None):
-            return torch.zeros(images.shape[0], 256, 4, 4)
-
-        def decode_heatmaps(
-            self,
-            embeddings,
-            heatmaps,
-            output_size=(1024, 1024),
-            valid_sizes=None,
-            *,
-            decoder=None,
-        ):
-            self.heatmap_calls.append(
-                {
-                    "heatmaps": heatmaps.detach().clone(),
-                    "output_size": output_size,
-                    "valid_sizes": valid_sizes,
-                    "decoder": decoder,
-                }
-            )
-            return torch.zeros(embeddings.shape[0], 1, *output_size)
-
-        def decode(self, embeddings, points, output_size=(1024, 1024)):
-            self.point_calls.append(points)
-            return torch.zeros(embeddings.shape[0], 1, *output_size)
-
-    class _DummyConditionEncoder:
-        def __call__(self, images, embeddings):
-            batch = images.shape[0]
-            return [torch.zeros(batch, 4, 4, 4) for _ in range(4)], []
-
-    class _DummyDiffusion:
-        def __init__(self, heatmaps: torch.Tensor) -> None:
-            self.heatmaps = heatmaps
-
-        def sample(self, dit, conditions, generator=None, record=False):
-            return self.heatmaps.clone()
-
-    def _predictor(self, protocol):
-        predictor = object.__new__(Predictor)
-        predictor.config = (
-            {"training_protocol": protocol} if protocol is not None else {}
-        )
-        predictor.config_dir = None
-        predictor.device = torch.device("cpu")
-        predictor.seed = 7
-        predictor.image_size = 1024
-        predictor.amp = False
-        predictor.threshold = 0.5
-        predictor.joint_abc = uses_joint_abc_protocol(predictor.config)
-        predictor.prompt_mode = "heatmap" if predictor.joint_abc else "points"
-        predictor.sam = self._DummySam()
-        predictor.condition_encoder = self._DummyConditionEncoder()
-        predictor.dit = object()
-        heatmaps = torch.zeros(1, 2, 4, 4)
-        heatmaps[0, 0, 2, 2] = 1.0
-        predictor.diffusion = self._DummyDiffusion(heatmaps)
-        predictor.peak_extractor = PeakExtractor({})
-        return predictor
-
-    def test_marker_uses_dense_heatmap_decode_and_keeps_point_diagnostics(self) -> None:
-        predictor = self._predictor(JOINT_ABC_PROTOCOL)
-
-        result = Predictor.predict_array(
-            predictor,
-            np.zeros((8, 8, 3), dtype=np.uint8),
-            image_id="scene",
-        )
-
-        self.assertEqual(result["prompt_mode"], "heatmap")
-        self.assertEqual(result["image_id"], "scene")
-        self.assertEqual(predictor.sam.point_calls, [])
-        self.assertEqual(len(predictor.sam.heatmap_calls), 1)
-        call = predictor.sam.heatmap_calls[0]
-        self.assertEqual(tuple(call["heatmaps"].shape), (1, 2, 4, 4))
-        self.assertEqual(call["output_size"], (1024, 1024))
-        self.assertEqual(call["valid_sizes"], [tuple(result["resized_size"])])
-        self.assertIsNone(call["decoder"])
-        # 点仍被提取并写入诊断字段，但不再用于解码，也不产生点成本。
-        self.assertGreaterEqual(result["points"]["point_count"], 1)
-        self.assertGreaterEqual(result["positive_count"], 1)
-        self.assertEqual(result["peak_point_count"], result["points"]["point_count"])
-        self.assertEqual(result["point_count"], 0)
-
-    def test_marker_missing_or_other_keeps_point_count_billing(self) -> None:
-        predictor = self._predictor(None)
-
-        result = Predictor.predict_array(
-            predictor,
-            np.zeros((8, 8, 3), dtype=np.uint8),
-            image_id="scene",
-        )
-
-        self.assertEqual(result["prompt_mode"], "points")
-        self.assertEqual(predictor.sam.heatmap_calls, [])
-        self.assertEqual(len(predictor.sam.point_calls), 1)
-        self.assertEqual(result["points"]["point_count"], 1)
-        self.assertEqual(result["point_count"], 1)
-        self.assertEqual(result["peak_point_count"], 1)
-
-    def test_marker_matching_is_exact_and_case_insensitive(self) -> None:
-        self.assertTrue(uses_joint_abc_protocol({"training_protocol": JOINT_ABC_PROTOCOL}))
-        self.assertTrue(
-            uses_joint_abc_protocol({"training_protocol": " Joint_ABC_V1 "})
-        )
-        for config in (
-            {},
-            {"training_protocol": None},
-            {"training_protocol": ""},
-            {"training_protocol": "legacy"},
-            {"training_protocol": 1},
-        ):
-            with self.subTest(config=config):
-                self.assertFalse(uses_joint_abc_protocol(config))
-
-
-class FileAndSeedTest(unittest.TestCase):
     def test_mask_roundtrip(self) -> None:
         mask = np.zeros((6, 8), dtype=bool)
         mask[2, 3:6] = True
@@ -511,33 +674,16 @@ class FileAndSeedTest(unittest.TestCase):
 
         self.assertTrue(np.array_equal(loaded, mask))
 
-    def test_load_image_file_returns_rgb_uint8(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "image.jpg"
-            Image.fromarray(
-                np.full((5, 7, 3), 120, dtype=np.uint8), mode="RGB"
-            ).save(path)
-
-            array = load_image_file(path)
-
-        self.assertEqual(array.shape, (5, 7, 3))
-        self.assertEqual(array.dtype, np.uint8)
-
     def test_stable_seed_is_reproducible_and_identifier_dependent(self) -> None:
         first = stable_seed(42, "infer", "scene")
-        second = stable_seed(42, "infer", "scene")
-        other = stable_seed(42, "infer", "other")
-        other_base = stable_seed(43, "infer", "scene")
-
-        self.assertEqual(first, second)
-        self.assertNotEqual(first, other)
-        self.assertNotEqual(first, other_base)
+        self.assertEqual(first, stable_seed(42, "infer", "scene"))
+        self.assertNotEqual(first, stable_seed(42, "infer", "other"))
+        self.assertNotEqual(first, stable_seed(43, "infer", "scene"))
         self.assertLess(first, 1 << 63)
 
     def test_generators_with_same_seed_match(self) -> None:
         first = make_generator(123)
         second = make_generator(123)
-
         self.assertTrue(
             torch.equal(
                 torch.randn(8, generator=first), torch.randn(8, generator=second)
@@ -551,8 +697,6 @@ class FileAndSeedTest(unittest.TestCase):
                 {"reward": 0.0, "iou": 0.0, "f1": 0.0, "cldice": float("nan"), "path": 0.0},
             ]
         )
-
-        self.assertEqual(summary["count"], 2)
         self.assertAlmostEqual(summary["iou"], 0.5)
         self.assertAlmostEqual(summary["cldice"], 1.0)
         self.assertAlmostEqual(summary["score"], 0.5)

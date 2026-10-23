@@ -100,8 +100,8 @@ class RoadSAMArchitectureIntegrationTest(unittest.TestCase):
         self.addCleanup(restore)
         return calls
 
-    def test_builds_real_sam2_modules_with_frozen_encoders(self) -> None:
-        """RoadSAM 注入的是官方 SAM2 模块，且只训练 mask decoder。"""
+    def test_builds_real_sam2_modules_with_all_parameters_frozen(self) -> None:
+        """RoadSAM 注入官方 SAM2 模块，且所有参数/buffer 全阶段冻结。"""
         self.assertIsInstance(self.road_sam.sam, SAM2Base)
         self.assertIsInstance(self.road_sam.sam.image_encoder, ImageEncoder)
         self.assertIsInstance(self.road_sam.sam.sam_prompt_encoder, PromptEncoder)
@@ -109,6 +109,7 @@ class RoadSAMArchitectureIntegrationTest(unittest.TestCase):
         self.assertEqual(
             self.road_sam.config_name, "configs/sam2.1/sam2.1_hiera_b+.yaml"
         )
+        self.assertEqual(self.road_sam.prompt_scale, 1.0)
 
         image_params = list(self.road_sam.sam.image_encoder.parameters())
         prompt_params = list(self.road_sam.sam.sam_prompt_encoder.parameters())
@@ -117,20 +118,24 @@ class RoadSAMArchitectureIntegrationTest(unittest.TestCase):
         self.assertGreater(len(prompt_params), 0)
         self.assertGreater(len(decoder_params), 0)
 
-        self.assertTrue(all(not p.requires_grad for p in image_params))
-        self.assertTrue(all(not p.requires_grad for p in prompt_params))
-        self.assertTrue(all(p.requires_grad for p in decoder_params))
+        self.assertTrue(
+            all(not p.requires_grad for p in self.road_sam.parameters())
+        )
+        self.assertTrue(
+            all(not buffer.requires_grad for buffer in self.road_sam.buffers())
+        )
         self.assertFalse(self.road_sam.sam.image_encoder.training)
         self.assertFalse(self.road_sam.sam.sam_prompt_encoder.training)
         self.assertFalse(self.road_sam.sam.memory_attention.training)
-        self.assertTrue(self.road_sam.sam.sam_mask_decoder.training)
+        self.assertFalse(self.road_sam.sam.sam_mask_decoder.training)
 
-        # 训练脚本整体调用 train() 后，冻结模块仍必须保持 eval。
+        # 训练脚本整体调用 train() 后，所有模块仍必须保持 eval。
         self.road_sam.train(True)
+        self.assertFalse(self.road_sam.training)
         self.assertFalse(self.road_sam.sam.image_encoder.training)
         self.assertFalse(self.road_sam.sam.sam_prompt_encoder.training)
         self.assertFalse(self.road_sam.sam.memory_attention.training)
-        self.assertTrue(self.road_sam.sam.sam_mask_decoder.training)
+        self.assertFalse(self.road_sam.sam.sam_mask_decoder.training)
 
     def test_single_mask_interface_and_output_shape(self) -> None:
         """multimask_output=False、repeat_image=False，每图只返回一个掩码。"""
@@ -147,8 +152,8 @@ class RoadSAMArchitectureIntegrationTest(unittest.TestCase):
         self.assertEqual(tuple(logits.shape), (2, 1, *OUTPUT_SIZE))
         self.assertEqual(calls, [(False, False, True), (False, False, True)])
         self.assertTrue(bool(torch.isfinite(logits).all()))
-        # 掩码解码器参数可训练，输出应连接计算图。
-        self.assertTrue(logits.requires_grad)
+        # 全冻结且稀疏输入无梯度：工具路径不构建计算图。
+        self.assertFalse(logits.requires_grad)
 
         # 不同的稀疏提示应产生不同的掩码，排除“提示被忽略”的接线错误。
         with torch.no_grad():
@@ -180,18 +185,16 @@ class RoadSAMArchitectureIntegrationTest(unittest.TestCase):
                 torch.full_like(empty, self.road_sam.no_positive_logit),
             )
         )
-        # 空行没有指向解码器的梯度路径。
+        # 全冻结下稀疏路径完全不构建计算图，空行也不产生梯度。
+        self.assertFalse(logits.requires_grad)
         self.road_sam.zero_grad(set_to_none=True)
-        empty.sum().backward()
         self.assertTrue(
             all(
                 parameter.grad is None
-                or not bool(torch.count_nonzero(parameter.grad))
                 for parameter in self.road_sam.sam.sam_mask_decoder.parameters()
             )
         )
         self.assertFalse(torch.equal(logits[0], empty))
-        self.assertTrue(logits[0].requires_grad)
 
     def test_all_samples_without_positive_prompts_short_circuit(self) -> None:
         """整批都没有正点时直接返回常量，不构造解码计算图。"""
@@ -302,119 +305,79 @@ class RoadSAMArchitectureIntegrationTest(unittest.TestCase):
         torch.testing.assert_close(batch[0:1], single_many, atol=1e-6, rtol=1e-5)
         torch.testing.assert_close(batch[1:2], single_one, atol=1e-6, rtol=1e-5)
 
-    def test_backward_updates_only_trainable_mask_decoder(self) -> None:
-        """解码输出可反向，梯度只落到 mask decoder（含高分辨率投影）。"""
+    def test_sparse_decode_accumulates_no_parameter_gradients(self) -> None:
+        """稀疏解码是工具路径；全冻结后不会产生任何参数梯度。"""
         self.road_sam.zero_grad(set_to_none=True)
         prompts = [_prompt([[400.0, 500.0]], [1])]
 
         logits = self.road_sam.decode(
             self.features.select(0), prompts, output_size=OUTPUT_SIZE
         )
-        logits.mean().backward()
 
-        decoder_grads = [
-            (name, p.grad)
-            for name, p in self.road_sam.sam.sam_mask_decoder.named_parameters()
-            if p.grad is not None
-        ]
-        self.assertGreater(len(decoder_grads), 0)
-        self.assertTrue(all(bool(torch.isfinite(g).all()) for _, g in decoder_grads))
+        self.assertFalse(logits.requires_grad)
         self.assertTrue(
-            any(float(g.abs().sum()) > 0.0 for _, g in decoder_grads),
-            "mask decoder 没有获得非零梯度",
-        )
-        # 高分辨率投影属于解码器，必须参与训练。
-        self.assertTrue(
-            any(
-                name.startswith("conv_s0") and float(g.abs().sum()) > 0.0
-                for name, g in decoder_grads
-            )
-        )
-        self.assertTrue(
-            any(
-                name.startswith("conv_s1") and float(g.abs().sum()) > 0.0
-                for name, g in decoder_grads
-            )
-        )
-        self.assertTrue(
-            all(p.grad is None for p in self.road_sam.sam.image_encoder.parameters())
-        )
-        self.assertTrue(
-            all(
-                p.grad is None
-                for p in self.road_sam.sam.sam_prompt_encoder.parameters()
-            )
+            all(p.grad is None for p in self.road_sam.parameters())
         )
 
     def test_decode_heatmaps_gradient_passes_through_fully_frozen_sam(self) -> None:
         parameters = list(self.road_sam.parameters())
-        flags = [parameter.requires_grad for parameter in parameters]
-        self.addCleanup(lambda: [p.requires_grad_(flag) for p, flag in zip(parameters, flags)])
-        self.road_sam.requires_grad_(False).eval()
+        self.assertTrue(all(not parameter.requires_grad for parameter in parameters))
+        self.road_sam.eval()
         self.road_sam.zero_grad(set_to_none=True)
-        heatmaps = torch.rand(2, 2, 16, 16, requires_grad=True)
+        field = torch.rand(2, 1, 16, 16, requires_grad=True)
         logits = self.road_sam.decode_heatmaps(
-            self.features, heatmaps, output_size=OUTPUT_SIZE
+            self.features, field, output_size=OUTPUT_SIZE
         )
         logits.square().mean().backward()
-        self.assertIsNotNone(heatmaps.grad)
-        self.assertTrue(bool(torch.isfinite(heatmaps.grad).all()))
-        self.assertGreater(float(heatmaps.grad.abs().sum()), 0)
+        self.assertIsNotNone(field.grad)
+        self.assertTrue(bool(torch.isfinite(field.grad).all()))
+        self.assertGreater(float(field.grad.abs().sum()), 0)
         self.assertTrue(all(p.grad is None for p in parameters))
 
     def test_decode_heatmaps_gradient_passes_through_frozen_prompt_encoder(self) -> None:
-        """密集热图提示可微：冻结提示编码器只把梯度传回输入热图。"""
+        """单通道场提示可微：冻结提示编码器只把梯度传回输入场。"""
         self.road_sam.zero_grad(set_to_none=True)
         generator = torch.Generator().manual_seed(7)
-        heatmaps = torch.rand(2, 2, 16, 16, generator=generator, requires_grad=True)
+        field = (
+            torch.rand(2, 1, 16, 16, generator=generator) * 2.0 - 1.0
+        ).detach().requires_grad_(True)
 
         logits = self.road_sam.decode_heatmaps(
-            self.features, heatmaps, output_size=OUTPUT_SIZE
+            self.features, field, output_size=OUTPUT_SIZE
         )
 
         self.assertEqual(tuple(logits.shape), (2, 1, *OUTPUT_SIZE))
         self.assertTrue(logits.requires_grad)
         logits.mean().backward()
 
-        self.assertIsNotNone(heatmaps.grad)
-        self.assertTrue(bool(torch.count_nonzero(heatmaps.grad)))
-        # 提示编码器权重冻结，不能累积梯度。
+        self.assertIsNotNone(field.grad)
+        self.assertTrue(bool(torch.count_nonzero(field.grad)))
+        # 提示编码器与掩码解码器权重全冻结，不能累积梯度。
         self.assertTrue(
             all(
                 p.grad is None
                 for p in self.road_sam.sam.sam_prompt_encoder.parameters()
             )
         )
-        # 但掩码解码器（含高分辨率投影）仍获得可训练梯度。
         decoder = self.road_sam.sam.sam_mask_decoder
-        self.assertTrue(
-            any(
-                p.grad is not None and bool(torch.count_nonzero(p.grad))
-                for p in decoder.parameters()
-            )
-        )
-        self.assertTrue(
-            all(bool(torch.isfinite(p.grad).all()) for p in decoder.parameters() if p.grad is not None)
-        )
+        self.assertTrue(all(p.grad is None for p in decoder.parameters()))
 
-    def test_decode_heatmaps_decodes_empty_maps_without_sparse_points(self) -> None:
-        """空热图也整批解码，且不依赖任何稀疏点提示。"""
+    def test_decode_heatmaps_decodes_empty_fields_without_sparse_points(self) -> None:
+        """空场也整批解码，且不依赖任何稀疏点提示。"""
         self.road_sam.zero_grad(set_to_none=True)
-        heatmaps = torch.zeros(2, 2, 16, 16)
+        field = torch.zeros(2, 1, 16, 16, requires_grad=True)
 
         logits = self.road_sam.decode_heatmaps(
-            self.features, heatmaps, output_size=OUTPUT_SIZE
+            self.features, field, output_size=OUTPUT_SIZE
         )
 
         self.assertEqual(tuple(logits.shape), (2, 1, *OUTPUT_SIZE))
         self.assertTrue(bool(torch.isfinite(logits).all()))
         self.assertTrue(logits.requires_grad)
         logits.mean().backward()
+        self.assertIsNotNone(field.grad)
         self.assertTrue(
-            any(
-                p.grad is not None and bool(torch.count_nonzero(p.grad))
-                for p in self.road_sam.sam.sam_mask_decoder.parameters()
-            )
+            all(p.grad is None for p in self.road_sam.sam.sam_mask_decoder.parameters())
         )
 
     def test_random_weights_are_not_pretrained(self) -> None:

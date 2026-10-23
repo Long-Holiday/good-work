@@ -118,7 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="all 或逗号分隔的阶段子集，例如 ABC、D、ABC,D。",
     )
     parser.add_argument("--resume", type=str, default=None, help="完整快照，用于阶段内恢复。")
-    parser.add_argument("--init", type=str, default=None, help="仅加载模型权重的上一阶段快照。")
+    parser.add_argument("--init", type=str, default=None, help="仅加载新协议模型权重的上一阶段快照。")
+    parser.add_argument("--migrate-legacy", action="store_true", help="配合 --init 和 --config 显式迁移旧模型的兼容扩散权重；不加载 SAM、输入输出头或优化器。")
     parser.add_argument("--device", type=str, default=None, help="例如 cuda、cuda:0、cpu。")
     parser.add_argument(
         "--seed",
@@ -151,6 +152,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.resume is not None and args.init is not None:
         parser.error("--resume 与 --init 不能同时使用")
+    if args.migrate_legacy and (args.init is None or args.config is None or args.resume is not None):
+        parser.error("--migrate-legacy 必须同时指定 --init 和 --config，不能用于 --resume")
 
     # 必须在 ExperimentLogger / engine（及其模型）构造前设置 torch 线程数。
     thread_metadata = _apply_thread_settings(args.cpu_threads, args.interop_threads)
@@ -194,8 +197,13 @@ def _run_training(parser, args, config, preloaded, engine, experiment) -> None:
     resume_epoch = 0
 
     if args.init is not None:
-        if preloaded is not None and args.config is None:
-            engine.load_models_from_payload(preloaded, include_ref=True)
+        if getattr(args, "migrate_legacy", False):
+            from diffpeak.inference import load_compatible_weights
+            report = load_compatible_weights(engine.models, read_checkpoint(args.init))
+            experiment.event("legacy_migration", checkpoint=args.init, report=report)
+            print(f"旧权重迁移报告：{report}", flush=True)
+        elif preloaded is not None and args.config is None:
+            engine.load_models_from_payload(preloaded, include_ref=False)
             print(f"已从 {args.init} 初始化模型权重（不含优化器状态）", flush=True)
             preloaded = None
         else:

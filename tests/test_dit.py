@@ -1,4 +1,8 @@
-"""条件 DiT 的形状、条件/时间步语义与梯度检查点测试。"""
+"""条件 DiT 的形状、条件/时间步语义与梯度检查点测试。
+
+新协议使用单通道有符号山脊场：``in_channels`` / ``out_channels`` 默认且
+推荐为 1。
+"""
 
 from __future__ import annotations
 
@@ -43,8 +47,8 @@ def _conditions(
 
 def _small_model(**overrides) -> ConditionalDiT:
     config = dict(
-        in_channels=2,
-        out_channels=2,
+        in_channels=1,
+        out_channels=1,
         hidden_size=32,
         depth=2,
         num_heads=4,
@@ -77,11 +81,11 @@ def _warm_up(model: ConditionalDiT) -> ConditionalDiT:
 
 
 class DiTConfigurationTest(unittest.TestCase):
-    def test_defaults_match_practical_256_heatmap_configuration(self) -> None:
+    def test_defaults_match_single_channel_256_heatmap_configuration(self) -> None:
         model = ConditionalDiT()
 
-        self.assertEqual(model.in_channels, 2)
-        self.assertEqual(model.out_channels, 2)
+        self.assertEqual(model.in_channels, 1)
+        self.assertEqual(model.out_channels, 1)
         self.assertEqual(model.hidden_size, 256)
         self.assertEqual(model.depth, 6)
         self.assertEqual(model.num_heads, 8)
@@ -103,6 +107,7 @@ class DiTConfigurationTest(unittest.TestCase):
             "three_scales": dict(condition_channels=(4, 8, 16)),
             "zero_condition_channel": dict(condition_channels=(4, 8, 16, 0)),
             "zero_in_channels": dict(in_channels=0),
+            "zero_out_channels": dict(out_channels=0),
             "heads_do_not_divide": dict(hidden_size=32, num_heads=3),
         }
         for name, overrides in cases.items():
@@ -114,7 +119,7 @@ class DiTConfigurationTest(unittest.TestCase):
         model = ConditionalDiT().eval()
         # 20x36 不是 8 的整数倍：覆盖默认配置下的补零/裁剪路径。
         height, width = 20, 36
-        x = torch.randn(1, 2, height, width)
+        x = torch.randn(1, 1, height, width)
         conditions = [
             torch.randn(1, channel, h, w)
             for channel, (h, w) in zip(
@@ -125,7 +130,7 @@ class DiTConfigurationTest(unittest.TestCase):
         with torch.no_grad():
             output = model(x, torch.tensor([0]), conditions)
 
-        self.assertEqual(tuple(output.shape), (1, 2, height, width))
+        self.assertEqual(tuple(output.shape), (1, 1, height, width))
         self.assertTrue(torch.isfinite(output).all())
 
 
@@ -136,7 +141,7 @@ class DiTForwardTest(unittest.TestCase):
     def test_forward_shape_and_zero_initialized_output(self) -> None:
         model = _small_model().eval()
         height, width = 16, 20
-        x = torch.randn(2, 2, height, width)
+        x = torch.randn(2, 1, height, width)
         conditions = _conditions(2, height, width)
 
         with torch.no_grad():
@@ -150,15 +155,15 @@ class DiTForwardTest(unittest.TestCase):
         model = _small_model().eval()
         for height, width in ((18, 26), (1, 3), (4, 4), (13, 7)):
             with self.subTest(height=height, width=width):
-                x = torch.randn(1, 2, height, width)
+                x = torch.randn(1, 1, height, width)
                 with torch.no_grad():
                     output = model(x, 3, _conditions(1, height, width))
-                self.assertEqual(tuple(output.shape), (1, 2, height, width))
+                self.assertEqual(tuple(output.shape), (1, 1, height, width))
                 self.assertTrue(torch.isfinite(output).all())
 
     def test_accepts_scalar_and_per_sample_timesteps(self) -> None:
         model = _warm_up(_small_model()).eval()
-        x = torch.randn(2, 2, 8, 12)
+        x = torch.randn(2, 1, 8, 12)
         conditions = _conditions(2, 8, 12)
 
         with torch.no_grad():
@@ -176,13 +181,13 @@ class DiTForwardTest(unittest.TestCase):
 
     def test_invalid_inputs_raise(self) -> None:
         model = _small_model().eval()
-        x = torch.randn(2, 2, 16, 16)
+        x = torch.randn(2, 1, 16, 16)
         conditions = _conditions(2, 16, 16)
 
         with self.assertRaises(ValueError):
-            model(torch.randn(2, 2, 16), 0, conditions)
+            model(torch.randn(2, 1, 16), 0, conditions)
         with self.assertRaises(ValueError):
-            model(torch.randn(2, 1, 16, 16), 0, conditions)
+            model(torch.randn(2, 2, 16, 16), 0, conditions)
         with self.assertRaises(ValueError):
             model(x, 0, conditions[:3])
         with self.assertRaises(ValueError):
@@ -198,7 +203,7 @@ class DiTForwardTest(unittest.TestCase):
 
     def test_non_tensor_condition_raises_type_error(self) -> None:
         model = _small_model().eval()
-        x = torch.randn(1, 2, 8, 8)
+        x = torch.randn(1, 1, 8, 8)
         conditions = _conditions(1, 8, 8)
 
         with self.assertRaises(TypeError):
@@ -208,7 +213,7 @@ class DiTForwardTest(unittest.TestCase):
 
     def test_condition_scales_influence_output_after_zero_head_warmup(self) -> None:
         model = _warm_up(_small_model()).eval()
-        x = torch.randn(2, 2, 16, 16)
+        x = torch.randn(2, 1, 16, 16)
         timestep = torch.tensor([2, 8])
         conditions = _conditions(2, 16, 16)
 
@@ -225,7 +230,7 @@ class DiTForwardTest(unittest.TestCase):
 
     def test_timestep_influences_output_after_zero_head_warmup(self) -> None:
         model = _warm_up(_small_model()).eval()
-        x = torch.randn(2, 2, 16, 16)
+        x = torch.randn(2, 1, 16, 16)
         conditions = _conditions(2, 16, 16)
 
         with torch.no_grad():
@@ -241,7 +246,7 @@ class DiTForwardTest(unittest.TestCase):
     def test_attention_dropout_is_zero_in_training_mode(self) -> None:
         model = _warm_up(_small_model()).train()
         self.assertEqual(model.blocks[0].attn.attention_dropout, 0.0)
-        x = torch.randn(1, 2, 8, 8)
+        x = torch.randn(1, 1, 8, 8)
         conditions = _conditions(1, 8, 8)
 
         first = model(x, 1, conditions)
@@ -256,7 +261,7 @@ class DiTBackwardTest(unittest.TestCase):
 
     def test_forward_backward_updates_all_major_components(self) -> None:
         model = _warm_up(_small_model()).train()
-        x = torch.randn(2, 2, 16, 16, requires_grad=True)
+        x = torch.randn(2, 1, 16, 16, requires_grad=True)
         conditions = _conditions(2, 16, 16)
 
         output = model(x, torch.tensor([1, 6]), conditions)
@@ -289,7 +294,7 @@ class DiTBackwardTest(unittest.TestCase):
     def test_gradient_checkpointing_eval_with_detached_inputs(self) -> None:
         """GRPO 场景：eval + 梯度开启 + x/条件均 detach，参数仍需梯度。"""
         model = _warm_up(_small_model(gradient_checkpointing=True)).eval()
-        x = torch.randn(2, 2, 16, 16)
+        x = torch.randn(2, 1, 16, 16)
         conditions = _conditions(2, 16, 16)
         self.assertFalse(x.requires_grad)
         self.assertTrue(all(not condition.requires_grad for condition in conditions))
@@ -313,7 +318,7 @@ class DiTBackwardTest(unittest.TestCase):
 
     def test_gradient_checkpointing_skipped_under_no_grad(self) -> None:
         model = _small_model(gradient_checkpointing=True).eval()
-        x = torch.randn(1, 2, 8, 8)
+        x = torch.randn(1, 1, 8, 8)
 
         with torch.no_grad():
             output = model(x, 0, _conditions(1, 8, 8))

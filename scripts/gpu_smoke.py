@@ -1,4 +1,4 @@
-"""RTX 3050 小型 GPU smoke test（阶段 B 与阶段 D）。
+"""RTX 3050 GPU smoke test for ABC supervision and diffusion-only D.
 
 只依赖 ``torch`` 与 ``diffpeak`` 的 models/losses 模块；不导入 inference/engine，
 不加载 SAM 权重（用随机低分辨率与两级高分辨率张量模拟 SAM2 图像特征），
@@ -8,14 +8,16 @@
 
     conda run -n pytorch python scripts/gpu_smoke.py
 
-阶段 B：128x128 输入 -> ConditionEncoder 多尺度条件 -> ConditionalDiT +
-GaussianDiffusion.training_losses + auxiliary_loss，AMP float16 + GradScaler
+ABC：128x128 输入 -> ConditionEncoder 多尺度条件 -> ConditionalDiT +
+GaussianDiffusion.training_losses（单通道有符号山脊场 + valid_mask +
+field_regions）+ auxiliary_loss(valid_sizes=...)，AMP float16 + GradScaler
 前向/反向，检查损失、梯度有限且参数确实更新。
 
-阶段 D：DiT eval、条件 detach，固定 CUDA generator 采样 G=2 轨迹
-（timesteps=32, steps=4），检查记录 dtype、逐步重算 log-prob 的 ratio≈1，
-再用组内奖励 [0.4, 0.6] 走真实的 ``diffpeak.grpo`` 优势/裁剪/KL 工具，
-做 GRPO + KL + 扩散 anchor 组合反向，检查梯度有限、参数更新。
+D：DiT eval、条件 detach，固定 CUDA generator 采样 G=2 条扩散轨迹
+（timesteps=32, steps=4），检查原始高斯动作、记录 dtype、逐步重算 log-prob
+的 ratio≈1，再用组内奖励 [0.4, 0.6] 走真实的 ``diffpeak.grpo`` 优势/裁剪/KL
+工具，做 GRPO + KL + 扩散 anchor 组合反向，检查梯度有限、参数更新。该阶段
+没有终端 Bernoulli 策略或参考 SAM 解码器。
 
 另有一组纯张量检查覆盖 GRPO 工具的多图组（``[G, B]`` 按列独立标准化）、
 常量组（零优势、策略项零梯度）与裁剪边界；不绘制任何图表。
@@ -53,6 +55,7 @@ from diffpeak.models.sam import SAM2ImageFeatures  # noqa: E402
 
 DEVICE = torch.device("cuda")
 IMAGE_SIZE = 128
+HEATMAP_SIZE = IMAGE_SIZE // 4
 EMBED_SIZE = 8
 BATCH = 1
 GROUP = 2
@@ -66,6 +69,8 @@ DIT_DEPTH = 2
 DIT_NUM_HEADS = 4
 DIT_MLP_RATIO = 4.0
 DIT_CONDITION_CHANNELS = (64, 128, 256, 256)
+# 山脊场四区域：中心线邻域、其余道路、边界外窄带、远端背景。
+REGION_COUNT = 4
 
 
 def autocast():
@@ -110,7 +115,12 @@ def grad_stats(params: Sequence[torch.nn.Parameter]) -> Dict[str, Any]:
 
 
 def build_targets() -> Dict[str, torch.Tensor]:
-    """构造含细线的原始 128x128 掩码；热图池化到 32x32，道路/骨架保留原分辨率。"""
+    """构造单通道有符号山脊场、有效掩码与四区域标签。
+
+    128x128 掩码/骨架用于辅助监督；场与区域按 ``adaptive_max_pool2d`` 降到
+    32x32 潜变量分辨率，与 ``diffusion.sample`` 的潜变量空间一致。中心线为
+    +1，道路内部为 +0.5，有效背景为 -1；四个区域互斥。
+    """
     yy, xx = torch.meshgrid(
         torch.arange(IMAGE_SIZE, device=DEVICE),
         torch.arange(IMAGE_SIZE, device=DEVICE),
@@ -118,21 +128,52 @@ def build_targets() -> Dict[str, torch.Tensor]:
     )
     horizontal = (yy == 64) & (xx >= 8) & (xx < 120)
     diagonal = (yy == xx) & (xx >= 16) & (xx < 112)
-    skeleton = (horizontal | diagonal).to(torch.float32).view(1, 1, IMAGE_SIZE, IMAGE_SIZE)
+    skeleton = (horizontal | diagonal).to(torch.float32).view(
+        1, 1, IMAGE_SIZE, IMAGE_SIZE
+    )
     # 3x3 max pooling 得到约 3 像素宽的道路区域，细线骨架单独保留。
-    road = F.max_pool2d(skeleton, kernel_size=3, stride=1, padding=1).clamp(0.0, 1.0)
+    road = F.max_pool2d(skeleton, kernel_size=3, stride=1, padding=1).clamp(
+        0.0, 1.0
+    )
 
-    heatmaps = torch.cat([skeleton, road * 0.5], dim=1)
-    # 与 diffusion.sample 的潜变量空间（conditions[0] 的 32x32）保持一致；
-    # 128x128 仅用于辅助头的原始分辨率监督。
-    heatmaps = F.adaptive_max_pool2d(
-        heatmaps, (IMAGE_SIZE // 4, IMAGE_SIZE // 4)
+    skeleton_low = F.adaptive_max_pool2d(
+        skeleton, (HEATMAP_SIZE, HEATMAP_SIZE)
     )
-    assert list(heatmaps.shape) == [BATCH, 2, IMAGE_SIZE // 4, IMAGE_SIZE // 4], tuple(
-        heatmaps.shape
+    road_low = F.adaptive_max_pool2d(road, (HEATMAP_SIZE, HEATMAP_SIZE))
+    center = (skeleton_low > 0.5).squeeze(1)
+    is_road = (road_low > 0.5).squeeze(1)
+    road_interior = is_road & ~center
+    dilated_road = F.max_pool2d(
+        is_road.to(torch.float32).unsqueeze(1),
+        kernel_size=3, stride=1, padding=1,
+    ).squeeze(1) > 0.5
+    boundary_band = dilated_road & ~is_road
+    far_background = ~(center | road_interior | boundary_band)
+
+    field = torch.full(
+        (BATCH, 1, HEATMAP_SIZE, HEATMAP_SIZE), -1.0, device=DEVICE
     )
+    field = torch.where(
+        road_interior.unsqueeze(1), torch.full_like(field, 0.5), field
+    )
+    field = torch.where(
+        center.unsqueeze(1), torch.ones_like(field), field
+    )
+    valid_mask = torch.ones_like(field)
+    regions = torch.stack(
+        (center, road_interior, boundary_band, far_background), dim=1
+    ).to(torch.float32)
+    assert list(field.shape) == [BATCH, 1, HEATMAP_SIZE, HEATMAP_SIZE], tuple(
+        field.shape
+    )
+    assert list(regions.shape) == [
+        BATCH, REGION_COUNT, HEATMAP_SIZE, HEATMAP_SIZE,
+    ], tuple(regions.shape)
+    assert float((regions.sum(dim=1) - 1.0).abs().max()) == 0.0
     return {
-        "heatmaps": heatmaps,
+        "heatmaps": field,
+        "field_valid_mask": valid_mask,
+        "field_regions": regions,
         "road": road,
         "skeleton": skeleton,
     }
@@ -180,7 +221,7 @@ def grpo_utility_checks() -> Dict[str, Any]:
     )
 
     # KL 工具：相同均值为 0；逐元素差 1 时为 0.5 * 动作维元素数，且梯度非零。
-    kl_mean = torch.zeros(2, 2, 4, 4, dtype=torch.float64, requires_grad=True)
+    kl_mean = torch.zeros(2, 1, 4, 4, dtype=torch.float64, requires_grad=True)
     kl_std = torch.ones_like(kl_mean)
     identical_kl = gaussian_kl_divergence(
         kl_mean, kl_mean.detach().clone(), kl_std
@@ -188,7 +229,7 @@ def grpo_utility_checks() -> Dict[str, Any]:
     assert torch.equal(identical_kl, torch.zeros(2, dtype=torch.float64))
     kl_reference = torch.ones_like(kl_mean)
     kl = gaussian_kl_divergence(kl_mean, kl_reference, kl_std)
-    torch.testing.assert_close(kl, torch.full((2,), 16.0, dtype=torch.float64))
+    torch.testing.assert_close(kl, torch.full((2,), 8.0, dtype=torch.float64))
     kl_grad = torch.autograd.grad(kl.mean(), kl_mean)[0]
     assert bool(torch.isfinite(kl_grad).all()) and float(kl_grad.abs().max()) > 0.0
 
@@ -209,7 +250,7 @@ def grpo_utility_checks() -> Dict[str, Any]:
     }
 
 
-def phase_b(
+def phase_abc(
     encoder: ConditionEncoder,
     dit: ConditionalDiT,
     diffusion: GaussianDiffusion,
@@ -217,7 +258,7 @@ def phase_b(
     embedding: SAM2ImageFeatures,
     targets: Dict[str, torch.Tensor],
 ) -> Dict[str, Any]:
-    """阶段 B：条件编码 + 扩散/热图/辅助损失 + AMP 反向与参数更新。"""
+    """ABC：条件编码 + 单通道场/扩散/辅助损失 + AMP 反向与参数更新。"""
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
 
@@ -226,46 +267,69 @@ def phase_b(
     params = list(encoder.parameters()) + list(dit.parameters())
     optimizer = torch.optim.Adam(params, lr=2e-3)
     scaler = torch.amp.GradScaler("cuda")
+    valid_sizes = [(IMAGE_SIZE, IMAGE_SIZE)] * BATCH
 
     with autocast():
         conditions, aux_logits = encoder(images, embedding)
-        losses = diffusion.training_losses(dit, conditions, targets["heatmaps"])
-        aux = auxiliary_loss(aux_logits, targets["road"], targets["skeleton"])
+        losses = diffusion.training_losses(
+            dit,
+            conditions,
+            targets["heatmaps"],
+            valid_mask=targets["field_valid_mask"],
+            field_regions=targets["field_regions"],
+        )
+        aux = auxiliary_loss(
+            aux_logits, targets["road"], targets["skeleton"],
+            valid_sizes=valid_sizes,
+        )
         total = losses["diff"] + losses["heat"] + 0.5 * aux
 
     condition_shapes = [list(c.shape) for c in conditions]
     assert condition_shapes == [
-        [BATCH, 64, 32, 32],
-        [BATCH, 128, 16, 16],
-        [BATCH, 256, 8, 8],
-        [BATCH, 256, 4, 4],
+        [BATCH, 64, HEATMAP_SIZE, HEATMAP_SIZE],
+        [BATCH, 128, HEATMAP_SIZE // 2, HEATMAP_SIZE // 2],
+        [BATCH, 256, HEATMAP_SIZE // 4, HEATMAP_SIZE // 4],
+        [BATCH, 256, HEATMAP_SIZE // 8, HEATMAP_SIZE // 8],
     ], f"条件形状不符合预期: {condition_shapes}"
-    assert list(aux_logits.shape) == [BATCH, 2, 32, 32], tuple(aux_logits.shape)
+    assert list(aux_logits.shape) == [BATCH, 2, HEATMAP_SIZE, HEATMAP_SIZE], (
+        tuple(aux_logits.shape)
+    )
+    assert list(targets["heatmaps"].shape) == [
+        BATCH, 1, HEATMAP_SIZE, HEATMAP_SIZE,
+    ], tuple(targets["heatmaps"].shape)
+    assert list(targets["field_valid_mask"].shape) == [
+        BATCH, 1, HEATMAP_SIZE, HEATMAP_SIZE,
+    ], tuple(targets["field_valid_mask"].shape)
+    assert list(targets["field_regions"].shape) == [
+        BATCH, REGION_COUNT, HEATMAP_SIZE, HEATMAP_SIZE,
+    ], tuple(targets["field_regions"].shape)
     assert all_finite([*conditions, aux_logits]), "条件特征或辅助 logits 出现非有限值"
-    assert all_finite([losses["diff"], losses["heat"], aux, total]), "阶段 B 损失非有限"
-    assert total.requires_grad, "阶段 B 总损失未连接计算图"
+    assert all_finite([losses["diff"], losses["heat"], aux, total]), "ABC 损失非有限"
+    assert total.requires_grad, "ABC 总损失未连接计算图"
 
     before = snapshot(params)
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(total.float()).backward()
     scaler.unscale_(optimizer)
     stats = grad_stats(params)
-    assert stats["missing"] == 0, f"阶段 B 有 {stats['missing']} 个参数没有梯度"
-    assert stats["nonfinite"] == 0, f"阶段 B 有 {stats['nonfinite']} 个参数梯度非有限"
-    assert stats["global_norm"] > 0.0, "阶段 B 梯度范数为 0"
+    assert stats["missing"] == 0, f"ABC 有 {stats['missing']} 个参数没有梯度"
+    assert stats["nonfinite"] == 0, f"ABC 有 {stats['nonfinite']} 个参数梯度非有限"
+    assert stats["global_norm"] > 0.0, "ABC 梯度范数为 0"
 
     scaler.step(optimizer)
     scaler.update()
     changed = changed_elements(before, params)
     finite_after = all_finite(params)
-    assert finite_after, "阶段 B 更新后参数出现非有限值"
-    assert changed > 0, "阶段 B 参数没有更新"
+    assert finite_after, "ABC 更新后参数出现非有限值"
+    assert changed > 0, "ABC 参数没有更新"
 
     elapsed = time.perf_counter() - started
     peak = torch.cuda.max_memory_allocated()
     return {
         "condition_shapes": condition_shapes,
-        "target_heatmap_shape": list(targets["heatmaps"].shape),
+        "target_field_shape": list(targets["heatmaps"].shape),
+        "field_valid_mask_shape": list(targets["field_valid_mask"].shape),
+        "field_regions_shape": list(targets["field_regions"].shape),
         "latent_shape": list(conditions[0].shape),
         "aux_logits_shape": list(aux_logits.shape),
         "losses": {
@@ -292,7 +356,7 @@ def phase_d(
     embedding: SAM2ImageFeatures,
     targets: Dict[str, torch.Tensor],
 ) -> Dict[str, Any]:
-    """阶段 D：eval DiT、detach 条件、记录式采样、重算与策略梯度反向。"""
+    """D：eval DiT、detach 条件、记录式采样、重算与扩散策略梯度反向。"""
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
 
@@ -303,7 +367,7 @@ def phase_d(
     conditions = [c.detach().expand(GROUP, *c.shape[1:]) for c in conditions]
     # diffusion.sample 从 conditions[0] 推断潜变量边长；128 输入经 4x 下采样为 32。
     latent_size = int(conditions[0].shape[-1])
-    assert latent_size == IMAGE_SIZE // 4, latent_size
+    assert latent_size == HEATMAP_SIZE, latent_size
 
     dit.eval()
     assert dit.gradient_checkpointing, "D 阶段要求 gradient_checkpointing=True"
@@ -317,11 +381,11 @@ def phase_d(
             dit, conditions, generator=generator, record=True
         )
 
-    assert list(heatmaps.shape) == [GROUP, 2, latent_size, latent_size], tuple(
+    assert list(heatmaps.shape) == [GROUP, 1, latent_size, latent_size], tuple(
         heatmaps.shape
     )
-    assert torch.isfinite(heatmaps).all(), "采样热图非有限"
-    assert float(heatmaps.min()) >= 0.0 and float(heatmaps.max()) <= 1.0
+    assert torch.isfinite(heatmaps).all(), "采样场非有限"
+    assert float(heatmaps.min()) >= -1.0 and float(heatmaps.max()) <= 1.0
     assert len(records) == SAMPLING_STEPS, f"记录步数 {len(records)} != {SAMPLING_STEPS}"
 
     record_shapes = []
@@ -333,7 +397,8 @@ def phase_d(
         assert state.dtype == torch.float32, state.dtype
         assert action.dtype == torch.float32, action.dtype
         assert old_log_prob.dtype == torch.float64, old_log_prob.dtype
-        assert list(state.shape) == [GROUP, 2, latent_size, latent_size]
+        assert list(state.shape) == [GROUP, 1, latent_size, latent_size]
+        assert list(action.shape) == [GROUP, 1, latent_size, latent_size]
         assert list(old_log_prob.shape) == [GROUP]
         assert bool(torch.isfinite(state).all()) and bool(torch.isfinite(action).all())
         assert bool(torch.isfinite(old_log_prob).all())
@@ -426,7 +491,7 @@ def phase_d(
 
         grpo_loss = grpo_policy_loss(ratio, advantages, clip_epsilon)
 
-        # 与 engine._grpo_update 相同的同方差高斯 KL 工具：动作维求和后取组均值。
+        # 与 engine/joint_rl 相同的同方差高斯 KL 工具：动作维求和后取组均值。
         kl = gaussian_kl_divergence(mean, ref_mean, std).mean()
 
         # 单独验证 GRPO 梯度与 KL 梯度都能到达动作均值。
@@ -441,10 +506,16 @@ def phase_d(
         kl_values.append(float(kl.detach()))
         policy_kl_loss = policy_kl_loss + (grpo_loss + 0.01 * kl) / total_terms
 
-    # 扩散 anchor：与 engine 的 _grpo_update 一致，只用噪声 MSE。
+    # 扩散 anchor：与 engine 的 D 锚定一致，只用噪声 MSE，并传有效掩码/区域。
+    anchor_valid = targets["field_valid_mask"].expand(GROUP, -1, -1, -1)
+    anchor_regions = targets["field_regions"].expand(GROUP, -1, -1, -1)
     with autocast():
         anchor_losses = diffusion.training_losses(
-            dit, conditions, targets["heatmaps"].expand(GROUP, -1, -1, -1)
+            dit,
+            conditions,
+            targets["heatmaps"].expand(GROUP, -1, -1, -1),
+            valid_mask=anchor_valid,
+            field_regions=anchor_regions,
         )
     anchor = 0.1 * anchor_losses["diff"]
     combined = (policy_kl_loss + anchor.double()).float()
@@ -483,7 +554,7 @@ def phase_d(
         "record_dtypes": record_shapes[0],
         "sample_generator": "cpu manual_seed(%d)" % SEED,
         "sample_reproducible_max_abs_diff": repeat_diff,
-        "heatmap_range": [round(float(heatmaps.min()), 4), round(float(heatmaps.max()), 4)],
+        "field_range": [round(float(heatmaps.min()), 4), round(float(heatmaps.max()), 4)],
         "logprob_ratio_max_abs_error": max_ratio_error,
         "group_rewards": group_rewards.reshape(-1).tolist(),
         "grpo_advantages": advantages.tolist(),
@@ -500,6 +571,7 @@ def phase_d(
         "kl_reference": "deepcopy(dit) + 1e-4 合成扰动，仅用于打通 KL 梯度路径",
         "anchor_diff": round(float(anchor_losses["diff"].detach()), 6),
         "combined_loss": round(float(combined.detach()), 6),
+        "terminal_policy": None,
         "gradients": stats,
         "changed_elements": changed,
         "params_finite_after_step": finite_after,
@@ -559,11 +631,13 @@ def main() -> None:
         heatmap_size=IMAGE_SIZE,
     ).to(DEVICE)
 
-    phase_b_result = phase_b(encoder, dit, diffusion, images, embedding, targets)
-    phase_d_result = phase_d(encoder, dit, diffusion, images, embedding, targets)
+    abc_result = phase_abc(encoder, dit, diffusion, images, embedding, targets)
+    d_result = phase_d(encoder, dit, diffusion, images, embedding, targets)
 
     elapsed = time.perf_counter() - started
-    peak_mib = max(phase_b_result["peak_allocated_mib"], phase_d_result["peak_allocated_mib"])
+    peak_mib = max(
+        abc_result["peak_allocated_mib"], d_result["peak_allocated_mib"]
+    )
     result = {
         "passed": True,
         "command": "conda run -n pytorch python scripts/gpu_smoke.py",
@@ -580,10 +654,14 @@ def main() -> None:
                 "low_res": list(embedding.low_res.shape),
                 "high_res": [list(level.shape) for level in embedding.high_res],
             },
-            "heatmap_target_shape": list(targets["heatmaps"].shape),
+            "field_target_shape": list(targets["heatmaps"].shape),
+            "field_valid_mask_shape": list(targets["field_valid_mask"].shape),
+            "field_regions_shape": list(targets["field_regions"].shape),
             "aux_target_shape": list(targets["road"].shape),
             "denoiser": "ConditionalDiT",
             "dit": {
+                "in_channels": dit.in_channels,
+                "out_channels": dit.out_channels,
                 "patch_size": DIT_PATCH_SIZE,
                 "hidden_size": DIT_HIDDEN_SIZE,
                 "depth": DIT_DEPTH,
@@ -593,23 +671,27 @@ def main() -> None:
                 "gradient_checkpointing": dit.gradient_checkpointing,
             },
             "amp": "cuda autocast float16 + GradScaler",
-            "diffusion": {"timesteps": TIMESTEPS, "sampling_steps": SAMPLING_STEPS},
+            "diffusion": {
+                "timesteps": TIMESTEPS,
+                "sampling_steps": SAMPLING_STEPS,
+                "latent_channels": diffusion.latent_channels,
+            },
             "phase_d_group_size": GROUP,
         },
         "grpo_utility_checks": utility_checks,
-        "phase_b": phase_b_result,
-        "phase_d": phase_d_result,
+        "phase_abc": abc_result,
+        "phase_d": d_result,
         "memory": {
-            "phase_b_peak_allocated_mib": phase_b_result["peak_allocated_mib"],
-            "phase_d_peak_allocated_mib": phase_d_result["peak_allocated_mib"],
+            "phase_abc_peak_allocated_mib": abc_result["peak_allocated_mib"],
+            "phase_d_peak_allocated_mib": d_result["peak_allocated_mib"],
             "max_memory_allocated_mib": peak_mib,
             "max_memory_reserved_mib": mib(torch.cuda.max_memory_reserved()),
             "device_total_memory_mib": device_total_mib,
             "peak_fraction_of_device": round(peak_mib / device_total_mib, 4),
         },
         "timings_sec": {
-            "phase_b": phase_b_result["seconds"],
-            "phase_d": phase_d_result["seconds"],
+            "phase_abc": abc_result["seconds"],
+            "phase_d": d_result["seconds"],
             "total": round(elapsed, 3),
         },
     }

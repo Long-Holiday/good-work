@@ -1,12 +1,18 @@
-"""条件高斯扩散与 DDIM 随机转移。
+"""单通道有符号道路山脊场的条件高斯扩散与 DDIM 随机转移。
 
 该模块同时服务于：
-- 扩散预训练：``training_losses`` 返回扩散损失与热图重建损失；
-- GRPO 采样与重算：``sample`` 记录每步状态、动作和旧策略对数概率，
-  ``transition`` / ``log_prob`` 用于更新时重新计算概率。
 
-热图映射只使用固定仿射变换 ``z0 = 2H - 1`` 与 ``H = clip((z0 + 1) / 2)``，
-不做任何逐图 min-max 归一化或通道间 Softmax。
+- 扩散预训练：``training_losses`` 返回扩散损失与山脊场重建损失；
+- GRPO 采样与重算：``sample`` 记录每步状态、**原始高斯动作**和旧策略对数
+  概率，``transition`` / ``log_prob`` 用于更新时重新计算概率。
+
+新协议直接在有符号目标场 ``[-1, 1]`` 上扩散：
+
+- 不使用旧的 ``[0, 1] -> [-1, 1]`` 仿射目标变换，也不在采样后做逆变换；
+- 带噪状态 ``z_t`` 不限制在 ``[-1, 1]``，最终采样场在输出时裁剪到
+  ``[-1, 1]``；裁剪发生在记录动作之后，因此 GRPO 始终以原始高斯样本计算
+  轨迹概率；
+- 不再使用依赖旧背景语义的采样均值补偿（背景先验）。
 """
 
 from __future__ import annotations
@@ -15,14 +21,13 @@ import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
 
 Timestep = Union[int, Tensor]
 
 
 class GaussianDiffusion(nn.Module):
-    """双通道热图上的条件扩散过程。
+    """单通道有符号山脊场上的条件扩散过程。
 
     Args:
         timesteps: 训练时使用的扩散步数，默认 1000。
@@ -34,13 +39,11 @@ class GaussianDiffusion(nn.Module):
         beta_end: 线性 beta 调度终点。
         eta: DDIM 随机性系数；0 表示均值采用确定性 DDIM，仅由 ``min_std``
             提供策略方差。
-        latent_channels: 热图潜变量通道数，默认 2。
+        latent_channels: 潜变量通道数；单通道协议固定为 1。
         heatmap_size: 期望的热图边长元数据；``sample`` 的实际尺寸由
             ``conditions[0]`` 推断。
-        heat_loss_max_timestep: 热图重建损失参与的最大时间步（不含）。
-            默认使用前一半时间步。
-        peak_threshold: 构造峰值邻域掩码的热图阈值。
-        peak_loss_weight: 峰值邻域损失在热图重建损失中的权重。
+        heat_loss_max_timestep: 山脊场重建损失参与的最大时间步（不含）。
+            默认使用前一半时间步；高噪声时间步的重建不稳定。
     """
 
     def __init__(
@@ -51,11 +54,9 @@ class GaussianDiffusion(nn.Module):
         beta_start: float = 1e-4,
         beta_end: float = 0.02,
         eta: float = 0.0,
-        latent_channels: int = 2,
+        latent_channels: int = 1,
         heatmap_size: int = 256,
         heat_loss_max_timestep: Optional[int] = None,
-        peak_threshold: float = 0.1,
-        peak_loss_weight: float = 0.5,
     ) -> None:
         super().__init__()
         if timesteps <= 0:
@@ -68,20 +69,28 @@ class GaussianDiffusion(nn.Module):
             raise ValueError("eta 必须是 [0, 1] 内的有限数")
         if not (0.0 < beta_start <= beta_end < 1.0):
             raise ValueError("beta 必须满足 0 < beta_start <= beta_end < 1")
+        if int(latent_channels) != 1:
+            raise ValueError(
+                "单通道山脊场协议要求 latent_channels=1，"
+                f"实际为 {latent_channels!r}"
+            )
 
         self.timesteps = int(timesteps)
         self.sampling_steps = int(sampling_steps)
         self.min_std = float(min_std)
         self.eta = float(eta)
-        self.latent_channels = int(latent_channels)
+        self.latent_channels = 1
         self.heatmap_size = int(heatmap_size)
-        self.peak_threshold = float(peak_threshold)
-        self.peak_loss_weight = float(peak_loss_weight)
         self.heat_loss_max_timestep = (
             self.timesteps // 2
             if heat_loss_max_timestep is None
             else int(heat_loss_max_timestep)
         )
+        if not 0 <= self.heat_loss_max_timestep <= self.timesteps:
+            raise ValueError(
+                "heat_loss_max_timestep 必须在 [0, timesteps] 内，"
+                f"实际为 {self.heat_loss_max_timestep}"
+            )
 
         betas = torch.linspace(beta_start, beta_end, self.timesteps, dtype=torch.float32)
         alphas = 1.0 - betas
@@ -97,7 +106,7 @@ class GaussianDiffusion(nn.Module):
 
         # DDIM 的 current 端点从 timesteps-1 递减到 0，保留 sampling_steps
         # 个；末尾追加 -1 表示 alpha_bar=1 的干净端点。若仍以 0 结尾，最后
-        # 一步只走到 t=0，采样结果不会成为干净热图。
+        # 一步只走到 t=0，采样结果不会成为干净场。
         #
         # sampling_steps=timesteps 时直接使用完整序列，避免 linspace 中出现
         # 重复时间步；其余情况取 sampling_steps+1 等分点的前
@@ -142,6 +151,74 @@ class GaussianDiffusion(nn.Module):
         values = buffer.to(device=timesteps.device).gather(0, index)
         return values.reshape(values.shape[0], *([1] * (len(shape) - 1)))
 
+    @staticmethod
+    def _prepare_valid_mask(
+        valid_mask: Optional[Tensor], reference: Tensor
+    ) -> Tensor:
+        """把有效区域掩码校验并整理为 ``B x 1 x H x W`` 的 bool 张量。
+
+        接受 ``B x H x W`` 或 ``B x 1 x H x W``；``None`` 表示全部有效。
+        非零值视为有效，padding 为零。
+        """
+        batch, _, height, width = reference.shape
+        if valid_mask is None:
+            return torch.ones(
+                (batch, 1, height, width), dtype=torch.bool, device=reference.device
+            )
+        if not torch.is_tensor(valid_mask):
+            raise TypeError(f"valid_mask 必须是张量，实际为 {type(valid_mask)!r}")
+        mask = valid_mask
+        if mask.ndim == 3:
+            mask = mask.unsqueeze(1)
+        if mask.ndim != 4:
+            raise ValueError(
+                "valid_mask 应为 B x 1 x H x W 或 B x H x W，"
+                f"实际为 {tuple(mask.shape)}"
+            )
+        if int(mask.shape[0]) != batch or tuple(mask.shape[-2:]) != (height, width):
+            raise ValueError(
+                "valid_mask 的批次/空间尺寸必须与目标场一致："
+                f"{tuple(mask.shape)} vs {(batch, height, width)}"
+            )
+        if int(mask.shape[1]) != 1:
+            raise ValueError(
+                f"valid_mask 通道数必须为 1，实际为 {int(mask.shape[1])}"
+            )
+        return (mask > 0).to(device=reference.device)
+
+    @staticmethod
+    def _prepare_field_regions(
+        field_regions: Optional[Tensor], target: Tensor
+    ) -> Tensor:
+        """把四个互斥区域整理为 ``B x R x H x W`` 的 bool 张量。
+
+        调用方缺失区域时使用 ``target > 0`` / ``target <= 0`` 两个区域作为
+        兜底，避免大面积 ``-1`` 背景主导场重建损失。
+        """
+        batch, _, height, width = target.shape
+        if field_regions is None:
+            positive = target > 0
+            return torch.cat((positive, ~positive), dim=1)
+        if not torch.is_tensor(field_regions):
+            raise TypeError(
+                f"field_regions 必须是张量，实际为 {type(field_regions)!r}"
+            )
+        if field_regions.ndim != 4:
+            raise ValueError(
+                "field_regions 应为 B x 4 x H x W，"
+                f"实际为 {tuple(field_regions.shape)}"
+            )
+        if (
+            int(field_regions.shape[0]) != batch
+            or int(field_regions.shape[1]) != 4
+            or tuple(field_regions.shape[-2:]) != (height, width)
+        ):
+            raise ValueError(
+                "field_regions 必须为 B x 4 x H x W 且与目标场对齐，"
+                f"实际为 {tuple(field_regions.shape)}"
+            )
+        return (field_regions > 0).to(device=target.device)
+
     def _predict_eps_and_x0(
         self,
         dit: nn.Module,
@@ -149,7 +226,7 @@ class GaussianDiffusion(nn.Module):
         timestep: Tensor,
         conditions: Sequence[Tensor],
     ) -> Tuple[Tensor, Tensor, Tensor]:
-        """由去噪器预测噪声，并恢复 ``[-1, 1]`` 范围的干净热图潜变量。"""
+        """由去噪器预测噪声，并恢复 ``[-1, 1]`` 范围的有符号干净场。"""
         # 去噪网络可由 autocast 加速；高维随机动作和转移系数保留 float32。
         state = state.float()
         eps = dit(state, timestep, conditions).float()
@@ -176,38 +253,102 @@ class GaussianDiffusion(nn.Module):
     # ------------------------------------------------------------------
     # 训练损失
     # ------------------------------------------------------------------
+    def _field_loss(
+        self,
+        prediction: Tensor,
+        target: Tensor,
+        valid_mask: Tensor,
+        field_regions: Optional[Tensor] = None,
+        sample_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        """按四个互斥区域分别归一化的有符号场重建损失。
+
+        每个区域先在该区域有效像素上取均方误差，再对存在（非空）的区域取
+        平均；缺失区域跳过，避免除零。有效掩码为零的样本不参与损失。
+
+        Args:
+            prediction: ``B x 1 x H x W`` 的预测场。
+            target: 同形状的目标场，范围 ``[-1, 1]``。
+            valid_mask: ``B x 1 x H x W`` 的 bool 有效区域掩码。
+            field_regions: ``B x 4 x H x W`` 的互斥区域；``None`` 时回退到
+                目标符号的两区域平衡。
+            sample_mask: 可选的 ``B`` 样本权重（例如时间步筛选）；``None``
+                表示全部样本参与。
+        """
+        batch = int(prediction.shape[0])
+        regions = self._prepare_field_regions(field_regions, target)
+        valid = valid_mask.to(device=prediction.device, dtype=prediction.dtype)
+        error = (prediction - target) ** 2
+        region_masks = regions.to(prediction.dtype) * valid
+        counts = region_masks.sum(dim=(2, 3))
+        # error 为 B x 1 x H x W，region_masks 为 B x R x H x W，
+        # 广播后按区域求和。
+        sums = (error * region_masks).sum(dim=(2, 3))
+        per_region = sums / counts.clamp_min(1.0)
+        present = counts > 0
+        per_sample = (per_region * present.to(prediction.dtype)).sum(dim=1) / (
+            present.sum(dim=1).clamp_min(1)
+        )
+
+        sample_valid = present.any(dim=1) & valid.reshape(batch, -1).any(dim=1)
+        if sample_mask is not None:
+            if not torch.is_tensor(sample_mask):
+                raise TypeError(
+                    f"sample_mask 必须是张量，实际为 {type(sample_mask)!r}"
+                )
+            weights = sample_mask.to(device=prediction.device).reshape(-1)
+            if weights.numel() != batch:
+                raise ValueError(
+                    f"sample_mask 长度 {weights.numel()} 与 batch {batch} 不一致"
+                )
+            sample_valid = sample_valid & weights.bool()
+
+        weight = sample_valid.to(prediction.dtype)
+        return (per_sample * weight).sum() / weight.sum().clamp_min(1.0)
+
     def training_losses(
         self,
         dit: nn.Module,
         conditions: Sequence[Tensor],
         target_heatmaps: Tensor,
         return_prediction: bool = False,
+        valid_mask: Optional[Tensor] = None,
+        field_regions: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
-        """计算扩散损失与热图重建损失。
+        """计算扩散损失与单通道山脊场重建损失。
 
         Args:
             dit: 条件去噪器（默认 DiT）。
             conditions: 四个尺度的条件特征。
-            target_heatmaps: 目标双通道热图 ``B x 2 x 256 x 256``，范围 ``[0, 1]``。
+            target_heatmaps: 目标有符号场 ``B x 1 x H x W``，范围 ``[-1, 1]``；
+                直接作为扩散目标，不做仿射变换。
             return_prediction: 为 ``True`` 时在返回值中加入 ``"heat_pred"``，
-                即由当前去噪器恢复的 ``[0, 1]`` 热图。该张量保留计算图，可直接
-                作为可微密集提示送入冻结的 SAM 提示编码器（联合 ABC 训练）。
+                即由当前去噪器恢复的 ``[-1, 1]`` 有符号场。该张量保留计算图，
+                可直接作为可微密集提示送入冻结的 SAM 提示编码器。
+            valid_mask: 可选的有效区域掩码 ``B x 1 x H x W`` 或 ``B x H x W``；
+                扩散 MSE 只在有效像素上平均，padding 不参与。
+            field_regions: 可选的 ``B x 4 x H x W`` 互斥区域，用于平衡场重建
+                损失；缺失区域跳过。未提供时按目标符号做两区域兜底。
 
         Returns:
-            ``{"diff": 扩散 MSE, "heat": 热图重建损失}``；当
+            ``{"diff": 扩散 MSE, "heat": 场重建损失}``；当
             ``return_prediction=True`` 时额外包含 ``"heat_pred"``。
         """
-        if target_heatmaps.ndim != 4 or target_heatmaps.shape[1] != 2:
+        if target_heatmaps.ndim != 4 or target_heatmaps.shape[1] != self.latent_channels:
             raise ValueError(
-                f"target_heatmaps 应为 B x 2 x H x W，实际为 {tuple(target_heatmaps.shape)}"
+                "target_heatmaps 应为 B x 1 x H x W 的有符号场，"
+                f"实际为 {tuple(target_heatmaps.shape)}"
             )
         batch_size = target_heatmaps.shape[0]
         device = target_heatmaps.device
         dtype = target_heatmaps.dtype
+        valid = self._prepare_valid_mask(valid_mask, target_heatmaps)
+        valid_float = valid.to(dtype)
 
         t = torch.randint(0, self.timesteps, (batch_size,), device=device)
         noise = torch.randn_like(target_heatmaps)
-        z0 = target_heatmaps * 2.0 - 1.0
+        # 目标已经是有符号场：直接扩散，不做 [0, 1] -> [-1, 1] 变换。
+        z0 = target_heatmaps
         alpha_bar = self._extract(self.alphas_cumprod, t, z0.shape).to(dtype)
         sqrt_alpha_bar = self._extract(self.sqrt_alphas_cumprod, t, z0.shape).to(dtype)
         sqrt_one_minus = self._extract(
@@ -216,35 +357,24 @@ class GaussianDiffusion(nn.Module):
         z_t = sqrt_alpha_bar * z0 + sqrt_one_minus * noise
 
         eps_pred = dit(z_t, t, conditions)
-        diff_loss = F.mse_loss(eps_pred, noise)
-
-        # 固定仿射恢复干净热图，不做 min-max。
-        x0_pred = (z_t - (1.0 - alpha_bar).clamp_min(0).sqrt() * eps_pred) / alpha_bar.sqrt().clamp_min(
-            1e-12
-        )
-        heat_pred = ((x0_pred + 1.0) * 0.5).clamp(0.0, 1.0)
-
-        error = (heat_pred - target_heatmaps) ** 2
-        peak_mask = (target_heatmaps > self.peak_threshold).to(dtype)
-        background_mask = 1.0 - peak_mask
-
-        reduce_dims = (1, 2, 3)
-        peak_count = peak_mask.sum(dim=reduce_dims)
-        background_count = background_mask.sum(dim=reduce_dims)
-        peak_loss = (error * peak_mask).sum(dim=reduce_dims) / peak_count.clamp_min(1.0)
-        background_loss = (error * background_mask).sum(dim=reduce_dims) / background_count.clamp_min(
+        squared_error = (eps_pred - noise) ** 2
+        valid_broadcast = valid_float.expand_as(squared_error)
+        diff_loss = (squared_error * valid_broadcast).sum() / valid_broadcast.sum().clamp_min(
             1.0
         )
-        weighted = (
-            self.peak_loss_weight * peak_loss
-            + (1.0 - self.peak_loss_weight) * background_loss
-        )
-        # 无峰样本（例如无道路影像）只使用背景损失，避免峰值项稀释。
-        per_sample_heat = torch.where(peak_count > 0, weighted, background_loss)
 
-        # 高噪声时间步的重建不稳定，只在前一半时间步监督热图。
-        time_weight = (t < self.heat_loss_max_timestep).to(per_sample_heat.dtype)
-        heat_loss = (per_sample_heat * time_weight).sum() / time_weight.sum().clamp_min(1.0)
+        x0_pred = (z_t - sqrt_one_minus * eps_pred) / sqrt_alpha_bar.clamp_min(1e-12)
+        heat_pred = x0_pred.clamp(-1.0, 1.0)
+
+        # 高噪声时间步的重建不稳定，只在前一半时间步监督山脊场。
+        time_mask = t < self.heat_loss_max_timestep
+        heat_loss = self._field_loss(
+            heat_pred,
+            target_heatmaps,
+            valid,
+            field_regions=field_regions,
+            sample_mask=time_mask,
+        )
 
         losses = {"diff": diff_loss, "heat": heat_loss}
         if return_prediction:
@@ -266,7 +396,7 @@ class GaussianDiffusion(nn.Module):
 
         Args:
             dit: 条件去噪器（默认 DiT）。
-            state: 当前带噪热图 ``z_t``。
+            state: 当前带噪场 ``z_t``，不限制在 ``[-1, 1]``。
             timestep: 当前时间步 ``t``（标量或长度 B 的张量）。
             previous_timestep: 上一时间步；允许 -1，此时视为 ``alpha_bar=1``。
             conditions: 四个尺度的条件特征。
@@ -320,8 +450,8 @@ class GaussianDiffusion(nn.Module):
     def log_prob(self, action: Tensor, mean: Tensor, std: Tensor) -> Tensor:
         """计算逐样本高斯对数概率，并对所有动作维度求和（不取平均）。
 
-        使用 float64 计算，避免 2x256x256 维动作求和时的数值误差。返回值形状
-        为 ``B``；若输入无 batch 维则返回标量。
+        使用 float64 计算，避免单通道 256x256 维动作求和时的数值误差。返回值
+        形状为 ``B``；若输入无 batch 维则返回标量。
         """
         action64 = action.to(torch.float64)
         mean64 = mean.to(torch.float64)
@@ -356,16 +486,13 @@ class GaussianDiffusion(nn.Module):
         batch_size, _, height, width = reference.shape
         device, dtype = reference.device, torch.float32
 
+        # 从纯噪声开始；新协议没有背景均值补偿。
         state = self._randn(
             (batch_size, self.latent_channels, height, width), device, dtype, generator
         )
         records: List[Dict[str, Any]] = []
         # 调度表是静态的，转成 Python 列表可避免每步 GPU 同步。
         schedule = self.sampling_schedule.tolist()
-        # 稀疏热图的背景 H=0 对应 z0=-1。非零终端 SNR 下，固定补偿
-        # 其残留均值；保持单位噪声方差，与全量配对验证的采样协议一致。
-        # 这是采样先验的背景近似，不使用目标标签，B/C/D 与推理统一启用。
-        state = state - self.alphas_cumprod[schedule[0]].to(device=device, dtype=dtype).sqrt()
 
         for index in range(self.sampling_steps):
             current = int(schedule[index])
@@ -379,6 +506,7 @@ class GaussianDiffusion(nn.Module):
 
             if record:
                 old_log_prob = self.log_prob(action, mean, std)
+                # 记录**裁剪前**的原始高斯动作；终端裁剪只影响返回场。
                 records.append(
                     {
                         "state": state.detach().to("cpu"),
@@ -390,7 +518,8 @@ class GaussianDiffusion(nn.Module):
                 )
             state = action
 
-        heatmaps = ((state + 1.0) * 0.5).clamp(0.0, 1.0)
+        # 单通道有符号场：只做范围裁剪，不做 [−1, 1] -> [0, 1] 逆变换。
+        heatmaps = state.clamp(-1.0, 1.0)
         if record:
             return heatmaps, records
         return heatmaps
@@ -402,7 +531,7 @@ class GaussianDiffusion(nn.Module):
         generator: Optional[torch.Generator] = None,
         record: bool = False,
     ) -> Union[Tensor, Tuple[Tensor, List[Dict[str, Any]]]]:
-        """DDIM 随机采样双通道热图（不构建计算图）。
+        """DDIM 随机采样单通道有符号场（不构建计算图）。
 
         Args:
             dit: 条件去噪器（默认 DiT）。
@@ -411,13 +540,14 @@ class GaussianDiffusion(nn.Module):
             record: 是否记录每步的 GRPO 轨迹信息。
 
         Returns:
-            ``record=False`` 时返回 ``B x 2 x 256 x 256`` 热图；
-            ``record=True`` 时返回 ``(heatmaps, records)``。records 中每项包含
-            ``state``、``action``、``timestep``、``previous_timestep``、
-            ``old_log_prob``，其中张量均已移到 CPU 以节省显存。
+            ``record=False`` 时返回 ``B x 1 x H x W`` 的有符号场，范围
+            ``[-1, 1]``；``record=True`` 时返回 ``(heatmaps, records)``。records
+            中每项包含 ``state``、``action``、``timestep``、
+            ``previous_timestep``、``old_log_prob``，其中张量均已移到 CPU 以
+            节省显存。``action`` 是终端裁剪前的原始高斯样本。
 
             采样从 ``timesteps-1`` 开始，最后一步的 ``previous_timestep`` 为
-            ``-1``，因此返回的热图对应 ``alpha_bar=1`` 的干净端点；末步仍会
+            ``-1``，因此返回的场对应 ``alpha_bar=1`` 的干净端点；末步仍会
             加入 ``min_std`` 的策略探索噪声，符合 GRPO 的非零方差要求。
         """
         with torch.no_grad():
@@ -432,7 +562,7 @@ class GaussianDiffusion(nn.Module):
     ) -> Union[Tensor, Tuple[Tensor, List[Dict[str, Any]]]]:
         """与 :meth:`sample` 完全相同的 DDIM 采样，但保留计算图。
 
-        用于联合 ABC 端到端训练：采样热图作为冻结 SAM 提示编码器的可微密集
+        用于联合 ABC 端到端训练：采样场作为冻结 SAM 提示编码器的可微密集
         输入，梯度可以经冻结的提示编码器回传到 DiT 与条件编码器。除不包裹
         ``torch.no_grad()`` 外，随机数消耗、调度和返回值与 :meth:`sample`
         逐位一致；固定 ``generator`` 时两者输出相同。

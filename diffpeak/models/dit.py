@@ -1,6 +1,6 @@
 """条件 DiT（Diffusion Transformer）去噪器。
 
-``forward(x, t, conditions)`` 接收双通道热图潜变量、
+``forward(x, t, conditions)`` 接收单通道有符号山脊场潜变量、
 时间步与四个尺度的条件特征，返回同形状的噪声预测。
 
 架构要点：
@@ -218,8 +218,8 @@ class ConditionalDiT(nn.Module):
     """四尺度条件 Transformer 去噪器。
 
     Args:
-        in_channels: 热图潜变量通道数，默认 2。
-        out_channels: 噪声预测通道数，默认 2。
+        in_channels: 山脊场潜变量通道数，默认 1（单通道有符号场）。
+        out_channels: 噪声预测通道数，默认 1。
         hidden_size: Transformer 宽度，默认 256。
         depth: Transformer block 数量，默认 6。
         num_heads: 注意力头数，默认 8（须整除 ``hidden_size``）。
@@ -237,8 +237,8 @@ class ConditionalDiT(nn.Module):
 
     def __init__(
         self,
-        in_channels: int = 2,
-        out_channels: int = 2,
+        in_channels: int = 1,
+        out_channels: int = 1,
         hidden_size: int = 256,
         depth: int = 6,
         num_heads: int = 8,
@@ -407,7 +407,7 @@ class ConditionalDiT(nn.Module):
         """预测噪声。
 
         Args:
-            x: 带噪热图 ``B x in_channels x H x W``，支持任意矩形尺寸。
+            x: 带噪有符号场 ``B x in_channels x H x W``，支持任意矩形尺寸。
             t: 时间步，标量或长度 B 的张量。
             conditions: 四个尺度的条件特征；空间尺寸任意，会双线性对齐。
 

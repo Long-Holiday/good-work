@@ -248,6 +248,21 @@ class AuxiliaryLossTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertGreaterEqual(float(loss.item()), 0.0)
 
+    def test_auxiliary_padding_has_no_loss_or_gradient(self) -> None:
+        logits = torch.randn(1, 2, 4, 4, requires_grad=True)
+        target = torch.zeros(1, 1, 16, 16)
+        target[:, :, :8, 2:4] = 1
+        loss = auxiliary_loss(logits, target, target, valid_sizes=[(8, 8)])
+        perturbed = logits.detach().clone()
+        perturbed[:, :, 2:, :] = 100
+        perturbed[:, :, :, 2:] = -100
+        other = auxiliary_loss(perturbed, target, target, valid_sizes=[(8, 8)])
+        torch.testing.assert_close(loss, other)
+        loss.backward()
+        self.assertEqual(float(logits.grad[:, :, 2:, :].abs().sum()), 0)
+        self.assertEqual(float(logits.grad[:, :, :, 2:].abs().sum()), 0)
+        self.assertGreater(float(logits.grad[:, :, :2, :2].abs().sum()), 0)
+
     def test_auxiliary_loss_requires_two_outputs(self) -> None:
         with self.assertRaises(ValueError):
             auxiliary_loss((torch.zeros(1, 1, 4, 4),), torch.zeros(1, 8, 8), torch.zeros(1, 8, 8))

@@ -56,6 +56,8 @@ class _DummySAM(nn.Module):
 
 def _tiny_dit(**overrides: Any) -> ConditionalDiT:
     kwargs = {
+        "in_channels": 1,
+        "out_channels": 1,
         "patch_size": 4,
         "hidden_size": 32,
         "depth": 1,
@@ -170,13 +172,21 @@ class BuildModelsTest(unittest.TestCase):
 
 class LegacyCheckpointTest(unittest.TestCase):
     def _payload(self, dit_state: Mapping[str, Any]) -> dict:
+        # 协议元数据必须齐全，否则会在进入模块键检查前被
+        # validate_checkpoint_protocol 拒绝（该行为由推理协议测试覆盖）。
         return {
+            "format_version": 5,
+            "training_protocol": "signed_ridge_v1",
+            "target_representation": "signed_ridge_v1",
+            "latent_channels": 1,
+            "sam_frozen": True,
+            "prompt": {"scale": 1.0, "terminal_mapping": "clamp"},
             "models": {
                 "sam": {},
                 "condition_encoder": {},
                 "dit": dict(dit_state),
                 "diffusion": {},
-            }
+            },
         }
 
     def _targets(self) -> dict:
@@ -223,7 +233,7 @@ class DiffusionIntegrationTest(unittest.TestCase):
             timesteps=8, sampling_steps=2, heatmap_size=16
         )
         conditions = _tiny_conditions()
-        target = torch.rand(2, 2, 16, 16)
+        target = torch.rand(2, 1, 16, 16) * 2.0 - 1.0
 
         losses = diffusion.training_losses(denoiser, conditions, target)
         self.assertEqual(set(losses), {"diff", "heat"})
@@ -233,9 +243,9 @@ class DiffusionIntegrationTest(unittest.TestCase):
 
         with torch.no_grad():
             heatmaps = diffusion.sample(denoiser, conditions)
-        self.assertEqual(tuple(heatmaps.shape), (2, 2, 16, 16))
+        self.assertEqual(tuple(heatmaps.shape), (2, 1, 16, 16))
         self.assertTrue(torch.isfinite(heatmaps).all())
-        self.assertGreaterEqual(float(heatmaps.min()), 0.0)
+        self.assertGreaterEqual(float(heatmaps.min()), -1.0)
         self.assertLessEqual(float(heatmaps.max()), 1.0)
 
 

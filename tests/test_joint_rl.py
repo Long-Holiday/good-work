@@ -1,16 +1,17 @@
-"""联合 ABC GRPO 的轻量单元/集成测试。
+"""扩散轨迹 GRPO（冻结 SAM、确定性评分）的单元/集成测试。
 
 测试不加载 SAM2 或 DeepGlobe 数据，只用微型条件编码器、DiT、扩散替身和
-可微密集热图解码器验证：
+可微密集热图解码器验证新协议：
 
-* Bernoulli 终端对数概率/KL 只对有效像素求和且使用 float64；
-* 采样动作的生成器设备语义与可复现性；
-* 联合组同时训练 condition_encoder、DiT 与 SAM mask decoder；
-* 同一组相对优势同时驱动扩散转移与终端 Bernoulli 策略；
-* 扩散项按 G*T*B、终端项按 G*B 归一，每轮只 step 一次；
+* 公共 API 只保留 ``joint_grpo_group``，不再导出 Bernoulli/终端采样；
+* 终端评分是确定性阈值 ``sigmoid(logits) >= threshold``，无 Bernoulli 动作；
+* 同一图像的 G 条扩散轨迹构成一组，优势逐图计算；
+* 只有 condition_encoder 与 DiT 收到梯度；SAM 被防御性冻结并保持 eval；
+* 参考 KL 只使用参考条件编码器与参考 DiT，不需要参考 SAM 解码器；
+* 固定路径奖励采样：每张图/每个候选使用稳定的 ``RewardConfig.seed``；
+* 扩散项按 ``G*T*B`` 归一，每轮只 step 一次，重放前 ratio 恰为 1；
 * 常量组在无 KL/anchor 时完全跳过 backward/optimizer；
-* 终端热图 detach、参考 mask decoder 冻结、参考条件只编码一次；
-* 密集提示的奖励点计数为 0，不产生稀疏点惩罚。
+* 记录中不再包含 ``terminal_grpo``/``terminal_kl``。
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -30,21 +32,55 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from diffpeak.engine import DiffPeakEngine  # noqa: E402
-from diffpeak.joint_rl import (  # noqa: E402
-    _sample_terminal_actions,
-    bernoulli_kl_divergence,
-    bernoulli_log_prob,
-    joint_grpo_group,
-)
+import diffpeak.joint_rl as joint_rl  # noqa: E402
+from diffpeak.inference import compute_image_metrics, stable_seed  # noqa: E402
+from diffpeak.joint_rl import joint_grpo_group  # noqa: E402
 from diffpeak.rewards import RewardConfig  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# 微型模型
+# 引擎替身
+# ---------------------------------------------------------------------------
+class _EngineHarness:
+    """只实现 joint_rl 依赖的引擎方法，避免耦合正在重构的 engine 模块。"""
+
+    def _trainable_parameters(self):
+        parameters = []
+        seen = set()
+        for module in (self.sam, self.condition_encoder, self.dit):
+            for parameter in module.parameters():
+                if id(parameter) in seen:
+                    continue
+                seen.add(id(parameter))
+                if parameter.requires_grad:
+                    parameters.append(parameter)
+        return parameters
+
+    @staticmethod
+    def _active_group_mask(reward_tensor):
+        if reward_tensor.ndim != 2:
+            raise ValueError("reward_tensor 必须是 [G, B]")
+        return reward_tensor.amax(dim=0) > reward_tensor.amin(dim=0)
+
+    def _optimizer_step(self) -> bool:
+        parameters = [
+            p for p in self._trainable_parameters() if p.grad is not None
+        ]
+        if parameters and self.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(parameters, self.grad_clip)
+        self.optimizer.step()
+        self.scaler.update()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.scheduler.step()
+        self.global_step += 1
+        return True
+
+
+# ---------------------------------------------------------------------------
+# 微型模型（单通道有符号场）
 # ---------------------------------------------------------------------------
 class _TinyDecoder(nn.Module):
-    def __init__(self, weight: float = 2.0, bias: float = 0.0) -> None:
+    def __init__(self, weight: float = 4.0, bias: float = 0.0) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.tensor(float(weight)))
         self.bias = nn.Parameter(torch.tensor(float(bias)))
@@ -53,10 +89,10 @@ class _TinyDecoder(nn.Module):
 class _TinySam(nn.Module):
     """提供 encode 与可微 decode_heatmaps 的最小 SAM 替身。"""
 
-    def __init__(self, decoder_weight: float = 2.0, decoder_bias: float = 0.0) -> None:
+    def __init__(self, decoder_weight: float = 4.0, decoder_bias: float = 0.0) -> None:
         super().__init__()
-        # 冻结的图像编码器参数：联合训练不应修改它。
-        self.encoder_scale = nn.Parameter(torch.tensor(1.0), requires_grad=False)
+        # 冻结的图像编码器参数：任何阶段都不应被更新。
+        self.encoder_scale = nn.Parameter(torch.tensor(1.0))
         self.decoder = _TinyDecoder(decoder_weight, decoder_bias)
         self.encode_calls = 0
         self.decode_calls: list[dict[str, object]] = []
@@ -71,7 +107,6 @@ class _TinySam(nn.Module):
         heatmaps: torch.Tensor,
         output_size=(4, 4),
         valid_sizes=None,
-        *,
         decoder: nn.Module | None = None,
     ) -> torch.Tensor:
         module = self.decoder if decoder is None else decoder
@@ -80,17 +115,17 @@ class _TinySam(nn.Module):
                 "decoder": module,
                 "uses_reference": decoder is not None,
                 "heatmaps_requires_grad": bool(heatmaps.requires_grad),
+                "heatmap_channels": int(heatmaps.shape[1]),
                 "heatmap_sum": float(heatmaps.detach().double().sum().cpu()),
                 "grad_enabled": torch.is_grad_enabled(),
                 "valid_sizes": valid_sizes,
             }
         )
-        signed = heatmaps[:, 0:1] - heatmaps[:, 1:2]
-        logits = signed * module.weight + module.bias
+        # 新协议：单通道有符号山脊场直接作为密集提示。
+        dense_mask = heatmaps[:, 0:1]
+        logits = dense_mask * module.weight + module.bias
         if tuple(logits.shape[-2:]) != tuple(output_size):
-            logits = F.interpolate(
-                logits, size=tuple(output_size), mode="nearest"
-            )
+            logits = F.interpolate(logits, size=tuple(output_size), mode="nearest")
         return logits
 
 
@@ -107,21 +142,14 @@ class _TinyConditionEncoder(nn.Module):
         batch_size = int(images.shape[0])
         base = torch.ones(
             batch_size,
-            2,
+            1,
             self.height,
             self.width,
             device=images.device,
             dtype=images.dtype,
         )
         condition = base * self.weight
-        auxiliary = torch.zeros(
-            batch_size,
-            2,
-            self.height,
-            self.width,
-            device=images.device,
-            dtype=images.dtype,
-        )
+        auxiliary = torch.zeros_like(condition)
         return [condition, condition * 0.5, condition * 0.25, condition * 0.125], auxiliary
 
 
@@ -141,20 +169,19 @@ class _TinyDiffusion:
         self.sample_seeds: list[int | None] = []
         self.transitions: list[dict[str, object]] = []
 
-    def _heat(self, batch_size: int, height: int, width: int, device) -> torch.Tensor:
-        # 非恒定模式交替 on/off，保证两条轨迹奖励不同。
+    def _field(self, batch_size: int, height: int, width: int, device) -> torch.Tensor:
+        # 非恒定模式交替 +1/-1 的有符号场，保证两条候选奖励不同。
         if self.constant:
             on = True
         else:
             on = self.sample_calls % 2 == 0
-        positive = torch.full(
+        value = 1.0 if on else -1.0
+        return torch.full(
             (batch_size, 1, height, width),
-            1.0 if on else 0.0,
+            value,
             device=device,
             dtype=torch.float32,
         )
-        negative = torch.zeros_like(positive)
-        return torch.cat([positive, negative], dim=1)
 
     def sample(self, dit, conditions, generator=None, record: bool = False):
         self.sample_seeds.append(
@@ -166,8 +193,9 @@ class _TinyDiffusion:
             int(conditions[0].shape[2]),
             int(conditions[0].shape[3]),
         )
-        heatmaps = self._heat(batch_size, height, width, conditions[0].device)
-        state = heatmaps * 2.0 - 1.0
+        heatmaps = self._field(batch_size, height, width, conditions[0].device)
+        # 新协议直接在有符号场域扩散，不再做 [0,1] <-> [-1,1] 变换。
+        state = heatmaps
         records: list[dict[str, object]] = []
         for timestep in range(self.steps, 0, -1):
             mean, std = self.transition(
@@ -265,13 +293,20 @@ def _make_engine(
     update_epochs: int = 1,
     group_size: int = 2,
     steps: int = 2,
-) -> DiffPeakEngine:
-    engine = object.__new__(DiffPeakEngine)
+    threshold: float = 0.5,
+    decoder_weight: float = 4.0,
+    decoder_bias: float = 0.0,
+    freeze_sam: bool = True,
+    ref_sam_decoder: str = "absent",
+    reward_config: RewardConfig | None = None,
+) -> _EngineHarness:
+    engine = _EngineHarness()
     engine.device = torch.device("cpu")
     engine.amp = False
     engine.image_size = 4
     engine.heatmap_size = 4
     engine.seed = 1234
+    engine.threshold = float(threshold)
     engine.group_size = int(group_size)
     engine.ppo_clip = 0.2
     engine.kl_weight = float(kl_weight)
@@ -281,22 +316,27 @@ def _make_engine(
     engine.grad_clip = 0.0
     engine.global_step = 0
     engine.grpo_groups_processed = 0
-    engine.point_cost_warmup_steps = 0
     engine._stage = "D"
-    engine.reward_config = RewardConfig(
+    engine.reward_config = reward_config or RewardConfig(
         iou_weight=0.5, cldice_weight=0.5, path_weight=0.0
     )
 
-    engine.sam = _TinySam(decoder_weight=2.0, decoder_bias=0.0)
+    engine.sam = _TinySam(decoder_weight=decoder_weight, decoder_bias=decoder_bias)
+    if freeze_sam:
+        _freeze(engine.sam)
     engine.condition_encoder = _TinyConditionEncoder(0.5)
     engine.dit = _TinyDit(1.0)
-    engine.ref_dit = _freeze(copy.deepcopy(engine.dit))
-    engine.ref_condition_encoder = _freeze(copy.deepcopy(engine.condition_encoder))
-    engine.ref_sam_decoder = _freeze(copy.deepcopy(engine.sam.decoder))
-    # 参考解码器与当前策略不同，终端 KL 才有非零信号。
+    # 参考 DiT 与当前策略不同，KL 才有非零信号。
+    engine.ref_dit = copy.deepcopy(engine.dit)
     with torch.no_grad():
-        engine.ref_sam_decoder.weight.fill_(1.0)
-        engine.ref_sam_decoder.bias.fill_(0.0)
+        engine.ref_dit.weight.fill_(2.0)
+    _freeze(engine.ref_dit)
+    engine.ref_condition_encoder = _freeze(copy.deepcopy(engine.condition_encoder))
+    engine.ref_sam_decoder = (
+        _freeze(copy.deepcopy(engine.sam.decoder))
+        if ref_sam_decoder == "present"
+        else None
+    )
 
     engine.diffusion = _TinyDiffusion(steps=steps, constant=constant)
     engine.optimizer = torch.optim.AdamW(
@@ -324,112 +364,111 @@ def _batch(batch_size: int = 1, valid_sizes=None) -> dict[str, object]:
         "image": images,
         "mask": mask,
         "skeleton": torch.zeros_like(mask),
-        "heatmaps": torch.zeros(batch_size, 2, 4, 4),
+        "heatmaps": torch.full((batch_size, 1, 4, 4), -1.0),
         "valid_sizes": list(valid_sizes),
         "ids": [f"image-{index}" for index in range(batch_size)],
     }
 
 
-def _run_joint(engine, batch, epoch: int = 0):
-    """联合测试中固定终端动作为 logits 的硬阈值，消除采样偶然性。"""
-    with mock.patch(
-        "diffpeak.joint_rl._sample_terminal_actions",
-        side_effect=lambda logits, generator: logits > 0,
-    ):
-        return joint_grpo_group(engine, batch, epoch)
+def _fake_metrics(reward: float) -> dict[str, float]:
+    return {
+        "reward": reward,
+        "iou": reward,
+        "f1": reward,
+        "cldice": reward,
+        "path": 0.0,
+        "tp": 0.0,
+        "fp": 0.0,
+        "fn": 0.0,
+        "tn": 0.0,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Bernoulli 数学
+# 公共 API 与确定性阈值
 # ---------------------------------------------------------------------------
-class BernoulliMathTest(unittest.TestCase):
-    def test_log_prob_sums_only_valid_pixels_in_float64(self) -> None:
-        logits = torch.zeros(1, 1, 4, 4)
-        actions = torch.zeros(1, 1, 4, 4, dtype=torch.bool)
+class DeterministicScoringTest(unittest.TestCase):
+    def test_public_api_only_exposes_joint_grpo_group(self) -> None:
+        self.assertEqual(joint_rl.__all__, ["joint_grpo_group"])
+        for removed in (
+            "bernoulli_log_prob",
+            "bernoulli_kl_divergence",
+            "_sample_terminal_actions",
+        ):
+            self.assertFalse(hasattr(joint_rl, removed), removed)
 
-        value = bernoulli_log_prob(logits, actions, [(2, 3)])
+    def test_threshold_predictions_are_inclusive_and_mask_padding(self) -> None:
+        logits = torch.tensor([[[[0.0, 1.0, -1.0]]]])
+        prediction = joint_rl._threshold_predictions(logits, 0.5, [(1, 3)])[0]
+        self.assertEqual(prediction.tolist(), [[True, True, False]])
+        self.assertEqual(prediction.dtype, np.bool_)
 
-        self.assertEqual(value.dtype, torch.float64)
-        self.assertAlmostEqual(float(value), 6.0 * math.log(0.5), places=12)
-
-        # padding 区的 logits 即使极端，也不得影响概率。
-        dirty = logits.clone()
-        dirty[:, :, 2:, :] = 1e4
-        dirty[:, :, :, 3:] = -1e4
-        self.assertAlmostEqual(
-            float(bernoulli_log_prob(dirty, actions, [(2, 3)])),
-            float(value),
-            places=12,
+        # padding 区的极端 logits 不进入有效区域。
+        dirty = torch.tensor([[[[0.0, 1.0, -1.0], [1e4, 1e4, 1e4]]]])
+        self.assertEqual(
+            joint_rl._threshold_predictions(dirty, 0.5, [(1, 3)])[0].tolist(),
+            [[True, True, False]],
         )
 
-        # 全动作下联合对数概率是逐像素和：2x3 区域各 6 个像素。
-        ones = torch.ones_like(actions)
-        self.assertAlmostEqual(
-            float(bernoulli_log_prob(logits, ones, [(2, 3)])),
-            6.0 * math.log(0.5),
-            places=12,
+    def test_segmentation_threshold_default_and_validation(self) -> None:
+        engine = _EngineHarness()
+        self.assertEqual(joint_rl._segmentation_threshold(engine), 0.5)
+        engine.threshold = 0.3
+        self.assertEqual(joint_rl._segmentation_threshold(engine), 0.3)
+        engine.threshold = 1.5
+        with self.assertRaises(ValueError):
+            joint_rl._segmentation_threshold(engine)
+
+    def test_decode_heatmaps_rejects_legacy_two_channel_prompts(self) -> None:
+        engine = _make_engine()
+        with self.assertRaises(ValueError):
+            joint_rl._decode_heatmaps(
+                engine,
+                torch.zeros(1, 1),
+                torch.zeros(1, 2, 4, 4),
+                (4, 4),
+                None,
+            )
+
+    def test_reward_uses_deterministic_threshold_not_bernoulli_sampling(self) -> None:
+        # logits 恰为 0 -> sigmoid = 0.5，>= 阈值 0.5 必须判为道路。
+        engine = _make_engine(
+            constant=True, decoder_weight=0.0, decoder_bias=0.0, threshold=0.5
         )
+        captured: list[np.ndarray] = []
 
-    def test_kl_is_masked_analytic_and_only_current_logits_get_grad(self) -> None:
-        logits = torch.full((1, 1, 4, 4), 0.5, requires_grad=True)
-        reference = torch.zeros(1, 1, 4, 4, requires_grad=True)
+        def spy(prediction, target, point_count, config):
+            captured.append(np.asarray(prediction).copy())
+            return compute_image_metrics(prediction, target, point_count, config)
 
-        value = bernoulli_kl_divergence(logits, reference, [(2, 2)])
-        self.assertEqual(value.dtype, torch.float64)
-        self.assertGreater(float(value.detach()), 0.0)
+        with mock.patch(
+            "diffpeak.joint_rl.compute_image_metrics", side_effect=spy
+        ):
+            joint_grpo_group(engine, _batch(1), 0)
 
-        # padding 区参考值变化不影响 KL。
-        dirty = reference.detach().clone()
-        dirty[:, :, 2:, :] = 1e4
-        dirty[:, :, :, 2:] = -1e4
-        self.assertAlmostEqual(
-            float(bernoulli_kl_divergence(logits, dirty, [(2, 2)]).detach()),
-            float(value.detach()),
-            places=12,
+        self.assertEqual(len(captured), 2)  # G=2 条轨迹
+        for prediction in captured:
+            self.assertEqual(prediction.shape, (3, 4))
+            self.assertTrue(bool(prediction.all()))
+
+        # 略低于阈值时必须全为背景。
+        engine = _make_engine(
+            constant=True, decoder_weight=0.0, decoder_bias=-0.5, threshold=0.5
         )
-
-        value.sum().backward()
-        self.assertIsNotNone(logits.grad)
-        self.assertIsNone(reference.grad)
-
-        # 相同分布 KL 为 0，且不会因舍入变成负数。
-        zeros = torch.zeros(1, 1, 4, 4)
-        self.assertGreaterEqual(
-            float(bernoulli_kl_divergence(zeros, zeros, [(2, 2)])), 0.0
-        )
-
-    def test_terminal_sampling_is_seeded_and_handles_cpu_generator(self) -> None:
-        logits = torch.zeros(3, 1, 5, 5)
-        generator_a = torch.Generator(device="cpu").manual_seed(99)
-        generator_b = torch.Generator(device="cpu").manual_seed(99)
-        generator_c = torch.Generator(device="cpu").manual_seed(100)
-
-        first = _sample_terminal_actions(logits, generator_a)
-        second = _sample_terminal_actions(logits, generator_b)
-        third = _sample_terminal_actions(logits, generator_c)
-
-        self.assertTrue(torch.equal(first, second))
-        self.assertFalse(torch.equal(first, third))
-        self.assertEqual(first.dtype, torch.bool)
-        self.assertEqual(tuple(first.shape), (3, 1, 5, 5))
-
-        always = _sample_terminal_actions(
-            torch.full((1, 1, 2, 2), 100.0),
-            torch.Generator(device="cpu").manual_seed(1),
-        )
-        never = _sample_terminal_actions(
-            torch.full((1, 1, 2, 2), -100.0),
-            torch.Generator(device="cpu").manual_seed(1),
-        )
-        self.assertTrue(bool(always.all()))
-        self.assertFalse(bool(never.any()))
+        captured.clear()
+        with mock.patch(
+            "diffpeak.joint_rl.compute_image_metrics", side_effect=spy
+        ):
+            joint_grpo_group(engine, _batch(1), 0)
+        for prediction in captured:
+            self.assertFalse(bool(prediction.any()))
 
 
 # ---------------------------------------------------------------------------
-# 联合组
+# 扩散组更新
 # ---------------------------------------------------------------------------
-class JointGroupTest(unittest.TestCase):
-    def test_active_group_trains_condition_dit_and_decoder(self) -> None:
+class DiffusionGroupTest(unittest.TestCase):
+    def test_active_group_trains_condition_and_dit_only(self) -> None:
         engine = _make_engine(constant=False, kl_weight=0.0, anchor_weight=0.0)
         batch = _batch(1)
         before = {
@@ -437,54 +476,82 @@ class JointGroupTest(unittest.TestCase):
             "dit": engine.dit.weight.detach().clone(),
             "decoder": engine.sam.decoder.weight.detach().clone(),
             "encoder": engine.sam.encoder_scale.detach().clone(),
-            "ref_decoder": engine.ref_sam_decoder.weight.detach().clone(),
             "ref_dit": engine.ref_dit.weight.detach().clone(),
+            "ref_condition": engine.ref_condition_encoder.weight.detach().clone(),
         }
 
-        record = _run_joint(engine, batch, epoch=0)
+        record = joint_grpo_group(engine, batch, epoch=0)
 
         self.assertEqual(record["updates"], 1.0)
         self.assertEqual(record["skipped_updates"], 0.0)
-        self.assertEqual(record["policy_terms"], 6.0)  # G*T + G
+        # G=2, T=2 -> 仅扩散项，共 4 项。
+        self.assertEqual(record["policy_terms"], 4.0)
         self.assertTrue(math.isfinite(record["grpo"]))
         self.assertTrue(math.isnan(record["kl"]))
         self.assertTrue(math.isnan(record["anchor"]))
         self.assertEqual(record["clip_fraction"], 0.0)
         self.assertEqual(record["logratio_abs_max"], 0.0)
-        self.assertEqual(record["point_count"], 0.0)
-        self.assertEqual(record["positive_point_count"], 0.0)
-        self.assertEqual(record["negative_point_count"], 0.0)
-        self.assertEqual(record["point_penalty"], 0.0)
         self.assertEqual(record["active_group_rate"], 1.0)
         self.assertEqual(engine.grpo_groups_processed, 1)
-        self.assertEqual(len(engine.scaler.losses), 6)  # G*(T+1)
+        self.assertEqual(len(engine.scaler.losses), 4)  # G*T
 
-        # 三个策略模块都收到非零更新；冻结编码器与参考模块保持不变。
+        # 终端 Bernoulli 策略日志已移除。
+        self.assertNotIn("terminal_grpo", record)
+        self.assertNotIn("terminal_kl", record)
+        self.assertNotIn("terminal_foreground_rate", record)
+        self.assertIn("prediction_foreground_rate", record)
+        self.assertIn("diffusion_grpo", record)
+        self.assertIn("diffusion_kl", record)
+
+        # 只有条件编码器与 DiT 被更新。
         self.assertFalse(
             torch.equal(before["condition"], engine.condition_encoder.weight.detach())
         )
         self.assertFalse(torch.equal(before["dit"], engine.dit.weight.detach()))
-        self.assertFalse(torch.equal(before["decoder"], engine.sam.decoder.weight.detach()))
-        self.assertTrue(torch.equal(before["encoder"], engine.sam.encoder_scale.detach()))
         self.assertTrue(
-            torch.equal(before["ref_decoder"], engine.ref_sam_decoder.weight.detach())
+            torch.equal(before["decoder"], engine.sam.decoder.weight.detach())
         )
-        self.assertTrue(torch.equal(before["ref_dit"], engine.ref_dit.weight.detach()))
+        self.assertTrue(
+            torch.equal(before["encoder"], engine.sam.encoder_scale.detach())
+        )
+        self.assertTrue(
+            torch.equal(before["ref_dit"], engine.ref_dit.weight.detach())
+        )
+        self.assertTrue(
+            torch.equal(
+                before["ref_condition"],
+                engine.ref_condition_encoder.weight.detach(),
+            )
+        )
 
-        # 每个扩散时间步都带梯度重算条件；rollout 的 transition 在 no_grad 中。
+        # SAM 防御性冻结：eval 且全部 requires_grad=False。
+        self.assertFalse(engine.sam.training)
+        self.assertTrue(
+            all(not p.requires_grad for p in engine.sam.parameters())
+        )
+
+        # rollout/no_grad 与 replay/带梯度条件各 G*T 次。
         replay = [row for row in engine.diffusion.transitions if row["grad_enabled"]]
-        rollout = [row for row in engine.diffusion.transitions if not row["grad_enabled"]]
-        self.assertEqual(len(replay), 4)  # G*T
-        self.assertEqual(len(rollout), 4)  # sample 内部同样调用 transition
+        rollout = [
+            row for row in engine.diffusion.transitions if not row["grad_enabled"]
+        ]
+        self.assertEqual(len(replay), 4)
+        self.assertEqual(len(rollout), 4)
         self.assertTrue(all(row["conditions_grad_fn"] for row in replay))
         self.assertTrue(all(not row["conditions_requires_grad"] for row in rollout))
         self.assertEqual(engine.condition_encoder.calls, 5)  # 1 rollout + G*T
 
-        # 终端热图不得带梯度；参考解码器只在 KL 开启时使用。
-        self.assertTrue(
-            all(not call["heatmaps_requires_grad"] for call in engine.sam.decode_calls)
-        )
-        self.assertFalse(any(call["uses_reference"] for call in engine.sam.decode_calls))
+        # 只在 rollout 阶段用冻结 SAM 做确定性评分；重放不再解码。
+        self.assertEqual(len(engine.sam.decode_calls), 2)  # G
+        for call in engine.sam.decode_calls:
+            self.assertFalse(call["uses_reference"])
+            self.assertFalse(call["heatmaps_requires_grad"])
+            self.assertFalse(call["grad_enabled"])
+            self.assertEqual(call["heatmap_channels"], 1)
+            self.assertEqual(call["valid_sizes"], [(3, 4)])
+        # 无 KL 时不编码参考条件。
+        self.assertEqual(engine.ref_condition_encoder.calls, 0)
+
         self.assertEqual(len(engine.diffusion.sample_seeds), 2)
         self.assertEqual(len(set(engine.diffusion.sample_seeds)), 2)
 
@@ -492,10 +559,47 @@ class JointGroupTest(unittest.TestCase):
             "reward", "iou", "f1", "cldice", "path", "reward_std",
             "reward_variance", "grpo", "kl", "anchor", "clip_fraction",
             "logratio_abs_mean", "logratio_abs_max", "updates",
-            "skipped_updates", "point_count", "point_penalty",
-            "quality_reward", "active_group_rate", "inactive_group_rate",
+            "skipped_updates", "quality_reward",
+            "active_group_rate", "inactive_group_rate",
         }
         self.assertTrue(expected_keys.issubset(record.keys()))
+        for removed in (
+            "point_count",
+            "positive_point_count",
+            "negative_point_count",
+            "point_penalty",
+            "point_cost",
+            "point_cost_scale",
+            "quality_reward_mean",
+        ):
+            self.assertNotIn(removed, record)
+
+    def test_only_condition_and_dit_receive_gradients(self) -> None:
+        engine = _make_engine(constant=False, freeze_sam=False)
+        engine.sam.train()  # 模拟残留的可训练状态
+        with torch.no_grad():
+            for parameter in engine.sam.parameters():
+                parameter.requires_grad_(True)
+
+        observed: dict[str, list[bool]] = {}
+        original_step = engine._optimizer_step
+
+        def step():
+            observed["condition"] = [
+                p.grad is not None for p in engine.condition_encoder.parameters()
+            ]
+            observed["dit"] = [p.grad is not None for p in engine.dit.parameters()]
+            observed["sam"] = [p.grad is not None for p in engine.sam.parameters()]
+            return original_step()
+
+        engine._optimizer_step = step  # type: ignore[method-assign]
+        joint_grpo_group(engine, _batch(1), 0)
+
+        self.assertTrue(any(observed["condition"]))
+        self.assertTrue(any(observed["dit"]))
+        self.assertFalse(any(observed["sam"]))
+        self.assertFalse(engine.sam.training)
+        self.assertTrue(all(not p.requires_grad for p in engine.sam.parameters()))
 
     def test_constant_group_without_kl_or_anchor_skips_everything(self) -> None:
         engine = _make_engine(
@@ -506,7 +610,7 @@ class JointGroupTest(unittest.TestCase):
             parameter.detach().clone() for parameter in engine._trainable_parameters()
         ]
 
-        record = _run_joint(engine, batch)
+        record = joint_grpo_group(engine, batch, 0)
 
         self.assertEqual(record["updates"], 0.0)
         self.assertEqual(record["skipped_updates"], 2.0)
@@ -519,81 +623,93 @@ class JointGroupTest(unittest.TestCase):
         self.assertEqual(record["policy_terms"], 0.0)
         self.assertEqual(record["reward_std"], 0.0)
         self.assertEqual(engine.anchor_calls, [])
-        for parameter, snapshot in zip(engine._trainable_parameters(), parameter_snapshot):
+        # 评分仍然需要 G 次确定性 SAM 解码，只是不 backward/step。
+        self.assertEqual(len(engine.sam.decode_calls), 2)
+        for parameter, snapshot in zip(
+            engine._trainable_parameters(), parameter_snapshot
+        ):
             self.assertTrue(torch.equal(parameter.detach(), snapshot))
 
-    def test_constant_group_still_updates_for_terminal_kl(self) -> None:
+    def test_constant_group_still_updates_for_diffusion_kl(self) -> None:
         engine = _make_engine(
             constant=True, kl_weight=0.1, anchor_weight=0.0, update_epochs=1
         )
         batch = _batch(1)
+        before_decoder = engine.sam.decoder.weight.detach().clone()
 
-        record = _run_joint(engine, batch)
+        record = joint_grpo_group(engine, batch, 0)
 
         self.assertEqual(record["updates"], 1.0)
         self.assertEqual(record["skipped_updates"], 0.0)
         self.assertEqual(record["policy_terms"], 0.0)
         self.assertTrue(math.isnan(record["grpo"]))
+        self.assertNotIn("terminal_kl", record)
         self.assertTrue(math.isfinite(record["kl"]))
-        self.assertGreater(record["terminal_kl"], 0.0)
-        self.assertAlmostEqual(record["diffusion_kl"], 0.0, places=12)
-        # KL 开启后仍要重放 G*T 个扩散步和 G 个终端项。
-        self.assertEqual(len(engine.scaler.losses), 6)
-        self.assertTrue(
+        self.assertGreater(record["diffusion_kl"], 0.0)
+        self.assertEqual(len(engine.scaler.losses), 4)  # 只有 G*T 扩散项
+        # 参考 SAM 从不参与：即使没设置 ref_sam_decoder 也能做 KL。
+        self.assertIsNone(engine.ref_sam_decoder)
+        self.assertFalse(
             any(call["uses_reference"] for call in engine.sam.decode_calls)
         )
         self.assertEqual(engine.ref_condition_encoder.calls, 1)
-        self.assertIsNone(engine.ref_sam_decoder.weight.grad)
+        self.assertTrue(
+            torch.equal(before_decoder, engine.sam.decoder.weight.detach())
+        )
 
-    def test_anchor_only_constant_group_updates_via_abc_supervision(self) -> None:
+    def test_anchor_only_constant_group_updates_dit_not_sam_or_condition(self) -> None:
         engine = _make_engine(
             constant=True, kl_weight=0.0, anchor_weight=1.0, update_epochs=1
         )
         batch = _batch(1)
         before_condition = engine.condition_encoder.weight.detach().clone()
         before_decoder = engine.sam.decoder.weight.detach().clone()
+        before_dit = engine.dit.weight.detach().clone()
 
-        record = _run_joint(engine, batch, epoch=3)
+        record = joint_grpo_group(engine, batch, epoch=3)
 
         self.assertEqual(engine.anchor_calls, [("ABC", 3)])
         self.assertEqual(record["updates"], 1.0)
         self.assertEqual(record["policy_terms"], 0.0)
         self.assertAlmostEqual(record["anchor"], 0.5, places=12)  # alpha * 0.5*1^2
         self.assertEqual(len(engine.scaler.losses), 1)  # 仅 anchor
-        # anchor 只走 DiT；没有策略项时条件/解码器不应被更新。
         self.assertTrue(
             torch.equal(before_condition, engine.condition_encoder.weight.detach())
         )
-        self.assertTrue(torch.equal(before_decoder, engine.sam.decoder.weight.detach()))
+        self.assertTrue(
+            torch.equal(before_decoder, engine.sam.decoder.weight.detach())
+        )
+        self.assertFalse(torch.equal(before_dit, engine.dit.weight.detach()))
 
     def test_anchor_is_backwarded_before_policy_terms(self) -> None:
         engine = _make_engine(
             constant=False, kl_weight=0.0, anchor_weight=0.5, update_epochs=1
         )
-        record = _run_joint(engine, _batch(1))
+        record = joint_grpo_group(engine, _batch(1), 0)
 
-        self.assertEqual(len(engine.scaler.losses), 7)  # 1 anchor + G*(T+1)
+        self.assertEqual(len(engine.scaler.losses), 5)  # 1 anchor + G*T
         self.assertAlmostEqual(engine.scaler.losses[0], 0.25, places=12)
         self.assertAlmostEqual(record["anchor"], 0.25, places=12)
         self.assertTrue(math.isfinite(record["grpo"]))
         self.assertEqual(record["updates"], 1.0)
 
-    def test_update_epochs_replays_condition_each_step_and_steps_once_per_epoch(self) -> None:
+    def test_update_epochs_replays_condition_and_steps_once_per_epoch(self) -> None:
         engine = _make_engine(
             constant=False, kl_weight=0.0, anchor_weight=0.0, update_epochs=2
         )
-        record = _run_joint(engine, _batch(1))
+        record = joint_grpo_group(engine, _batch(1), 0)
 
         self.assertEqual(record["updates"], 2.0)
         self.assertEqual(record["skipped_updates"], 0.0)
-        self.assertEqual(record["policy_terms"], 12.0)  # 2 轮 * (G*T + G)
-        self.assertEqual(len(engine.scaler.losses), 12)
+        self.assertEqual(record["policy_terms"], 8.0)  # 2 轮 * (G*T)
+        self.assertEqual(len(engine.scaler.losses), 8)
         self.assertEqual(engine.scheduler.steps, 2)
         self.assertEqual(engine.global_step, 2)
-        # 1 次 rollout 条件 + 每轮每步重算 G*T 次。
+        # 1 次 rollout 条件 + 每轮重算 G*T 次。
         self.assertEqual(engine.condition_encoder.calls, 1 + 2 * 2 * 2)
-        # 终端热图只在 rollout 采样一次，第二轮重放复用已保存的热图。
+        # 采样只发生 G 次；重放不再调用 SAM 解码。
         self.assertEqual(len(engine.diffusion.sample_seeds), 2)
+        self.assertEqual(len(engine.sam.decode_calls), 2)
         # 第一轮更新前 ratio 必须恰为 1；step 之后第二轮才出现策略漂移。
         self.assertGreater(record["logratio_abs_max"], 0.0)
 
@@ -602,135 +718,133 @@ class JointGroupTest(unittest.TestCase):
             constant=False, kl_weight=0.0, anchor_weight=0.0, update_epochs=2
         )
         ratio_errors: list[float] = []
-        from diffpeak.joint_rl import grpo_policy_loss as real_policy_loss
+        real_policy_loss = joint_rl.grpo_policy_loss
 
         def spy(ratio, advantage, epsilon):
             ratio_errors.append(float((ratio.detach() - 1.0).abs().max().cpu()))
             return real_policy_loss(ratio, advantage, epsilon)
 
         with mock.patch(
-            "diffpeak.joint_rl._sample_terminal_actions",
-            side_effect=lambda logits, generator: logits > 0,
-        ), mock.patch(
             "diffpeak.joint_rl.grpo_policy_loss", side_effect=spy
         ):
             record = joint_grpo_group(engine, _batch(1), 0)
 
-        # 每轮 G*(T+1) 个策略项；第一轮都发生在 optimizer.step() 之前。
-        per_epoch = 2 * (2 + 1)
+        per_epoch = 2 * 2  # G * T
         self.assertEqual(len(ratio_errors), per_epoch * 2)
         self.assertTrue(all(error < 1e-12 for error in ratio_errors[:per_epoch]))
         self.assertTrue(any(error > 0.0 for error in ratio_errors[per_epoch:]))
         self.assertEqual(record["updates"], 2.0)
 
-    def test_terminal_heatmaps_are_stored_and_reward_uses_sampled_mask(self) -> None:
-        engine = _make_engine(
-            constant=False, kl_weight=0.0, anchor_weight=0.0, update_epochs=2
-        )
-        batch = _batch(1, valid_sizes=[(3, 4)])
-        captured: list[tuple[torch.Tensor, torch.Tensor, int]] = []
-        from diffpeak.inference import compute_image_metrics as real_metrics
-
-        def spy_metrics(prediction, target, point_count, reward_config):
-            captured.append(
-                (
-                    torch.as_tensor(prediction).clone(),
-                    torch.as_tensor(target).clone(),
-                    int(point_count),
-                )
-            )
-            return real_metrics(prediction, target, point_count, reward_config)
-
-        with mock.patch(
-            "diffpeak.joint_rl._sample_terminal_actions",
-            side_effect=lambda logits, generator: logits > 0,
-        ), mock.patch(
-            "diffpeak.joint_rl.compute_image_metrics", side_effect=spy_metrics
-        ):
-            joint_grpo_group(engine, batch, 0)
-
-        # 每张图每条轨迹一次，奖励只来自采样得到的二值掩码与 GT 比较。
-        self.assertEqual(len(captured), 2)
-        trajectory0_prediction, target, point_count = captured[0]
-        trajectory1_prediction, same_target, second_count = captured[1]
-        self.assertTrue(bool(trajectory0_prediction.all()))
-        self.assertFalse(bool(trajectory1_prediction.any()))
-        self.assertEqual(tuple(trajectory0_prediction.shape), (3, 4))
-        self.assertEqual(point_count, 0)
-        self.assertEqual(second_count, 0)
-        # GT 只作为奖励比较对象；有效区域裁剪正确，未把 padding 计入。
-        self.assertTrue(torch.equal(target, same_target))
-        self.assertEqual(tuple(target.shape), (3, 4))
-        self.assertTrue(bool(target[:, :2].all()))
-        self.assertFalse(bool(target[:, 2:].any()))
-
-        # 所有解码调用都收到 valid mask（终端重放也使用保存的热图）。
-        self.assertTrue(
-            all(call["valid_sizes"] == [(3, 4)] for call in engine.sam.decode_calls)
-        )
-        live_calls = [call for call in engine.sam.decode_calls if not call["uses_reference"]]
-        self.assertEqual(len(live_calls), 6)  # 2 条 rollout + 2 轮 * 2 条 replay
-        # update_epochs=2 但 sample 只发生 G 次；重放直接复用已存热图。
-        self.assertEqual(len(engine.diffusion.sample_seeds), 2)
-        for replay_index in (2, 4):
-            self.assertAlmostEqual(
-                live_calls[0]["heatmap_sum"],
-                live_calls[replay_index]["heatmap_sum"],
-            )
-            self.assertAlmostEqual(
-                live_calls[1]["heatmap_sum"],
-                live_calls[replay_index + 1]["heatmap_sum"],
-            )
-
-    def test_shared_advantages_and_normalization_denominators(self) -> None:
+    def test_shared_advantages_and_diffusion_normalization_denominators(self) -> None:
         engine = _make_engine(
             constant=False, kl_weight=0.0, anchor_weight=0.0, steps=2
         )
         batch = _batch(2)
         # 轨迹优先排列：g0=(b0,b1), g1=(b0,b1)。
-        # b0 两轨迹奖励相同 -> 常量组；b1 奖励 [1,3] -> 优势 [-1,1]。
+        # b0 两候选奖励相同 -> 常量组；b1 奖励 [1,3] -> 优势 [-1,1]。
         known_rewards = iter([0.0, 1.0, 0.0, 3.0])
 
         def fake_metrics(prediction, target, point_count, reward_config):
-            reward = next(known_rewards)
-            return {
-                "reward": reward,
-                "iou": reward,
-                "f1": reward,
-                "cldice": reward,
-                "path": 0.0,
-                "tp": 0.0,
-                "fp": 0.0,
-                "fn": 0.0,
-                "tn": 0.0,
-            }
+            return _fake_metrics(next(known_rewards))
 
         with mock.patch(
             "diffpeak.joint_rl.compute_image_metrics", side_effect=fake_metrics
         ):
-            record = _run_joint(engine, batch)
+            record = joint_grpo_group(engine, batch, 0)
 
-        # G=2, T=2, B=2；扩散分母 G*T*B=8，终端分母 G*B=4。
+        # G=2, T=2, B=2；扩散分母 G*T*B=8。
         # g0 优势 [0,-1] -> grpo_loss=0.5；g1 优势 [0,1] -> -0.5。
         expected = [
-            0.5 * 2 / 8,   # g0 扩散步 1
-            0.5 * 2 / 8,   # g0 扩散步 2
-            0.5 * 2 / 4,   # g0 终端
-            -0.5 * 2 / 8,  # g1 扩散步 1
-            -0.5 * 2 / 8,  # g1 扩散步 2
-            -0.5 * 2 / 4,  # g1 终端
+            0.5 * 2 / 8,   # g0 step 1
+            0.5 * 2 / 8,   # g0 step 2
+            -0.5 * 2 / 8,  # g1 step 1
+            -0.5 * 2 / 8,  # g1 step 2
         ]
         self.assertEqual(len(engine.scaler.losses), len(expected))
         for actual, wanted in zip(engine.scaler.losses, expected):
             self.assertAlmostEqual(actual, wanted, places=10)
 
-        self.assertEqual(record["policy_terms"], 6.0)  # 只有 b1 组有效
+        self.assertEqual(record["policy_terms"], 4.0)  # 只有 b1 组有效
         self.assertEqual(record["active_group_rate"], 0.5)
         self.assertEqual(record["inactive_group_rate"], 0.5)
         self.assertEqual(record["invalid_groups"], 1.0)
         self.assertAlmostEqual(record["diffusion_grpo"], 0.0, places=12)
-        self.assertAlmostEqual(record["terminal_grpo"], 0.0, places=12)
+        self.assertAlmostEqual(record["grpo"], 0.0, places=12)
         self.assertEqual(record["updates"], 1.0)
+
+
+# ---------------------------------------------------------------------------
+# 固定奖励采样与参考模块
+# ---------------------------------------------------------------------------
+class RewardSamplingTest(unittest.TestCase):
+    def test_path_reward_seed_is_fixed_per_image(self) -> None:
+        base = RewardConfig(
+            iou_weight=0.5,
+            cldice_weight=0.5,
+            path_weight=0.25,
+            path_samples=4,
+            seed=7,
+        )
+        engine = _make_engine(constant=True, reward_config=base)
+        captured: list[RewardConfig] = []
+
+        def spy(prediction, target, point_count, reward_config):
+            captured.append(reward_config)
+            return _fake_metrics(0.5)
+
+        with mock.patch(
+            "diffpeak.joint_rl.compute_image_metrics", side_effect=spy
+        ):
+            joint_grpo_group(engine, _batch(2), 0)
+            first_seeds = [config.seed for config in captured]
+            captured.clear()
+            # 常量组不更新参数；换 epoch 后奖励采样种子必须仍然相同。
+            joint_grpo_group(engine, _batch(2), 1)
+            second_seeds = [config.seed for config in captured]
+
+        per_image = [
+            stable_seed(engine.seed, "D-reward", f"image-{b}") % (1 << 32)
+            for b in range(2)
+        ]
+        # 轨迹优先排列：每条轨迹的 B 张图依次使用各自的固定种子。
+        expected = per_image * engine.group_size
+        self.assertEqual(first_seeds, expected)
+        self.assertEqual(second_seeds, expected)
+        self.assertEqual(len(set(expected)), 2)
+        # 同一图像的所有候选共享同一条路径采样规则。
+        self.assertEqual(first_seeds[0], first_seeds[2])
+        self.assertEqual(first_seeds[1], first_seeds[3])
+        for reward_config in captured:
+            self.assertIsInstance(reward_config, RewardConfig)
+            self.assertEqual(reward_config.path_weight, 0.25)
+            self.assertEqual(reward_config.path_samples, 4)
+            self.assertEqual(reward_config.iou_weight, 0.5)
+        # 原始配置不被就地修改。
+        self.assertEqual(base.seed, 7)
+
+    def test_reference_kl_never_uses_or_requires_reference_sam(self) -> None:
+        engine = _make_engine(
+            constant=False,
+            kl_weight=0.1,
+            ref_sam_decoder="present",
+        )
+        # 参考解码器与当前解码器不同，若被误用会改变 logits。
+        with torch.no_grad():
+            engine.ref_sam_decoder.weight.fill_(0.5)
+        before_reference = engine.ref_sam_decoder.weight.detach().clone()
+
+        record = joint_grpo_group(engine, _batch(1), 0)
+
+        self.assertTrue(math.isfinite(record["kl"]))
+        self.assertFalse(
+            any(call["uses_reference"] for call in engine.sam.decode_calls)
+        )
+        self.assertEqual(len(engine.sam.decode_calls), 2)  # 只有 G 次 rollout 评分
+        self.assertTrue(
+            torch.equal(before_reference, engine.ref_sam_decoder.weight.detach())
+        )
+        self.assertIsNone(engine.ref_sam_decoder.weight.grad)
+        self.assertNotIn("terminal_kl", record)
 
 
 if __name__ == "__main__":

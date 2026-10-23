@@ -15,8 +15,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from diffpeak.diagnostics import (  # noqa: E402
+    FIELD_METRIC_KEYS,
+    ORACLE_ROW_KEYS,
+    PERTURBATION_MODES,
     PROMPT_METRIC_KEYS,
     REWARD_GROUP_METRIC_KEYS,
+    build_binary_prompt_field,
+    build_oracle_prompt_fields,
+    build_ridge_prompt_field,
+    field_quality,
+    oracle_prompt_diagnostics,
+    perturb_prompt_field,
     prompt_quality,
     reward_group_diagnostics,
 )
@@ -429,6 +438,269 @@ class RewardGroupDiagnosticsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             reward_group_diagnostics(
                 [row], torch.tensor([[float("inf")]], dtype=torch.float64)
+            )
+
+
+class FieldQualityTest(unittest.TestCase):
+    def test_constant_background_field_reports_collapse(self) -> None:
+        field = np.full((1, 8, 8), -1.0, dtype=np.float32)
+        target = np.zeros((8, 8), dtype=bool)
+        target[3, 2:6] = True
+
+        result = field_quality(field, target, image_size=8)
+
+        self.assertEqual(tuple(result), FIELD_METRIC_KEYS)
+        self.assertEqual(result["valid_pixels"], 64)
+        self.assertEqual(result["valid_field_mean"], -1.0)
+        self.assertEqual(result["foreground_rate"], 0.0)
+        self.assertEqual(result["foreground_positive_rate"], 0.0)
+        self.assertEqual(result["foreground_collapse_rate"], 1.0)
+        self.assertEqual(result["background_negative_rate"], 1.0)
+        self.assertEqual(result["collapsed"], 1.0)
+        # 4/64 道路像素与背景一致，剩余背景也一致。
+        self.assertAlmostEqual(result["sign_agreement"], 60.0 / 64.0)
+
+    def test_ridge_field_is_not_collapsed_and_tracks_foreground(self) -> None:
+        target = np.zeros((16, 16), dtype=bool)
+        target[7:9, 2:14] = True
+        ridge = build_ridge_prompt_field(target)
+        field = ridge[None, ...]
+
+        result = field_quality(field, target, image_size=16)
+
+        self.assertEqual(result["collapsed"], 0.0)
+        self.assertGreater(result["valid_field_std"], 0.0)
+        self.assertEqual(result["background_field_mean"], -1.0)
+        self.assertGreater(result["foreground_field_mean"], -1.0)
+        self.assertGreater(result["foreground_positive_rate"], 0.9)
+        self.assertEqual(result["background_negative_rate"], 1.0)
+        self.assertGreater(result["sign_agreement"], 0.9)
+
+    def test_valid_crop_excludes_right_bottom_padding(self) -> None:
+        field = np.full((16, 16), -1.0, dtype=np.float32)
+        field[:, 8:] = 99.0
+        field[8:, :] = 99.0
+
+        result = field_quality(
+            field, target=np.zeros((8, 8), dtype=bool), image_size=16
+        )
+
+        # field 与画布同分辨率时，前 8x8 像素正好是有效区域。
+        self.assertEqual(result["valid_pixels"], 64)
+        self.assertEqual(result["field_max"], 99.0)
+        self.assertLessEqual(result["valid_field_max"], -1.0)
+        self.assertEqual(result["valid_background_rate"], 1.0)
+
+    def test_target_and_field_resolutions_differ(self) -> None:
+        # engine 约定：field 1x16x16，target 64x64 有效 crop，image_size=64。
+        field = np.zeros((1, 16, 16), dtype=np.float32)
+        target = np.zeros((64, 64), dtype=bool)
+        target[:32] = True
+
+        result = field_quality(field, target, image_size=64)
+
+        self.assertEqual(result["valid_pixels"], 256)
+        self.assertAlmostEqual(result["target_foreground_rate"], 0.5)
+        self.assertEqual(result["foreground_positive_rate"], 0.0)
+
+    def test_without_target_foreground_metrics_are_nan(self) -> None:
+        result = field_quality(
+            np.zeros((1, 4, 4), dtype=np.float32), image_size=4
+        )
+        self.assertEqual(result["valid_pixels"], 16)
+        self.assertTrue(math.isnan(result["target_foreground_rate"]))
+        self.assertTrue(math.isnan(result["foreground_field_mean"]))
+        self.assertTrue(math.isnan(result["sign_agreement"]))
+        # 常量零场没有任何前景结构，视为塌缩。
+        self.assertEqual(result["collapsed"], 1.0)
+
+    def test_validation_errors(self) -> None:
+        with self.assertRaises(ValueError):
+            field_quality(np.zeros((1, 2, 4, 4)), image_size=4)
+        with self.assertRaises(ValueError):
+            field_quality(np.full((1, 4, 4), np.nan), image_size=4)
+        with self.assertRaises(ValueError):
+            field_quality(np.zeros((1, 4, 4)), np.zeros((8, 8)), image_size=None)
+
+
+class OracleFieldTest(unittest.TestCase):
+    def test_binary_and_empty_fields(self) -> None:
+        mask = np.zeros((6, 6), dtype=bool)
+        mask[2:4, 1:5] = True
+        binary = build_binary_prompt_field(mask)
+        self.assertTrue(np.all(binary[mask] == 1.0))
+        self.assertTrue(np.all(binary[~mask] == -1.0))
+
+        empty = build_binary_prompt_field(np.zeros((4, 4), dtype=bool))
+        self.assertTrue(np.all(empty == -1.0))
+
+    def test_ridge_semantics(self) -> None:
+        mask = np.zeros((16, 16), dtype=bool)
+        mask[7:9, 2:14] = True
+        ridge = build_ridge_prompt_field(mask)
+
+        self.assertTrue(np.all(ridge[~mask] == -1.0))
+        self.assertTrue(np.all(ridge[mask] > -1.0))
+        self.assertAlmostEqual(float(ridge.max()), 1.0, places=5)
+        self.assertTrue(np.isfinite(ridge).all())
+
+        # 全道路与空道路都必须给出确定结果。
+        full = build_ridge_prompt_field(np.ones((8, 8), dtype=bool))
+        self.assertTrue(np.isfinite(full).all())
+        empty = build_ridge_prompt_field(np.zeros((8, 8), dtype=bool))
+        self.assertTrue(np.all(empty == -1.0))
+
+    def test_build_oracle_prompt_fields_kinds(self) -> None:
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[3:5, 1:7] = True
+        fields = build_oracle_prompt_fields(mask)
+        self.assertEqual(set(fields), {"ridge", "binary"})
+        with self.assertRaises(ValueError):
+            build_oracle_prompt_fields(mask, kinds=("unknown",))
+
+
+class PerturbationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        mask = np.zeros((16, 16), dtype=bool)
+        mask[7:9, 2:14] = True
+        self.field = build_ridge_prompt_field(mask)
+
+    def test_none_zero_and_deterministic_shuffle(self) -> None:
+        none = perturb_prompt_field(self.field, "none")
+        self.assertTrue(np.array_equal(none, self.field))
+
+        zero = perturb_prompt_field(self.field, "zero")
+        self.assertFalse(zero.any())
+
+        first = perturb_prompt_field(self.field, "shuffled", seed=3)
+        second = perturb_prompt_field(self.field, "shuffled", seed=3)
+        self.assertTrue(np.array_equal(first, second))
+        self.assertEqual(sorted(first.reshape(-1)), sorted(self.field.reshape(-1)))
+
+    def test_local_perturbation_is_bounded_and_seeded(self) -> None:
+        first = perturb_prompt_field(self.field, "local", seed=1, strength=0.5)
+        second = perturb_prompt_field(self.field, "local", seed=1, strength=0.5)
+        self.assertTrue(np.array_equal(first, second))
+        self.assertGreaterEqual(float(first.min()), -1.0)
+        self.assertLessEqual(float(first.max()), 1.0)
+        self.assertGreater(float(np.abs(first - self.field).sum()), 0.0)
+        # 局部扰动应只改变一小块区域。
+        changed = np.count_nonzero(first != self.field)
+        self.assertLess(changed, self.field.size)
+
+    def test_invalid_mode_and_valid_mask(self) -> None:
+        with self.assertRaises(ValueError):
+            perturb_prompt_field(self.field, "unknown")
+        with self.assertRaises(ValueError):
+            perturb_prompt_field(
+                self.field, "shuffled", valid_mask=np.ones((4, 4), dtype=bool)
+            )
+        valid = np.zeros_like(self.field, dtype=bool)
+        valid[:, :4] = True
+        shuffled = perturb_prompt_field(
+            self.field, "shuffled", seed=0, valid_mask=valid
+        )
+        # 未被选中的区域保持不变。
+        self.assertTrue(np.array_equal(shuffled[:, 4:], self.field[:, 4:]))
+
+
+class OracleInterfaceDiagnosticsTest(unittest.TestCase):
+    @staticmethod
+    def _decode(prompt: torch.Tensor) -> torch.Tensor:
+        return prompt * 6.0 - 0.5
+
+    def setUp(self) -> None:
+        self.mask = np.zeros((16, 16), dtype=bool)
+        self.mask[7:9, 2:14] = True
+        self.fields = build_oracle_prompt_fields(self.mask)
+
+    def test_rows_cover_kinds_scales_and_perturbations(self) -> None:
+        result = oracle_prompt_diagnostics(
+            self.fields,
+            self._decode,
+            self.mask,
+            scales=(0.5, 1.0),
+            perturbations=PERTURBATION_MODES,
+        )
+
+        rows = result["rows"]
+        self.assertEqual(
+            len(rows), len(self.fields) * 2 * len(PERTURBATION_MODES)
+        )
+        for row in rows:
+            self.assertEqual(tuple(row), ORACLE_ROW_KEYS)
+        summary = result["summary"]
+        self.assertEqual(summary["n_rows"], len(rows))
+        self.assertIn(summary["best_kind"], {"ridge", "binary"})
+        self.assertIn(summary["best_perturbation"], set(PERTURBATION_MODES))
+        self.assertIn("ridge", summary["mean_iou_by_kind"])
+        self.assertIn("zero", summary["mean_iou_by_perturbation"])
+
+    def test_zero_prompt_and_local_perturbation_change_output(self) -> None:
+        result = oracle_prompt_diagnostics(
+            {"binary": self.fields["binary"]},
+            self._decode,
+            self.mask,
+            scales=(1.0,),
+            perturbations=("none", "zero", "shuffled", "local"),
+        )
+        by_mode = {row["perturbation"]: row for row in result["rows"]}
+        self.assertAlmostEqual(by_mode["none"]["iou"], 1.0)
+        self.assertLess(by_mode["zero"]["iou"], 0.5)
+        self.assertEqual(by_mode["none"]["mean_abs_delta"], 0.0)
+        self.assertGreater(by_mode["zero"]["mean_abs_delta"], 0.0)
+        self.assertGreater(by_mode["shuffled"]["mean_abs_delta"], 0.0)
+        self.assertGreater(by_mode["local"]["mean_abs_delta"], 0.0)
+
+    def test_decode_output_can_be_resized_to_target(self) -> None:
+        def tiny_decode(prompt: torch.Tensor) -> torch.Tensor:
+            return torch.ones(1, 1, 8, 8, dtype=prompt.dtype)
+
+        result = oracle_prompt_diagnostics(
+            {"binary": self.fields["binary"]},
+            tiny_decode,
+            np.ones((16, 16), dtype=bool),
+            scales=(1.0,),
+            perturbations=("none",),
+        )
+        self.assertAlmostEqual(result["rows"][0]["iou"], 1.0)
+
+    def test_scale_is_applied_after_clamp(self) -> None:
+        seen: dict[str, float] = {}
+
+        def capture(prompt: torch.Tensor) -> torch.Tensor:
+            seen["max"] = float(prompt.max())
+            seen["min"] = float(prompt.min())
+            return prompt * 6.0 - 0.5
+
+        oracle_prompt_diagnostics(
+            {"binary": self.fields["binary"]},
+            capture,
+            self.mask,
+            scales=(2.0,),
+            perturbations=("none",),
+        )
+        # U = scale * clamp(H)：H=1, scale=2 时必须保留 2，而不是被夹回 1。
+        self.assertAlmostEqual(seen["max"], 2.0)
+        self.assertAlmostEqual(seen["min"], -2.0)
+
+    def test_validation_errors(self) -> None:
+        with self.assertRaises(ValueError):
+            oracle_prompt_diagnostics({}, self._decode, self.mask)
+        with self.assertRaises(ValueError):
+            oracle_prompt_diagnostics(
+                self.fields, self._decode, self.mask, scales=(0.0,)
+            )
+        with self.assertRaises(ValueError):
+            oracle_prompt_diagnostics(
+                self.fields, self._decode, self.mask, perturbations=("bad",)
+            )
+        with self.assertRaises(ValueError):
+            oracle_prompt_diagnostics(
+                self.fields,
+                self._decode,
+                self.mask,
+                terminal_mapping="identity",
             )
 
 

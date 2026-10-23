@@ -1,43 +1,193 @@
-"""Training CLI resume validation and experiment logging wiring."""
+"""Training CLI resume/migration validation and experiment logging wiring."""
+from __future__ import annotations
+
 import copy
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import ANY, Mock, patch
 
 import train
+import diffpeak.inference as inference
 from diffpeak.engine import DiffPeakEngine
 from diffpeak.inference import DEFAULT_CONFIG
+
+PROTOCOL = "signed_ridge_v1"
 
 
 def _mock_logger():
     logger = Mock()
     logger.__enter__ = Mock(return_value=logger)
     logger.__exit__ = Mock(return_value=False)
+    # _run_training writes experiment.metadata[...] directly; a plain Mock does
+    # not support item assignment.
+    logger.metadata = {}
     return logger
 
 
+def _valid_protocol_payload(stage="ABC"):
+    return {
+        "stage": stage,
+        "format_version": 5,
+        "training_protocol": PROTOCOL,
+        "target_representation": PROTOCOL,
+        "sam_frozen": True,
+        "latent_channels": 1,
+        "prompt": {"scale": 1.0, "terminal_mapping": "clamp"},
+    }
+
+
 class TrainingResumeBoundaryTest(unittest.TestCase):
-    def test_completed_ddpo_stage_still_rejects_resume(self):
+    def test_default_config_uses_signed_ridge_protocol(self):
+        self.assertEqual(DEFAULT_CONFIG["training_protocol"], PROTOCOL)
+        self.assertEqual(tuple(DEFAULT_CONFIG["stages"]), ("ABC", "D"))
+
+    def _assert_resume_rejected(self, payload):
         config = copy.deepcopy(DEFAULT_CONFIG)
-        payload = {"stage": "D", "epoch": 100, "format_version": 1}
         engine = Mock()
         engine.output_dir = Path("unused")
         logger = _mock_logger()
         bare = object.__new__(DiffPeakEngine)
-        engine._validate_resume_algorithm.side_effect = bare._validate_resume_algorithm
+        bare.config = copy.deepcopy(config)
+        engine._validate_resume_algorithm.side_effect = (
+            bare._validate_resume_algorithm
+        )
         with patch.object(sys, "argv", ["train.py", "--resume", "old.pt"]), patch.object(
             train, "_load_training_config", return_value=(config, None, payload)
         ), patch.object(train, "DiffPeakEngine", return_value=engine), patch.object(
             train, "ExperimentLogger", return_value=logger
         ):
-            with self.assertRaisesRegex(ValueError, "--init"):
+            with self.assertRaises(ValueError) as caught:
                 train.main()
         engine.load_models_from_payload.assert_not_called()
         engine.run_stage.assert_not_called()
         logger.__enter__.assert_called_once()
         logger.__exit__.assert_called_once()
+        return str(caught.exception)
+
+    def test_completed_ddpo_stage_still_rejects_resume(self):
+        message = self._assert_resume_rejected(
+            {"stage": "D", "epoch": 100, "format_version": 1}
+        )
+        self.assertRegex(message, "init|migrate")
+
+    def test_legacy_joint_abc_resume_is_rejected(self):
+        payload = {
+            "stage": "ABC",
+            "epoch": 100,
+            "format_version": 4,
+            "training_protocol": "joint_abc_v1",
+            "target_representation": "joint_abc_v1",
+            "sam_frozen": True,
+        }
+        message = self._assert_resume_rejected(payload)
+        self.assertRegex(message, "init|migrate")
+
+    def test_unfrozen_sam_snapshot_is_rejected(self):
+        payload = _valid_protocol_payload("D")
+        payload["sam_frozen"] = False
+        self._assert_resume_rejected(payload)
+
+
+class TrainingMigrationCliTest(unittest.TestCase):
+    """``--migrate-legacy`` is an explicit, lossy initialization path."""
+
+    def _run(self, argv, config=None, payload=None, helper=None, preloaded=None):
+        config = copy.deepcopy(DEFAULT_CONFIG) if config is None else config
+        engine = Mock()
+        engine.output_dir = Path("unused")
+        engine.device = "cpu"
+        logger = _mock_logger()
+        helper = helper or Mock(return_value={})
+        read_mock = Mock(return_value=payload or {})
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(sys, "argv", ["train.py", *argv])
+            )
+            stack.enter_context(
+                patch.object(
+                    train, "_load_training_config",
+                    return_value=(config, None, preloaded),
+                )
+            )
+            stack.enter_context(
+                patch.object(train, "DiffPeakEngine", return_value=engine)
+            )
+            stack.enter_context(
+                patch.object(train, "ExperimentLogger", return_value=logger)
+            )
+            stack.enter_context(patch.object(train, "seed_everything"))
+            stack.enter_context(
+                patch.object(train, "read_checkpoint", read_mock)
+            )
+            # The helper is imported lazily inside _run_training from inference.
+            stack.enter_context(
+                patch.object(inference, "load_compatible_weights", helper)
+            )
+            if hasattr(train, "load_compatible_weights"):
+                stack.enter_context(
+                    patch.object(train, "load_compatible_weights", helper)
+                )
+            train.main()
+        return engine, helper, read_mock
+
+    def test_flag_is_boolean_and_defaults_off(self):
+        parser = train.build_parser()
+        self.assertFalse(parser.parse_args([]).migrate_legacy)
+        self.assertTrue(parser.parse_args(["--migrate-legacy"]).migrate_legacy)
+
+    def _assert_usage_error(self, argv):
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        engine = Mock()
+        logger_cls = Mock()
+        with patch.object(sys, "argv", ["train.py", *argv]), patch.object(
+            train, "_load_training_config", return_value=(config, None, None)
+        ), patch.object(
+            train, "DiffPeakEngine", return_value=engine
+        ), patch.object(
+            train, "ExperimentLogger", logger_cls
+        ), patch.object(
+            train, "seed_everything"
+        ), patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as raised:
+                train.main()
+        self.assertEqual(raised.exception.code, 2)
+        logger_cls.assert_not_called()
+        engine.run_stage.assert_not_called()
+
+    def test_migration_requires_init(self):
+        self._assert_usage_error(["--migrate-legacy", "--config", "configs/3090.yaml"])
+
+    def test_migration_requires_explicit_config(self):
+        self._assert_usage_error(["--migrate-legacy", "--init", "old.pt"])
+
+    def test_migration_cannot_be_combined_with_resume(self):
+        self._assert_usage_error([
+            "--migrate-legacy", "--config", "configs/3090.yaml",
+            "--resume", "last.pt",
+        ])
+
+    def test_migration_uses_compatible_loader_instead_of_strict_init(self):
+        legacy_payload = {"models": {"condition_encoder": {}}}
+        engine, helper, read_mock = self._run(
+            [
+                "--migrate-legacy", "--config", "configs/3090.yaml",
+                "--init", "old.pt",
+            ],
+            payload=legacy_payload,
+        )
+        helper.assert_called_once_with(engine.models, legacy_payload)
+        read_mock.assert_called_once_with("old.pt")
+        engine.load_init_weights.assert_not_called()
+
+    def test_plain_init_remains_strict(self):
+        engine, helper, _ = self._run(
+            ["--config", "configs/3090.yaml", "--init", "old.pt"]
+        )
+        helper.assert_not_called()
+        engine.load_init_weights.assert_called_once_with("old.pt")
 
 
 class TrainingLoggingCliTest(unittest.TestCase):

@@ -1,16 +1,17 @@
-"""DiffPeak-SAM 有标注划分评估入口。
+"""DiffPeak-SAM 有标注划分评估入口（signed_ridge_v1）。
 
 只接受带掩码的划分（通常为 ``splits/val.json`` 或 ``splits/train.json``）。
-每张图独立推理：影像 -> 条件编码 -> 扩散采样 -> 峰值提取 -> SAM 解码，
-之后才读取掩码计算指标。预测过程不接触掩码或骨架。
+每张图独立推理：影像 -> 条件编码 -> 扩散采样单通道有符号场 -> 冻结 SAM
+解码，之后才读取掩码计算指标。预测过程不接触掩码或骨架；不提取峰值点。
 
 指标同时报告：
 * 逐图宏平均 ``iou`` / ``f1`` / ``cldice`` / ``reward``；
 * 累加 TP/FP/FN 后的 ``micro_iou`` / ``micro_f1``；
-* 正负提示点数与空预测/空标注比例。
+* 有符号场分布、前景/背景响应与 collapse 诊断；
+* 空预测/空标注比例。
 
-本脚本总是使用**生成提示**，因此应评估 B/C/D 阶段快照。A 阶段尚未训练
-扩散生成器，其“真实提示”验证在 ``train.py`` 的验证循环内完成。
+本脚本总是使用**生成场提示**。旧双通道 checkpoint 会被协议校验拒绝；
+显式 ``--migrate-weights`` 只迁移形状兼容权重（不恢复优化器）。
 
 分辨率说明：``engine`` 验证在 1024² 画布上按缩放后的有效区域计算指标，本脚本
 则先把预测恢复到原图尺寸再读取同尺寸标注。当前 DeepGlobe 影像均为 1024²，
@@ -20,7 +21,7 @@
 
     python evaluate.py --checkpoint runs/diffpeak/best.pt --split val
     python evaluate.py --config configs/3090.yaml --checkpoint runs/diffpeak/best.pt \
-        --split val --save-predictions --save-points
+        --split val --save-predictions --save-fields
 """
 
 from __future__ import annotations
@@ -31,7 +32,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from PIL import Image
 
+from diffpeak.diagnostics import FIELD_METRIC_KEYS, field_quality
 from diffpeak.inference import (
     Predictor,
     aggregate_metrics,
@@ -47,7 +50,6 @@ from diffpeak.inference import (
     resolve_sam_checkpoint,
     resolve_split_file,
     save_mask_file,
-    save_points_file,
     unique_output_path,
 )
 
@@ -126,6 +128,18 @@ def _write_json(
         handle.write("\n")
 
 
+def _resize_bool_mask(mask: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
+    """最近邻把 bool 掩码缩放到 ``(height, width)``。"""
+    array = np.asarray(mask).astype(bool)
+    height, width = int(size[0]), int(size[1])
+    if array.shape == (height, width):
+        return array
+    resized = Image.fromarray(array.astype(np.uint8) * 255, mode="L").resize(
+        (width, height), Image.NEAREST
+    )
+    return np.asarray(resized) > 127
+
+
 def _check_output_conflicts(output_dir: Path) -> None:
     """推理前检查旧结果，避免跑完整个评估后才在写文件时失败。"""
     if output_dir.exists() and not output_dir.is_dir():
@@ -154,7 +168,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default=None, help="cuda、cuda:0 或 cpu。")
     parser.add_argument("--seed", type=int, default=None, help="显式覆盖评估种子。")
     parser.add_argument("--save-predictions", action="store_true", help="保存 0/255 预测掩码。")
-    parser.add_argument("--save-points", action="store_true", help="保存提示点 JSON。")
+    parser.add_argument(
+        "--save-fields",
+        action="store_true",
+        help="保存单通道有符号场（.field.npy）。",
+    )
+    parser.add_argument(
+        "--migrate-weights",
+        action="store_true",
+        help="显式迁移旧快照的形状兼容权重（跳过 SAM/输入输出头，不恢复优化器）。",
+    )
     parser.add_argument("--limit", type=int, default=None, help="最多评估的影像数。")
     return parser
 
@@ -219,6 +242,7 @@ def main() -> None:
         threshold=args.threshold,
         seed=seed,
         payload=preloaded,
+        migrate_weights=bool(args.migrate_weights),
     )
     preloaded = None
     # 提前校验 SAM 权重路径。
@@ -226,12 +250,11 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     produced = set()
-    save_points = bool(args.save_points)
+    save_fields = bool(args.save_fields)
     reward_config = make_reward_config(config)
     threshold = predictor.threshold
 
     rows: List[Dict[str, Any]] = []
-    point_counts: List[float] = []
     empty_predictions = 0
     empty_targets = 0
 
@@ -239,7 +262,7 @@ def main() -> None:
         image_path = Path(entry["image_path"])
         # 先推理，后读取掩码，确保生成提示不接触 GT。
         prediction = predictor.predict_file(
-            image_path, image_id=entry["id"], seed=seed
+            image_path, image_id=entry["id"], seed=seed, return_field=True
         )
         target = load_mask_file(Path(entry["mask_path"]))
         prediction_bool = np.asarray(prediction["mask"]) > 0
@@ -247,27 +270,38 @@ def main() -> None:
         metrics = compute_image_metrics(
             prediction_bool,
             target,
-            prediction["point_count"],
+            0,  # 密集有符号场提示不消耗离散点
             reward_config,
+        )
+        # 场诊断与 engine 验证使用同一约定：field 为 1xHxW 热图，target 为
+        # 裁掉右下 padding 的有效区域（这里从原图最近邻恢复到 resized_size）。
+        target_valid = _resize_bool_mask(
+            target,
+            tuple(int(value) for value in prediction["resized_size"]),
+        )
+        field_metrics = field_quality(
+            prediction["field"],
+            target_valid,
+            image_size=int(predictor.image_size),
         )
         row: Dict[str, Any] = {
             "id": str(entry["id"]),
             "relative_path": str(entry["relative_path"]),
             **metrics,
-            "point_count": int(prediction["point_count"]),
-            "positive_count": int(prediction["positive_count"]),
-            "negative_count": int(prediction["negative_count"]),
+            **field_metrics,
+            "point_count": 0,
             "original_size": list(prediction["original_size"]),
             "resized_size": list(prediction["resized_size"]),
+            "prompt_scale": float(prediction["prompt_scale"]),
+            "terminal_mapping": prediction["terminal_mapping"],
         }
         rows.append(row)
-        point_counts.append(float(prediction["point_count"]))
         if not prediction_bool.any():
             empty_predictions += 1
         if not target.any():
             empty_targets += 1
 
-        if args.save_predictions or save_points:
+        if args.save_predictions or save_fields:
             mask_path = unique_output_path(
                 output_dir,
                 entry["relative_path"],
@@ -277,23 +311,23 @@ def main() -> None:
             )
             if args.save_predictions:
                 save_mask_file(prediction["mask"], mask_path)
-            if save_points:
-                points_payload = {
-                    "image_id": row["id"],
-                    "source_path": str(image_path),
-                    "original_size": row["original_size"],
-                    "resized_size": row["resized_size"],
-                    "threshold": threshold,
-                    **prediction["points"],
-                }
-                save_points_file(
-                    points_payload, mask_path.with_suffix(".points.json")
+            if save_fields:
+                np.save(
+                    mask_path.with_suffix(".field.npy"),
+                    np.asarray(prediction["field"], dtype=np.float32),
                 )
 
         if index % 50 == 0 or index == len(usable):
             print(f"已评估 {index}/{len(usable)}", flush=True)
 
     summary = aggregate_metrics(rows)
+    for key in FIELD_METRIC_KEYS:
+        values = [
+            float(row[key])
+            for row in rows
+            if key in row and np.isfinite(float(row[key]))
+        ]
+        summary[key] = float(np.mean(values)) if values else float("nan")
     summary.update(
         {
             "split": split_name,
@@ -304,9 +338,15 @@ def main() -> None:
             "count": len(rows),
             "split_total": split_total,
             "subset": bool(subset),
-            "mean_point_count": float(
-                sum(point_counts) / max(len(point_counts), 1)
+            "training_protocol": str(config.get("training_protocol", "")),
+            "target_representation": str(
+                config.get("target_representation", "")
             ),
+            "prompt_scale": float(predictor.prompt_scale),
+            "terminal_mapping": predictor.terminal_mapping,
+            "migrated_weights": bool(predictor.migrate_weights),
+            # 密集场提示不消耗离散点；保留字段便于旧报表读取。
+            "mean_point_count": 0.0,
             "empty_prediction_rate": float(empty_predictions) / float(len(rows)),
             "empty_target_rate": float(empty_targets) / float(len(rows)),
         }
@@ -323,8 +363,11 @@ def main() -> None:
         f"macro_f1={summary['f1']:.4f}  clDice={summary['cldice']:.4f}\n"
         f"  micro_iou={summary['micro_iou']:.4f}  "
         f"micro_f1={summary['micro_f1']:.4f}  "
-        f"reward={summary['reward']:.4f}  "
-        f"points={summary['mean_point_count']:.2f}\n"
+        f"reward={summary['reward']:.4f}\n"
+        f"  field_mean={summary['valid_field_mean']:.4f}  "
+        f"foreground_rate={summary['foreground_rate']:.4f}  "
+        f"collapsed={summary['collapsed']:.3f}  "
+        f"scale={summary['prompt_scale']:.3f}\n"
         f"  结果目录：{output_dir}",
         flush=True,
     )

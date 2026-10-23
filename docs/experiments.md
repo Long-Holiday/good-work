@@ -1,67 +1,16 @@
 # 实验与结果口径
 
-本文是代码使用约定，不表示已开展实验或获得结果。用于消融、主流模型比较和 RTX 3090 24GB 训练的统一规则见 [正式实验协议](experimental_protocol.md)，其中区分已实现能力、待实测配置和正式运行前需补齐的条件。
+当前模型使用 `signed_ridge_v1`，单通道有符号场、SAM 全阶段冻结，ABC/D 都只更新条件编码器与 DiT。训练和检查点语义以 [训练说明](joint_training.md) 为准，实验设计与尚未验证项见 [山脊场方案](signed_ridge_diffusion_plan.md)。下述日志接口继续使用。
 
-## 最小实验路线
+先用 `check_targets.py` 检查目标几何、细路保留和有效区域，再用 `scripts/diagnose_ridge_sam.py` 在内部验证集比较标注场/二值提示、固定尺度及提示干预。正式训练前确认冻结 SAM 对提示有效响应。主实验依次比较确定性同场预测、监督扩散、监督后 GRPO，以及关闭监督锚定；不得把多候选标注最优结果报告为可部署成绩。
 
-1. 固定 `splits/protocol_v1/*.json`（或登记过的等价三分清单）与依赖版本；不对官方无掩码 valid/test 计算指标，内部 test 只在全部选模完成后统一评估。划分与测试集使用历史见 [实验协议](experimental_protocol.md) 第 2 节。
-2. 先运行 `python check_targets.py --config configs/3090.yaml --samples 16`，检查目标点回提 precision / recall、数量、最大定位误差及无正峰率。少量样本仅用于排错，正式定阈值需覆盖整个内部验证集。若仍在用旧两分清单，这 16 张可能落入新 test，必须按协议登记用途，不能据此声称测试集从未被查看。
-3. A 阶段只训练 SAM2 解码器，确认真实提示下 SAM2 能学道路；SAM2 迁移后必须从 A 重新开始 A→B→C→D。A 的真值提示指标是受提示监督的诊断指标，不能与 B/C/D 自动生成提示成绩混称。
-4. B 阶段训练细节/条件编码器与去噪 DiT。先检查扩散 MSE 与低中噪声重建，再看生成热图幅度、正负峰数与无正峰率；只看扩散 MSE 不足以选择最终模型。
-5. C 阶段只训练 SAM2 解码器，确认生成提示分布下解码器适配有效，再冻结解码器进入 D。
-6. D 阶段只训练扩散 DiT，使用 GRPO。同时记录终端奖励、组内奖励标准差、零优势组比例、联合 log-ratio、KL、裁剪比例与点数。若同图四条轨迹奖励完全一致，优势为零是正确行为，不应替换成跨图基线；非零但方差低于 `advantage_std_delta` 的组只按该下限缩放，仍会参与学习，不能误记为“已跳过”。
-7. 完整实验以每张影像一次采样为主协议，多种子重复。不要用标注从多轨迹中挑最优结果当成无标注推理性能。
+ABC 保留完整采样分割监督，不能只凭扩散损失选模。D 每图独立成组，奖励采用确定性分割和固定奖励采样种子。记录生成场分布、空预测率、IoU/F1/clDice、组内奖励方差、活跃组比例、Gaussian KL、联合 log-ratio、裁剪比例、实际更新数与监督锚定。没有点数、峰值、点成本预热或终端 Bernoulli 策略日志。
 
-## 提示质量与奖励诊断
-
-训练内 A/B/C/D 验证新增以下标量；A 使用真实提示，B/C/D 使用生成提示，不应混排：
-
-- `positive_on_road_rate` / `negative_on_background_rate`：提示在有效图像区域的落点正确率；无该类点时为 NaN（JSONL 为 null），宏平均排除未定义值。
-- `no_positive_rate` / `point_outside_rate`：无正点比例、落在有效内容之外（包括 padding）的点比例。
-- `heatmap_above_threshold_rate`：有效热图像素中，任一通道超过各自峰值阈值的比例；这里统计原始热图，未应用平滑或 h-maxima。另有 `heatmap_mean` / `heatmap_max`。
-- `skeleton_coverage`：GT 骨架像素距最近域内正点不超过 8 个输入图像像素的比例，仅表示局部提示覆盖，不是分支覆盖或 APLS。GT 有骨架但没有域内正点时为 0；GT 无骨架时未定义。
-
-D 阶段每条轨迹还计算 `quality_reward`（不含点成本）、`point_penalty`（包含当前预热乘子）和 `advantage`。`train_group` 的 JSONL `metrics.trajectory_diagnostics` 保存逐候选记录，含 `image_id` 与从 0 开始的 `trajectory_index`，按现有 `logging.log_every` 间隔及首末批记录；设为 1 可记录每批。逐轨迹列表不进入 TensorBoard，也不在整个 epoch 内累积。
-
-TensorBoard 和 epoch 汇总新增质量/成本的组内标准差、`advantage_point_count_corr`、`reward_point_count_corr`、`quality_reward_point_count_corr`。标准差和相关性都先在同一张图的 G 个候选间计算，再跨图平均；常量相关性未定义，另报 `undefined_advantage_corr_rate`。这些诊断不会改变奖励、采样或优化目标。逐组计算覆盖率会增加 CPU 骨架与 KDTree 开销，新的端到端吞吐需重新测量。当前接入范围是训练内验证和 D rollout，独立 `evaluate.py` 尚未输出这些新增字段。
-
-## SAM2 高分辨率条件融合
-
-条件编码器统一使用 SAM2 高分辨率融合结构，不再提供低分辨率旧分支或切换开关。冻结 SAM2 的原始 256² / 128² FPN 特征经独立可训练 1×1 投影与融合层接入条件金字塔。投影不与 mask decoder 共享，B 更新条件模块，A/C/D 保持其冻结；图像编码器仍冻结。训练与 Predictor 推理均传递完整 SAM2 特征，缺少两级高分辨率特征时直接报错。
-
-旧低分辨率条件模型 checkpoint 缺少新增参数，不支持直接 `resume/init`，由严格状态字典加载拒绝；不提供兼容分支或静默迁移。新实验从官方 SAM2 权重执行 A→B→C→D。新增结构的真实 3090 显存、吞吐与精度尚待测量，原低分辨率条件模型的探针结果不能作为新结构验收。
-
-## 优先消融
-
-| 对照 | 固定因素 | 改变因素 |
-|---|---|---|
-| B/C 对比 D | 条件、SAM2、峰值与推理采样 | 是否做 GRPO 后训练 |
-| 不惩罚点数 | 全部模型与数据 | `reward.point_cost=0`，需重新后训练 |
-| 点成本预热 | 模型、数据、点数成本 | `rl.point_cost_warmup_steps` 为 `0` 与配置值，需分别重新后训练 |
-| 监督锚定 | 其余 GRPO 协议 | `rl.anchor_weight=0` 对比非零值；非零只是可选监督锚定，不是默认协议 |
-| 加路径代理 | 其余协议 | 在实验 YAML 中启用非零路径权重；只作为独立消融，不改主协议 |
-| 正点 vs 双通道 | 正通道与模型 | 负点是否参与，需定义训练一致的消融 |
-| h-maxima vs 普通局部极大 | 数据和模型 | 重新校准且固定峰值提取协议 |
-| 提示依赖性 | 同一模型 | 移除或打乱提示，仅用于评估诊断 |
-
-确定性 CNN 热图基线、直接分割基线、正式 APLS、512² 热图和细边界细化是后续独立实验；当前没有为这些消融声称结果。
-
-## D 阶段 GRPO 协议与迁移口径
-
-当前 D 阶段配置显式写 `rl.algorithm=grpo`，表示 DDPO 已被同图组内相对优势的 GRPO 取代。当前实现规范是 [`docs/model_grpo.md`](model_grpo.md)，已被替代的旧设计稿不再保留在工作树。D 的学习率、warmup、裁剪半径等**数值起点统一见 `configs/3090.yaml`**，本文只保留语义，不复制参数表。
-
-- `ppo_clip` 键名为兼容旧配置保留，语义是 GRPO 裁剪半径 epsilon，不是 PPO 的原始超参。
-- `advantage_std_delta` 是组内优势分母的标准差下限，不是“跳过阈值”；非零但低方差的组仍按该下限缩放后参与学习，只有奖励完全相同的组优势为零。
-- `point_cost_warmup_steps` 按**已处理的 D 组数**推进，不依赖该组是否真正产生 optimizer step；这样常量奖励组或 AMP 溢出不会让预热永久停在 0。验证固定使用未预热的基准 `reward.point_cost`，避免同一 checkpoint 的验证奖励随预热进度漂移；`0` 表示禁用。
-- `anchor_weight` 默认 `0`；非零时是可选监督锚定（对目标热图额外加扩散 MSE），不是默认 GRPO 目标。
-- D 阶段的 `lr`、`warmup_ratio`、`min_lr_ratio` 在 `stages.D` 中覆盖全局值；具体数值以配置为准，不在文档中重复。
-- **两种“旧策略”不要混淆。** 组 rollout 时保存的 `old_log_prob` 在组内冻结并 detach，只作为概率比的分母；重放更新时重算当前策略。首次从 B/C 进入 D 时深拷贝当前预训练 DiT 为长期参考，之后永久冻结，只用于 KL；从已有 D 快照初始化或恢复时保留其中的 `ref_dit`，缺失时才从已加载权重重建，需记录该协议差异。前者不是长期参考模型。
-- **旧快照的架构限制。** 旧 U-Net/DDPO 快照不能通过 `--init` 或 `--resume` 加载到当前 DiT；应使用独立输出目录从官方 SAM2.1 权重重新执行 A→B→C→D。只有结构匹配的 DiT 权重才能用于后续初始化；不同训练算法的优化器/调度器/RNG 可技术性加载也不代表可按 GRPO 继续恢复。
-- 以上均为待验证起点，本文不声称已运行 GRPO 实验或取得改进。
+SAM 全冻结参考无需复制；D 只保存固定参考条件编码器与 DiT。普通 init 与 resume 都严格验证新协议；显式 `--init --migrate-legacy --config` 仅迁移兼容扩散权重，另起实验，不恢复训练状态。单通道改变动作维与概率尺度，旧超参数及吞吐均需重新校准。
 
 ## 实验运行目录、日志与 TensorBoard
 
-本节描述 `train.py` 的实验日志协议。TensorBoard 2.21.0 的 SummaryWriter/event accumulator 写读已在 `pytorch` 环境通过，`pip check` 无 broken requirements；尚未用真实 SAM2 权重运行完整 A–D 训练来验证真实训练负载下的日志轮转、flush 行为或曲线；SAM1 时期的日志结果不能视为 SAM2 证据。`evaluate.py`/`predict.py` 的既有输出不受本协议影响。
+本节描述 `train.py` 的实验日志协议。TensorBoard 2.21.0 的 SummaryWriter/event accumulator 写读已在 `pytorch` 环境通过，`pip check` 无 broken requirements；尚未用真实 SAM2 权重运行完整 ABC/D 训练来验证真实训练负载下的日志轮转、flush 行为或曲线；SAM1 时期的日志结果不能视为 SAM2 证据。`evaluate.py`/`predict.py` 的既有输出不受本协议影响。
 
 ### 输出目录与 CLI
 
@@ -115,7 +64,7 @@ python train.py --config configs/3090.yaml --stage all --no-tensorboard
 - `config.json`：本次运行实际解析后的配置，包含 YAML、checkpoint 内配置、CLI 覆盖和日志配置；路径应尽量为绝对路径。
 - `metadata.json`：包含 `session_id`、`status`、启动/结束时间、持续时间、命令行、Python/PyTorch/CUDA/conda 环境、TensorBoard 是否启用、git revision/status 与异常信息；resume 时另记 `resume`、`resume_stage`、`resume_epoch`，并记录本次执行阶段与 seed。
 - `train.log`：训练进程 stdout 与 stderr 的合并 tee，包含普通进度、警告与异常 traceback；写入时刷新。
-- `metrics.jsonl`：UTF-8 JSON Lines，追加写入，一行一个对象。每条记录含 `event` 和 ISO 8601 UTC `time`；指标记录为 `event="metrics"`，并带 `stage`（大写 A/B/C/D）、`scope`（如 `train_batch`/`train_group`/`train_epoch`/`val_epoch`/`system`）、`step`、1-based `epoch`，具体标量放在 `metrics` 对象中，例如 batch 的损失分量、D 组的奖励/优势统计/KL/裁剪比例、epoch 的汇总损失与耗时、验证的 IoU/F1/clDice。session 开始/结束使用 `session_start`/`session_end` 记录。
+- `metrics.jsonl`：UTF-8 JSON Lines，追加写入，一行一个对象。每条记录含 `event` 和 ISO 8601 UTC `time`；指标记录为 `event="metrics"`，并带 `stage`（大写 ABC/D）、`scope`（如 `train_batch`/`train_group`/`train_epoch`/`val_epoch`/`system`）、`step`、1-based `epoch`，具体标量放在 `metrics` 对象中，例如 batch 的损失分量、D 组的奖励/优势统计/KL/裁剪比例、epoch 的汇总损失与耗时、验证的 IoU/F1/clDice。session 开始/结束使用 `session_start`/`session_end` 记录。
 - `tensorboard/`：TensorBoard 事件文件；关闭 TensorBoard 时不创建。
 
 根目录的 `metrics.json` 继续按既有逻辑保存训练历史，不替代每个 session 的 `metrics.jsonl`。

@@ -1,5 +1,17 @@
 # 测试记录
 
+## 单通道山脊场重构（2026-10-23）
+
+当前协议 `signed_ridge_v1`：单通道有符号场，SAM 全阶段冻结，ABC 完整监督与 D 扩散轨迹 GRPO。下方双通道、峰值和 A/B/C 记录保留为历史证据，不代表当前接口或性能。
+
+- 本地 `pytorch` 环境（Python 3.11.15、PyTorch 2.14.0+cu130）执行 `python -m pytest tests -q`：**395 passed、192 subtests passed，13.28 秒**。覆盖源场/缩放/padding、细道路与特殊几何、四区域归一、全无效区域、单通道采样、裁剪前高斯动作、冻结 SAM 输入梯度、ABC/D 参数和状态不变、同图奖励分组、参考固定、概率重放、常量奖励、显式迁移及严格新协议恢复。
+- 官方 SAM2.1 模块随机权重集成测试实际运行，验证单通道提示编码、固定尺度、半像素 padding 和分割梯度；没有使用 SAM2.1 预训练权重，不能说明真实提示有效性。
+- CUDA `python scripts/gpu_smoke.py`：**passed=true**，RTX 3050 Laptop 4GB；单通道、AMP、可微采样与扩散 GRPO 更新通过，初始重放概率比最大误差 **0.0**，参数及梯度有限。微型 DiT + 模拟 SAM 特征的 ABC/D 峰值 allocated 为 **73.84 / 58.91 MiB**；该工具不运行真实 SAM 完整分割，不代表完整模型显存。
+- `check_targets.py --config configs/3090.yaml --samples 16` 在真实训练清单前16张运行成功：场范围 [-1,1]，未分区有效像素总数0。首样本 100034 的保守投影相对中心最近邻保留 **1.49 倍道路单元、4.58 倍骨架单元**；投影道路/骨架召回均为1，后者是几何一致性检查，不能作为模型性能。没有读取 test 清单。
+- `scripts/diagnose_ridge_sam.py --mock --size 64` 运行成功，覆盖山脊/二值提示、多尺度、零值/打乱/局部扰动。mock 仅验证诊断工具，不能替代冻结预训练 SAM 的真实接口实验。
+- 本地忽略目录 `runs/signed_ridge_validation/` 保存 `targets_16.jsonl`、`gpu_smoke.json`、`oracle_mock.json` 和回归日志。`python -m compileall -q diffpeak tests scripts train.py predict.py evaluate.py check_targets.py` 与 `git diff --check` 通过。
+- **尚未执行：**真实预训练 SAM2.1 的尺度选择与提示有效性验证、真实小样本收敛、3090 全尺寸吞吐重测、完整训练和确定性基线/GRPO/无锚定对照。当前本地只有 SAM1 权重；代码验收不构成分割质量或 GRPO 收益结论。
+
 ## DiT 架构替换验证（2026-10-22）
 
 - 默认去噪器替换为 `ConditionalDiT`，保留四尺度条件、双通道噪声预测、DDIM 与 GRPO 接口；既有采样背景先验回归仍通过。

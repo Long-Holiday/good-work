@@ -145,6 +145,69 @@ class RoadSAMValidSizesTest(unittest.TestCase):
             RoadSAM._normalise_valid_sizes(123, 1, image_size=1024)
 
 
+class RoadSAMValidRegionMaskTest(unittest.TestCase):
+    """SAM padding 掩码必须与山脊场数据侧共享同一像素中心判据。"""
+
+    def test_matches_ridge_valid_heatmap_mask_on_odd_rectangles(self) -> None:
+        import numpy as np
+
+        from diffpeak.data.geometry import ImageGeometry
+        from diffpeak.data.ridge import _valid_heatmap_mask
+
+        cases = [
+            (64, 16, (10, 38)),  # 10/64*16=2.5：banker's round 会得到 2。
+            (64, 16, (38, 10)),
+            (64, 16, (37, 37)),
+            (1024, 256, (512, 300)),
+            (1024, 256, (1, 1)),
+            (68, 17, (33, 9)),
+        ]
+        for image_size, heatmap_size, resized in cases:
+            with self.subTest(image_size=image_size, resized=resized):
+                geometry = ImageGeometry(
+                    source_size=resized,
+                    resized_size=resized,
+                    image_size=image_size,
+                    heatmap_size=heatmap_size,
+                )
+                expected = _valid_heatmap_mask(geometry)
+                actual = RoadSAM._valid_region_mask(
+                    [resized],
+                    1,
+                    (heatmap_size, heatmap_size),
+                    (image_size, image_size),
+                    torch.device("cpu"),
+                    torch.float32,
+                )
+                np.testing.assert_array_equal(
+                    actual[0, 0].to(torch.bool).numpy(), expected
+                )
+
+    def test_center_criterion_handles_ties_and_zero_cell_regions(self) -> None:
+        # 16 热图 -> 64 画布，valid=10：中心判据保留 3 个像素，
+        # round(10 * 16 / 64)=round(2.5) 会错误地得到 2。
+        tie = RoadSAM._valid_region_mask(
+            [(10, 10)], 1, (16, 16), (64, 64), torch.device("cpu"), torch.float32
+        )
+        self.assertEqual(float(tie.sum()), 9.0)
+        self.assertTrue(torch.all(tie[0, 0, :3, :3] == 1.0))
+        self.assertTrue(torch.all(tie[0, 0, 3:, :] == 0.0))
+
+        # 极细有效区域可能映射到零个目标像素；不得强制至少保留一个。
+        zero = RoadSAM._valid_region_mask(
+            [(1, 1)], 1, (4, 4), (64, 64), torch.device("cpu"), torch.float32
+        )
+        self.assertEqual(float(zero.sum()), 0.0)
+
+        # 非方形画布也使用同一判据：field 8x6, output 16x12。
+        rectangle = RoadSAM._valid_region_mask(
+            [(5, 10)], 1, (8, 6), (16, 12), torch.device("cpu"), torch.float32
+        )
+        self.assertTrue(torch.all(rectangle[0, 0, :3, :5] == 1.0))
+        self.assertTrue(torch.all(rectangle[0, 0, 3:, :] == 0.0))
+        self.assertTrue(torch.all(rectangle[0, 0, :, 5:] == 0.0))
+
+
 class RoadSAMCheckpointErrorTest(unittest.TestCase):
     def test_legacy_state_dict_without_model_key_raises_value_error(self) -> None:
         """旧 SAM1 原始 state dict 缺少 ``model`` 字段时应给出明确错误。"""
@@ -387,7 +450,7 @@ class _FakeSAM2(nn.Module):
         self.use_high_res_features_in_sam = True
 
 
-def _fake_road_sam() -> RoadSAM:
+def _fake_road_sam(prompt_scale: float = 1.0) -> RoadSAM:
     """构造不依赖官方 sam2 包的 RoadSAM，复用真实 encode/decode 逻辑。"""
     model = object.__new__(RoadSAM)
     nn.Module.__init__(model)
@@ -398,7 +461,9 @@ def _fake_road_sam() -> RoadSAM:
     model.config_name = "fake"
     model.architecture = "fake"
     model.apply_postprocessing = False
-    model._freeze_encoder_and_prompt()
+    model.prompt_scale = float(prompt_scale)
+    # train(False) 同时切换到 eval 并施加全参数冻结。
+    model.train(False)
     return model
 
 
@@ -429,7 +494,7 @@ class FakeSAM2FeatureContractTest(unittest.TestCase):
         self.assertFalse(features.high_res[0].requires_grad)
         self.assertFalse(features.high_res[1].requires_grad)
 
-    def test_decode_uses_sam2_signature_and_trains_high_res_projections(self) -> None:
+    def test_sparse_decode_uses_sam2_signature_with_all_parameters_frozen(self) -> None:
         model = _fake_road_sam()
         features = model.encode(torch.ones(2, 3, 1024, 1024))
         prompts = [self._positive_prompt(), self._positive_prompt()]
@@ -437,20 +502,17 @@ class FakeSAM2FeatureContractTest(unittest.TestCase):
         logits = model.decode(features, prompts, output_size=(8, 6))
 
         self.assertEqual(tuple(logits.shape), (2, 1, 8, 6))
-        self.assertTrue(logits.requires_grad)
+        # 全冻结且输入特征 detach：稀疏工具路径不构建计算图。
+        self.assertFalse(logits.requires_grad)
         decoder = model.sam.sam_mask_decoder
         self.assertEqual(len(decoder.calls), 2)
         for call in decoder.calls:
             self.assertFalse(call["multimask_output"])
             self.assertFalse(call["repeat_image"])
             self.assertEqual(call["high_res_shapes"], [(1, 32, 8, 8), (1, 64, 4, 4)])
-
-        logits.sum().backward()
-        self.assertIsNotNone(decoder.conv_s0.weight.grad)
-        self.assertIsNotNone(decoder.conv_s1.weight.grad)
-        self.assertTrue(bool(torch.count_nonzero(decoder.conv_s0.weight.grad)))
-        self.assertTrue(bool(torch.count_nonzero(decoder.conv_s1.weight.grad)))
-        # 冻结编码器的 no_mem_embed 不参与梯度。
+        self.assertTrue(
+            all(not parameter.requires_grad for parameter in model.parameters())
+        )
         self.assertIsNone(model.sam.no_mem_embed.grad)
 
     def test_decode_without_positive_points_skips_decoder(self) -> None:
@@ -471,20 +533,18 @@ class FakeSAM2FeatureContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             model.decode(features.low_res, [self._positive_prompt()])
 
-    def test_decode_heatmaps_uses_signed_prompt_and_backpropagates_to_inputs(self) -> None:
-        model = _fake_road_sam()
+    def test_decode_heatmaps_uses_scaled_signed_field_and_backpropagates(self) -> None:
+        model = _fake_road_sam(prompt_scale=2.0)
         features = model.encode(torch.ones(2, 3, 1024, 1024))
-        positive = torch.rand(2, 1, 4, 4, requires_grad=True)
-        negative = torch.rand(2, 1, 4, 4, requires_grad=True)
-        heatmaps = torch.cat([positive, negative], dim=1)
+        field = (torch.rand(2, 1, 4, 4) * 2.0 - 1.0).detach().requires_grad_(True)
 
-        logits = model.decode_heatmaps(features, heatmaps, output_size=(8, 6))
+        logits = model.decode_heatmaps(features, field, output_size=(8, 6))
 
         self.assertEqual(tuple(logits.shape), (2, 1, 8, 6))
         self.assertTrue(logits.requires_grad)
-        # 密集提示是正负通道差，并缩放到 prompt_encoder.mask_input_size。
+        # 固定映射 U = prompt_scale * H，并缩放到 mask_input_size。
         expected = F.interpolate(
-            positive - negative, size=(8, 8), mode="bilinear", align_corners=False
+            2.0 * field, size=(8, 8), mode="bilinear", align_corners=False
         )
         torch.testing.assert_close(model.sam.sam_prompt_encoder.last_masks, expected)
         # 不做跨样本补齐，也没有任何稀疏点 token。
@@ -498,39 +558,41 @@ class FakeSAM2FeatureContractTest(unittest.TestCase):
         )
 
         logits.sum().backward()
-        # 提示编码器权重冻结，但输入热图必须获得非零梯度。
-        self.assertIsNotNone(positive.grad)
-        self.assertIsNotNone(negative.grad)
-        self.assertTrue(bool(torch.count_nonzero(positive.grad)))
-        self.assertTrue(bool(torch.count_nonzero(negative.grad)))
-        self.assertIsNotNone(decoder.conv_s0.weight.grad)
-        self.assertIsNotNone(decoder.conv_s1.weight.grad)
+        # SAM 参数全冻结，但输入有符号场必须获得非零梯度。
+        self.assertIsNotNone(field.grad)
+        self.assertTrue(bool(torch.count_nonzero(field.grad)))
+        self.assertTrue(
+            all(parameter.grad is None for parameter in decoder.parameters())
+        )
         self.assertIsNone(model.sam.no_mem_embed.grad)
 
     def test_decode_heatmaps_decodes_all_samples_including_empty_maps(self) -> None:
         model = _fake_road_sam()
         features = model.encode(torch.ones(2, 3, 1024, 1024))
-        heatmaps = torch.zeros(2, 2, 4, 4)
+        field = torch.zeros(2, 1, 4, 4, requires_grad=True)
 
-        logits = model.decode_heatmaps(features, heatmaps, output_size=(8, 8))
+        logits = model.decode_heatmaps(features, field, output_size=(8, 8))
 
         self.assertEqual(tuple(logits.shape), (2, 1, 8, 8))
         self.assertTrue(torch.isfinite(logits).all())
-        # 空热图不能被短路跳过：整批一次解码。
+        self.assertTrue(logits.requires_grad)
+        # 空场不能被短路跳过：整批一次解码。
         self.assertEqual(len(model.sam.sam_mask_decoder.calls), 1)
         self.assertEqual(
             model.sam.sam_mask_decoder.calls[0]["sparse_tokens"], (2, 0, 256)
         )
+        logits.sum().backward()
+        self.assertIsNotNone(field.grad)
+        self.assertTrue(torch.isfinite(field.grad).all())
 
     def test_decode_heatmaps_masks_padding_from_valid_sizes(self) -> None:
         model = _fake_road_sam()
         features = model.encode(torch.ones(1, 3, 1024, 1024))
-        heatmaps = torch.zeros(1, 2, 4, 4)
-        heatmaps[:, 0] = 1.0  # 正通道全 1，负通道全 0，符号掩码为 1。
+        field = torch.ones(1, 1, 4, 4)
 
         model.decode_heatmaps(
             features,
-            heatmaps,
+            field,
             output_size=(4, 4),
             valid_sizes=[(2, 3)],
         )
@@ -542,29 +604,27 @@ class FakeSAM2FeatureContractTest(unittest.TestCase):
         self.assertTrue(torch.equal(mask[:, :, 4:, :], torch.zeros_like(mask[:, :, 4:, :])))
         self.assertTrue(torch.equal(mask[:, :, :, 6:], torch.zeros_like(mask[:, :, :, 6:])))
 
-    def test_decode_heatmaps_decoder_override_uses_its_high_res_projections(self) -> None:
-        model = _fake_road_sam()
-        features = model.encode(torch.ones(2, 3, 1024, 1024))
-        default_decoder = model.sam.sam_mask_decoder
-        override = _FakeSAM2MaskDecoder()
-        for parameter in override.parameters():
-            parameter.requires_grad_(False)
-        heatmaps = torch.rand(2, 2, 4, 4, requires_grad=True)
+    def test_decode_heatmaps_scales_only_the_valid_prompt_region(self) -> None:
+        model = _fake_road_sam(prompt_scale=3.0)
+        features = model.encode(torch.ones(1, 3, 1024, 1024))
+        # 与 mask_input_size 同分辨率，避免双线性边界影响断言。
+        field = torch.ones(1, 1, 8, 8)
 
-        logits = model.decode_heatmaps(
-            features, heatmaps, output_size=(8, 8), decoder=override
+        model.decode_heatmaps(
+            features,
+            field,
+            output_size=(8, 8),
+            valid_sizes=[(8, 4)],
         )
 
-        self.assertEqual(tuple(logits.shape), (2, 1, 8, 8))
-        self.assertEqual(default_decoder.calls, [])
-        self.assertEqual(len(override.calls), 1)
-        self.assertEqual(override.calls[0]["high_res_shapes"], [(2, 32, 8, 8), (2, 64, 4, 4)])
-
-        logits.sum().backward()
-        # 参考解码器冻结，但热图仍能通过冻结的提示编码器获得梯度。
-        self.assertIsNotNone(heatmaps.grad)
-        self.assertTrue(bool(torch.count_nonzero(heatmaps.grad)))
-        self.assertTrue(all(parameter.grad is None for parameter in override.parameters()))
+        mask = model.sam.sam_prompt_encoder.last_masks
+        # 有效区域为 1 * 3.0；右半 padding 严格为 0。
+        self.assertTrue(
+            torch.allclose(
+                mask[:, :, :, :4], torch.full_like(mask[:, :, :, :4], 3.0)
+            )
+        )
+        self.assertTrue(torch.equal(mask[:, :, :, 4:], torch.zeros_like(mask[:, :, :, 4:])))
 
     def test_decode_heatmaps_rejects_invalid_shapes(self) -> None:
         model = _fake_road_sam()
@@ -572,34 +632,55 @@ class FakeSAM2FeatureContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             model.decode_heatmaps(features, torch.zeros(2, 3, 4, 4))
         with self.assertRaises(ValueError):
-            model.decode_heatmaps(features, torch.zeros(1, 2, 4, 4))
+            # 新协议只接受单通道有符号场。
+            model.decode_heatmaps(features, torch.zeros(2, 2, 4, 4))
+        with self.assertRaises(ValueError):
+            model.decode_heatmaps(features, torch.zeros(1, 1, 4, 4))
         with self.assertRaises(TypeError):
-            model.decode_heatmaps(features, torch.zeros(2, 2, 4, 4, dtype=torch.uint8))
+            model.decode_heatmaps(features, torch.zeros(2, 1, 4, 4, dtype=torch.uint8))
         with self.assertRaises(ValueError):
             model.decode_heatmaps(
                 features,
-                torch.zeros(2, 2, 4, 4),
+                torch.zeros(2, 1, 4, 4),
                 output_size=(8, 8),
                 valid_sizes=[(8, 8), (0, 4)],
             )
 
-    def test_train_mode_keeps_frozen_sam2_modules_in_eval(self) -> None:
+    def test_decode_heatmaps_rejects_invalid_prompt_scale(self) -> None:
+        model = _fake_road_sam()
+        features = model.encode(torch.ones(1, 3, 1024, 1024))
+        for scale in (0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(prompt_scale=scale):
+                model.prompt_scale = scale
+                with self.assertRaises(ValueError):
+                    model.decode_heatmaps(features, torch.zeros(1, 1, 4, 4))
+
+    def test_train_mode_keeps_all_sam_modules_eval_and_frozen(self) -> None:
         model = _fake_road_sam()
         model.train(True)
 
+        self.assertFalse(model.training)
         self.assertFalse(model.sam.image_encoder.training)
         self.assertFalse(model.sam.sam_prompt_encoder.training)
-        self.assertTrue(model.sam.sam_mask_decoder.training)
-        self.assertFalse(model.sam.no_mem_embed.requires_grad)
+        self.assertFalse(model.sam.sam_mask_decoder.training)
         self.assertTrue(
-            all(
-                parameter.requires_grad
-                for parameter in model.sam.sam_mask_decoder.parameters()
-            )
+            all(not parameter.requires_grad for parameter in model.parameters())
         )
+        self.assertTrue(all(not buffer.requires_grad for buffer in model.buffers()))
+        self.assertFalse(model.sam.no_mem_embed.requires_grad)
 
         model.train(False)
         self.assertFalse(model.sam.sam_mask_decoder.training)
+
+    def test_constructor_validates_prompt_scale_without_official_sam2(self) -> None:
+        fake_sam = _FakeSAM2()
+        with mock.patch("diffpeak.models.sam._build_sam2", return_value=fake_sam):
+            model = RoadSAM(prompt_scale=2.5)
+            self.assertEqual(model.prompt_scale, 2.5)
+            self.assertFalse(model.training)
+            for scale in (0.0, -1.0, float("nan"), float("inf")):
+                with self.subTest(prompt_scale=scale), self.assertRaises(ValueError):
+                    RoadSAM(prompt_scale=scale)
 
 
 if __name__ == "__main__":

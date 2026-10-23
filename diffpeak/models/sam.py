@@ -1,7 +1,10 @@
 """SAM 2.1 分割分支。
 
 约定：
-- 图像编码器与提示编码器始终冻结，仅掩码解码器（含其高分辨率投影）可训练；
+- 图像编码器、提示编码器与掩码解码器（含高分辨率投影）**全部冻结**，且
+  在调用 ``train()`` 后仍保持 ``eval``；
+- 冻结参数不阻断输入梯度：``decode_heatmaps`` 保留计算图，使单通道场提示
+  可以接收来自分割损失的梯度；
 - 输入图像为 RGB、取值范围 ``[0, 1]``、尺寸 ``B x 3 x 1024 x 1024``；
 - 提示点坐标已经位于 SAM2 的 1024 输入坐标系，正点标签为 1，负点为 0。
 
@@ -17,6 +20,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from numbers import Real
 from typing import List, Optional, Sequence, Tuple, Union
@@ -38,7 +42,7 @@ class SAM2ImageFeatures:
         low_res: ``B x 256 x 64 x 64``，供条件编码器与掩码解码器使用。
         high_res: ``(B x 256 x 256 x 256, B x 256 x 128 x 128)`` 的原始 FPN
             特征。其通道仍为 neck 的 ``d_model``；1x1 投影 ``conv_s0`` /
-            ``conv_s1`` 在解码时执行，使这两个解码器参数可训练。
+            ``conv_s1`` 在解码时执行，但它们与其他 SAM 参数一样冻结。
         """
 
     low_res: Tensor
@@ -128,10 +132,10 @@ def _build_sam2(
 class RoadSAM(nn.Module):
     """基于官方 SAM2.1 Hiera-B+ 的道路分割分支。
 
-    图像编码器、提示编码器、记忆模块与位置参数全部冻结；仅
-    ``sam_mask_decoder``（含 ``conv_s0`` / ``conv_s1``）可训练。
-    ``encode`` 在 ``torch.no_grad()`` 下运行冻结编码器，返回不带梯度的
-    特征；高分辨率投影在 ``decode`` 中执行，以保留了解码器参数的梯度。
+    SAM 的全部参数与 buffer 始终冻结，且 ``train()`` 调用不会切换到训练
+    模式。``encode`` 在 ``torch.no_grad()`` 下运行冻结编码器，返回不带梯度
+    的特征；``decode_heatmaps`` 不包裹 ``torch.no_grad()``，因此梯度可以穿过
+    冻结的提示编码器/掩码解码器回到单通道有符号场提示。
 
     Args:
         checkpoint: 官方 SAM2.1 权重路径（例如
@@ -141,6 +145,8 @@ class RoadSAM(nn.Module):
         apply_postprocessing: 是否启用官方解码器的动态多掩码回退。默认
             ``False``，保证训练、验证与奖励使用同一种单掩码语义。
         architecture: 写入快照的骨干标识；默认使用 ``config_name``。
+        prompt_scale: 有符号场到 SAM 密集提示的固定正尺度 ``U = s * H``，
+            默认 1.0；必须是有限正数。
     """
 
     def __init__(
@@ -150,8 +156,13 @@ class RoadSAM(nn.Module):
         no_positive_logit: float = -20.0,
         apply_postprocessing: bool = False,
         architecture: Optional[str] = None,
+        prompt_scale: float = 1.0,
     ) -> None:
         super().__init__()
+        if not math.isfinite(prompt_scale) or prompt_scale <= 0:
+            raise ValueError(
+                f"prompt_scale 必须是有限正数，实际为 {prompt_scale!r}"
+            )
         self.sam = _build_sam2(
             str(config_name),
             None if checkpoint is None else str(checkpoint),
@@ -161,6 +172,7 @@ class RoadSAM(nn.Module):
         self.architecture = str(architecture or config_name)
         self.apply_postprocessing = bool(apply_postprocessing)
         self.no_positive_logit = float(no_positive_logit)
+        self.prompt_scale = float(prompt_scale)
 
         # SAM2 官方变换在 [0,1] 像素尺度上做 ImageNet 标准化。
         self.register_buffer(
@@ -174,27 +186,36 @@ class RoadSAM(nn.Module):
             persistent=False,
         )
 
-        self._freeze_encoder_and_prompt()
+        self._freeze_all_parameters()
+        # 所有冻结模块从构造起就处于 eval，避免 buffer（例如归一化统计）
+        # 在任何训练调用中被更新。
+        self.train(False)
 
     @property
     def mask_decoder(self) -> nn.Module:
-        """可训练的解码器（SAM2 命名为 ``sam_mask_decoder``）。"""
+        """掩码解码器（SAM2 命名为 ``sam_mask_decoder``，全阶段冻结）。"""
         return self.sam.sam_mask_decoder
 
-    def _freeze_encoder_and_prompt(self) -> None:
-        """冻结除掩码解码器外的全部 SAM2 参数。"""
-        for parameter in self.sam.parameters():
+    def _freeze_all_parameters(self) -> None:
+        """冻结 RoadSAM（含内部 SAM2）的全部参数与 buffer。"""
+        for parameter in self.parameters():
             parameter.requires_grad_(False)
-        for parameter in self.sam.sam_mask_decoder.parameters():
-            parameter.requires_grad_(True)
+        for buffer in self.buffers():
+            buffer.requires_grad_(False)
+
+    def _freeze_encoder_and_prompt(self) -> None:
+        """旧名称兼容；现在冻结全部 SAM2 参数与 buffer。"""
+        self._freeze_all_parameters()
 
     def train(self, mode: bool = True) -> "RoadSAM":
-        """保持冻结模块处于 eval，仅切换掩码解码器的训练状态。"""
-        super().train(mode)
-        for name, child in self.sam.named_children():
-            if name != "sam_mask_decoder":
-                child.eval()
-        self.sam.sam_mask_decoder.train(mode)
+        """始终保持全部 SAM2 模块为 ``eval`` 与冻结状态。
+
+        冻结协议要求训练脚本整体调用 ``train()`` 时也不能解冻或切换 SAM；
+        因此无论 ``mode`` 为何，这里都强制 ``eval`` 并重新施加冻结。
+        """
+        super().train(False)
+        self.sam.eval()
+        self._freeze_all_parameters()
         return self
 
     @staticmethod
@@ -390,7 +411,11 @@ class RoadSAM(nn.Module):
         points: Sequence[Tuple[Tensor, Tensor]],
         output_size: Tuple[int, int] = (1024, 1024),
     ) -> Tensor:
-        """根据 SAM2 图像特征与正负点提示输出道路分割 logits。
+        """根据 SAM2 图像特征与正负点提示输出道路分割 logits（工具路径）。
+
+        新协议的主链路是密集单通道场提示 :meth:`decode_heatmaps`；本方法保留
+        用于稀疏点提示的诊断与旧测试。由于 SAM 全部参数冻结且输入特征已
+        detach，返回值默认不连接计算图。
 
         Args:
             embeddings: ``encode`` 返回的 :class:`SAM2ImageFeatures`。为兼容
@@ -459,8 +484,8 @@ class RoadSAM(nn.Module):
 
             high_res_features = None
             if high_res is not None:
-                # 1x1 投影属于掩码解码器，必须在 no_grad 之外执行，保证
-                # conv_s0 / conv_s1 与解码器其他参数一样可训练。
+                # 1x1 投影属于冻结的掩码解码器；稀疏路径不需要参数梯度，
+                # 仍然复用同一前向接口。
                 sample_high = high_res[0][index : index + 1], high_res[1][index : index + 1]
                 high_res_features = [
                     self.sam.sam_mask_decoder.conv_s0(sample_high[0]),
@@ -553,40 +578,69 @@ class RoadSAM(nn.Module):
             normalised.append((height, width))
         return normalised
 
+    @staticmethod
+    def _valid_region_mask(
+        valid_sizes: Sequence[Tuple[int, int]],
+        batch_size: int,
+        size: Tuple[int, int],
+        output_size: Tuple[int, int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        """在指定分辨率上构造有效区域为 1、右下 padding 为 0 的掩码。
+
+        ``valid_sizes`` 与 ``output_size`` 使用同一画布坐标，有效性采用与
+        ``diffpeak.data.ridge._valid_heatmap_mask`` 完全一致的像素中心判据：
+
+        ``(i + 0.5) * output / size <= valid``
+
+        对目标分辨率上的每个索引 ``i`` 直接判定，而不是先做 ``round``。
+        这样半像素边界（例如 ``valid * size / output = 2.5``）不会受
+        banker's rounding 影响，也不会强制保留至少一个像素——细几何可能
+        映射为零个目标像素。整数形式 ``(2i+1)*output <= 2*valid*size``
+        精确保留该判据。
+        """
+        height, width = int(size[0]), int(size[1])
+        out_height, out_width = int(output_size[0]), int(output_size[1])
+        rows = torch.arange(height, device=device, dtype=torch.int64)
+        cols = torch.arange(width, device=device, dtype=torch.int64)
+        mask = torch.zeros(
+            (batch_size, 1, height, width), device=device, dtype=dtype
+        )
+        for index, (valid_height, valid_width) in enumerate(valid_sizes):
+            row_ok = (2 * rows + 1) * out_height <= 2 * int(valid_height) * height
+            col_ok = (2 * cols + 1) * out_width <= 2 * int(valid_width) * width
+            mask[index, 0] = (row_ok[:, None] & col_ok[None, :]).to(dtype)
+        return mask
+
     def decode_heatmaps(
         self,
         embeddings: Union[Tensor, SAM2ImageFeatures],
         heatmaps: Tensor,
         output_size: Tuple[int, int] = (1024, 1024),
         valid_sizes: Optional[Union[Sequence[Tuple[int, int]], Tensor]] = None,
-        decoder: Optional[nn.Module] = None,
     ) -> Tensor:
-        """用可微密集热图提示解码全部样本。
+        """用可微单通道有符号场提示解码全部样本。
 
-        该路径用于联合 ABC 端到端训练：把扩散热图的**正负通道差**
-        ``heatmaps[:, 0] - heatmaps[:, 1]``（一通道输入则直接使用）作为 SAM
-        掩码提示，经冻结的提示编码器得到 dense embedding，再交给掩码解码器。
-        与 :meth:`decode` 不同：
+        新协议主链路：``heatmaps`` 是 ``[-1, 1]`` 的单通道道路山脊场 ``H``，
+        固定正尺度映射为 ``U = prompt_scale * H`` 后作为 SAM 密集掩码提示。
+        与稀疏 :meth:`decode` 不同：
 
         * 不使用任何稀疏点提示（``points=None`` / ``boxes=None``）；
-        * 不跳过空热图样本，整批一次解码，因此每张图都有解码器梯度路径；
-        * 提示编码器在**不包裹** ``torch.no_grad()`` 的情况下执行。其权重仍然
-          冻结，但因输入 ``heatmaps`` 要求梯度，反向传播可以穿过冻结的掩码
-          下采样卷积回到热图，进而回到去噪器/条件编码器；
-        * 高分辨率 FPN 投影 ``conv_s0`` / ``conv_s1`` 取自 ``decoder``（默认
-          当前模型的掩码解码器），保证联合训练时这些参数仍可训练。
+        * 不跳过空场样本，整批一次解码；
+        * 提示编码器与掩码解码器在**不包裹** ``torch.no_grad()`` 的情况下
+          执行。其参数全部冻结，但因输入 ``heatmaps`` 要求梯度，反向传播
+          可以穿过冻结权重回到有符号场，进而回到去噪器/条件编码器；
+        * ``valid_sizes`` 给出的有效区域外（右下 padding）的提示严格置零，
+          热图分辨率与提示编码器输入分辨率使用同一缩放约定。
 
         Args:
             embeddings: ``encode`` 返回的 :class:`SAM2ImageFeatures`（含高分辨率
                 特征时最完整）；也接受裸低分辨率 ``B x 256 x 64 x 64`` 张量。
-            heatmaps: ``B x 2 x h x w`` 的正/负提示热图（通道 0 为正、1 为负），
-                或 ``B x 1 x h x w`` 的已签名掩码。范围约定为 ``[0, 1]``。
+            heatmaps: ``B x 1 x h x w`` 的单通道有符号场，范围 ``[-1, 1]``。
             output_size: 输出 logits 的 ``(height, width)``，默认 1024。
             valid_sizes: 可选的每样本有效区域 ``(height, width)``，单位为
                 ``output_size`` 画布像素；右下填充区会在送入提示编码器前清零。
-            decoder: 可选的掩码解码器覆盖模块（需提供与 SAM2 相同的
-                ``forward`` 签名以及 ``conv_s0`` / ``conv_s1``，例如强化学习
-                阶段冻结的参考解码器）。默认使用 ``self.mask_decoder``。
 
         Returns:
             ``B x 1 x H x W`` 的分割 logits（``H, W`` 来自 ``output_size``）。
@@ -601,9 +655,9 @@ class RoadSAM(nn.Module):
             raise ValueError("output_size 应为 (H, W)")
         if not torch.is_tensor(heatmaps):
             raise TypeError(f"heatmaps 必须是张量，实际为 {type(heatmaps)!r}")
-        if heatmaps.ndim != 4 or heatmaps.shape[1] not in (1, 2):
+        if heatmaps.ndim != 4 or int(heatmaps.shape[1]) != 1:
             raise ValueError(
-                "heatmaps 应为 B x 2 x H x W（或 B x 1 的已签名掩码），"
+                "heatmaps 应为 B x 1 x H x W 的单通道有符号场，"
                 f"实际为 {tuple(heatmaps.shape)}"
             )
         if not heatmaps.is_floating_point():
@@ -618,30 +672,29 @@ class RoadSAM(nn.Module):
             # 移动是可微操作，不切断到原始 heatmaps 的梯度。
             heatmaps = heatmaps.to(device=low_res.device)
 
-        # 官方约定通道 0 为正提示、通道 1 为负提示；有符号差值即掩码 logits。
-        if heatmaps.shape[1] == 2:
-            dense_mask = heatmaps[:, 0:1] - heatmaps[:, 1:2]
-        else:
-            dense_mask = heatmaps[:, 0:1]
+        prompt_scale = float(getattr(self, "prompt_scale", 1.0))
+        if not math.isfinite(prompt_scale) or prompt_scale <= 0:
+            raise ValueError(
+                f"prompt_scale 必须是有限正数，实际为 {prompt_scale!r}"
+            )
+        # 固定尺度映射：有符号场 H -> 密集提示 U = s * H。
+        dense_mask = heatmaps[:, 0:1] * prompt_scale
 
         out_height, out_width = int(output_size[0]), int(output_size[1])
-        heat_height, heat_width = int(dense_mask.shape[-2]), int(dense_mask.shape[-1])
         sizes: Optional[List[Tuple[int, int]]] = None
         if valid_sizes is not None:
             sizes = self._normalise_prompt_valid_sizes(
                 valid_sizes, batch_size, (out_height, out_width)
             )
-            valid = torch.zeros_like(dense_mask)
-            for index, (valid_height, valid_width) in enumerate(sizes):
-                scaled_height = max(
-                    1, min(heat_height, int(round(valid_height * heat_height / out_height)))
-                )
-                scaled_width = max(
-                    1, min(heat_width, int(round(valid_width * heat_width / out_width)))
-                )
-                valid[index, :, :scaled_height, :scaled_width] = 1.0
-            # 乘法保持可微，并让填充区的提示恰为 0（背景）。
-            dense_mask = dense_mask * valid
+            # 乘法保持可微，并让填充区的提示恰为 0。
+            dense_mask = dense_mask * self._valid_region_mask(
+                sizes,
+                batch_size,
+                (int(dense_mask.shape[-2]), int(dense_mask.shape[-1])),
+                (out_height, out_width),
+                dense_mask.device,
+                dense_mask.dtype,
+            )
 
         prompt_encoder = getattr(self.sam, "sam_prompt_encoder", None)
         if prompt_encoder is None:
@@ -657,29 +710,15 @@ class RoadSAM(nn.Module):
         if sizes is not None:
             # 双线性上采样会把有效区边界外的零向内侧扩散；在提示编码器的
             # 输入分辨率上再次硬屏蔽，保证 padding 提示严格为 0。
-            prompt_valid = torch.zeros_like(mask_prompt)
-            for index, (valid_height, valid_width) in enumerate(sizes):
-                scaled_height = max(
-                    1,
-                    min(
-                        mask_input_size[0],
-                        int(
-                            round(
-                                valid_height * mask_input_size[0] / out_height
-                            )
-                        ),
-                    ),
-                )
-                scaled_width = max(
-                    1,
-                    min(
-                        mask_input_size[1],
-                        int(round(valid_width * mask_input_size[1] / out_width)),
-                    ),
-                )
-                prompt_valid[index, :, :scaled_height, :scaled_width] = 1.0
-            mask_prompt = mask_prompt * prompt_valid
-        # 与提示编码器参数 dtype 对齐；``.to`` 可微，不切断到热图的梯度。
+            mask_prompt = mask_prompt * self._valid_region_mask(
+                sizes,
+                batch_size,
+                mask_input_size,
+                (out_height, out_width),
+                mask_prompt.device,
+                mask_prompt.dtype,
+            )
+        # 与提示编码器参数 dtype 对齐；``.to`` 可微，不切断到场提示的梯度。
         try:
             prompt_dtype = next(prompt_encoder.parameters()).dtype
         except StopIteration:  # pragma: no cover - 无参数的测试替身
@@ -692,10 +731,6 @@ class RoadSAM(nn.Module):
             points=None, boxes=None, masks=mask_prompt
         )
 
-        decoder_module = self.mask_decoder if decoder is None else decoder
-        if not callable(decoder_module):
-            raise TypeError("decoder 必须是可调用的掩码解码器模块")
-
         high_res = (
             embeddings.high_res if isinstance(embeddings, SAM2ImageFeatures) else None
         )
@@ -707,19 +742,14 @@ class RoadSAM(nn.Module):
 
         high_res_features = None
         if high_res is not None:
-            conv_s0 = getattr(decoder_module, "conv_s0", None)
-            conv_s1 = getattr(decoder_module, "conv_s1", None)
-            if conv_s0 is None or conv_s1 is None:
-                raise ValueError(
-                    "decoder 缺少 conv_s0 / conv_s1，无法复用高分辨率 FPN 投影"
-                )
             high_res_features = [
-                conv_s0(high_res[0]),
-                conv_s1(high_res[1]),
+                self.sam.sam_mask_decoder.conv_s0(high_res[0]),
+                self.sam.sam_mask_decoder.conv_s1(high_res[1]),
             ]
 
-        image_pe = prompt_encoder.get_dense_pe()
-        low_res_logits, _, _, _ = decoder_module(
+        with torch.no_grad():
+            image_pe = prompt_encoder.get_dense_pe()
+        low_res_logits, _, _, _ = self.sam.sam_mask_decoder(
             image_embeddings=low_res,
             image_pe=image_pe,
             sparse_prompt_embeddings=sparse_embeddings,

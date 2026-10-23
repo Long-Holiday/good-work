@@ -1,4 +1,9 @@
-"""Tiny ABC,D control-flow integration; no pretrained weights or quality claims."""
+"""Tiny ABC,D control-flow integration for the signed-ridge protocol.
+
+No pretrained weights and no quality claims: the tiny SAM/diffusion only verify
+stage wiring, frozen-SAM invariants, checkpoint protocol, throughput overrides,
+logging scopes and exact resume equivalence.
+"""
 from __future__ import annotations
 
 import copy
@@ -19,11 +24,18 @@ from diffpeak.experiment_logging import ExperimentLogger
 from diffpeak.inference import DEFAULT_CONFIG, read_checkpoint
 from diffpeak.models import ConditionEncoder, ConditionalDiT, GaussianDiffusion
 from diffpeak.models.sam import SAM2ImageFeatures
-from diffpeak.prompts import PeakExtractor
+
+PROTOCOL = "signed_ridge_v1"
 
 
 class _TinySAM(nn.Module):
+    """Prompt-sensitive dense decoder; every parameter is frozen by the engine."""
+
     no_positive_logit = -20.0
+    prompt_scale = 1.0
+    architecture = "tiny"
+    config_name = "tiny.yaml"
+    apply_postprocessing = False
 
     def __init__(self):
         super().__init__()
@@ -40,39 +52,32 @@ class _TinySAM(nn.Module):
             (F.avg_pool2d(features, 4), F.avg_pool2d(features, 8)),
         )
 
-    def decode(self, embeddings, points, output_size):
-        logits = self.sam.mask_decoder(embeddings.low_res)
-        # The lightweight environment is prompt-sensitive, without using labels.
-        coords, labels = points[0]
-        shift = coords[labels == 1].mean() / output_size[0]
-        return F.interpolate(logits, size=output_size, mode="bilinear", align_corners=False) + shift
-
     def decode_heatmaps(
         self,
         embeddings,
         heatmaps,
         output_size=(1024, 1024),
         valid_sizes=None,
-        *,
-        decoder=None,
     ):
-        """可微密集热图提示：解码器参数与热图都必须保留梯度。"""
-        module = self.sam.mask_decoder if decoder is None else decoder
+        """单通道有符号场 -> 固定尺度 dense prompt -> logits (grad keeps)."""
         low_res = getattr(embeddings, "low_res", embeddings)
-        logits = module(low_res)
-        if heatmaps.shape[1] == 2:
-            dense = heatmaps[:, 0:1] - heatmaps[:, 1:2]
-        else:
-            dense = heatmaps[:, 0:1]
+        logits = self.sam.mask_decoder(low_res)
+        dense = heatmaps[:, 0:1] * float(self.prompt_scale)
         if valid_sizes is not None:
             mask = torch.zeros_like(dense)
+            ratio_h = float(dense.shape[-2]) / float(output_size[0])
+            ratio_w = float(dense.shape[-1]) / float(output_size[1])
             for index, size in enumerate(valid_sizes):
                 height, width = (
-                    (int(dense.shape[-2]), int(dense.shape[-1]))
+                    (int(output_size[0]), int(output_size[1]))
                     if size is None
                     else (int(size[0]), int(size[1]))
                 )
-                mask[index, :, :height, :width] = 1.0
+                mask[
+                    index, :,
+                    : max(1, int(round(height * ratio_h))),
+                    : max(1, int(round(width * ratio_w))),
+                ] = 1.0
             dense = dense * mask
         dense = F.interpolate(
             dense, size=logits.shape[-2:], mode="bilinear", align_corners=False
@@ -95,11 +100,12 @@ def _build_tiny_models(config, device, sam_checkpoint=None):
             hidden_size=32, depth=2, num_heads=4, patch_size=4,
             condition_channels=(4, 8, 8, 8), gradient_checkpointing=True,
         ),
-        "diffusion": GaussianDiffusion(timesteps=8, sampling_steps=2, heatmap_size=16),
+        "diffusion": GaussianDiffusion(
+            timesteps=8, sampling_steps=2, heatmap_size=16
+        ),
     }
-    return {name: module.to(device) for name, module in models.items()}, PeakExtractor(
-        sigma=0, h=0, threshold=0.3, min_distance=4
-    )
+    # Signed-ridge 协议不再构造峰值提取器；build_models 返回 (models, None)。
+    return {name: module.to(device) for name, module in models.items()}, None
 
 
 def _session_records(directory):
@@ -142,25 +148,42 @@ class EnginePipelineTest(unittest.TestCase):
         split = root / "split.json"
         split.write_text(json.dumps(entries), encoding="utf-8")
         config = copy.deepcopy(DEFAULT_CONFIG)
-        # 默认配置必须使用联合 ABC,D 协议；分阶段 A/B/C 已移除。
-        self.assertEqual(config["training_protocol"], "joint_abc_v1")
+        # 默认配置必须是单通道有符号山脊场协议，且只保留 ABC,D。
+        self.assertEqual(config["training_protocol"], PROTOCOL)
         self.assertEqual(tuple(config["stages"]), ("ABC", "D"))
         # 快照配置必须描述测试工厂实际构建的微型 DiT。
         config["model"]["dit"].update(
             hidden_size=32, depth=2, num_heads=4, patch_size=4,
             condition_channels=(4, 8, 8, 8), gradient_checkpointing=True,
         )
-        config["data"].update(root=str(data), train_split=str(split), val_split=str(split), num_workers=0)
+        config["data"].update(
+            root=str(data), train_split=str(split), val_split=str(split),
+            num_workers=0,
+        )
         config["output_dir"] = str(root / "run")
         checkpoint = root / "unused.pth"
         checkpoint.write_bytes(b"tiny SAM builder does not read pretrained weights")
         config["model"]["sam_checkpoint"] = str(checkpoint)
-        config["train"].update(
-            amp=False, batch_size=batch_size, accumulation_steps=1, val_limit=1, log_every=100
+        # 微型 SAM 替身的骨干标识必须与快照记录一致，否则严格加载会拒绝。
+        config["model"].update(
+            sam_architecture="tiny", sam_config="tiny.yaml"
         )
-        config["rl"].update(group_size=2, point_cost_warmup_steps=2)
-        for stage in ("ABC", "D"):
-            config["stages"][stage].update(epochs=1, lr=1e-4, warmup_steps=1)
+        config["train"].update(
+            amp=False, batch_size=batch_size, accumulation_steps=1,
+            val_limit=1, log_every=100,
+        )
+        # anchor/KL 保证微型组也有真实更新，用于逐位恢复等价性检查。
+        config["rl"].update(
+            group_size=2, anchor_weight=0.1, kl_weight=0.01, update_epochs=1
+        )
+        config["stages"]["ABC"].update(
+            epochs=1, lr=1e-4, warmup_steps=1,
+            batch_size=2, accumulation_steps=1,
+        )
+        config["stages"]["D"].update(
+            epochs=1, lr=1e-4, warmup_steps=1,
+            batch_size=1, accumulation_steps=1,
+        )
         return config
 
     def _engine(self, config):
@@ -168,6 +191,25 @@ class EnginePipelineTest(unittest.TestCase):
         engine.image_size = 64
         engine.heatmap_size = 16
         return engine
+
+    def _assert_frozen_sam(self, test, engine, reference_state):
+        test.assertFalse(engine.sam.training)
+        test.assertTrue(all(not p.requires_grad for p in engine.sam.parameters()))
+        for name, value in engine.sam.state_dict().items():
+            torch.testing.assert_close(
+                value, reference_state[name], rtol=0, atol=0,
+                msg=f"SAM buffer/参数 {name} 在训练中被修改",
+            )
+
+    def _assert_protocol_payload(self, test, payload, stage):
+        test.assertEqual(payload["stage"], stage)
+        test.assertEqual(payload["format_version"], 5)
+        test.assertEqual(payload["training_protocol"], PROTOCOL)
+        test.assertEqual(payload["target_representation"], PROTOCOL)
+        test.assertIs(payload["sam_frozen"], True)
+        test.assertEqual(payload["latent_channels"], 1)
+        test.assertEqual(payload["prompt"]["terminal_mapping"], "clamp")
+        test.assertAlmostEqual(float(payload["prompt"]["scale"]), 1.0)
 
     def test_joint_abc_d_flow_and_resume_match_uninterrupted_training(self):
         with tempfile.TemporaryDirectory() as temporary, patch(
@@ -177,38 +219,47 @@ class EnginePipelineTest(unittest.TestCase):
             config = self._make_config(root)
             engine = self._engine(config)
 
-            # ABC：只更新扩散分支，SAM 参数和 buffers 全部保持不变。
+            # ABC：SAM 全冻结且保持 eval；条件编码器与 DiT 正常训练。
             sam_before = copy.deepcopy(engine.sam.state_dict())
             abc_metrics = engine.run_stage("ABC")
             self.assertTrue(np.isfinite(abc_metrics["iou"]))
-            self.assertFalse(engine.sam.sam.mask_decoder.training)
-            self.assertTrue(all(not p.requires_grad for p in engine.sam.parameters()))
-            for name, value in engine.sam.state_dict().items():
-                torch.testing.assert_close(value, sam_before[name], rtol=0, atol=0)
+            self._assert_frozen_sam(self, engine, sam_before)
             self.assertTrue(engine.condition_encoder.training)
             self.assertTrue(engine.dit.training)
+            self.assertIsNone(engine.ref_dit)
+            self.assertIsNone(engine.ref_condition_encoder)
+            self.assertIsNone(getattr(engine, "ref_sam_decoder", None))
             payload = read_checkpoint(engine.output_dir / "last.pt")
-            self.assertEqual(payload["stage"], "ABC")
-            self.assertEqual(payload["format_version"], 4)
-            self.assertEqual(payload["training_protocol"], "joint_abc_v1")
-            self.assertNotIn("ref_dit", payload["models"])
+            self._assert_protocol_payload(self, payload, "ABC")
+            for name in ("ref_dit", "ref_condition_encoder", "ref_sam_decoder"):
+                self.assertNotIn(name, payload["models"])
             self.assertTrue((engine.output_dir / "stage_ABC.pth").is_file())
-            # D 从 ABC 结束状态初始化；快照不依赖旧分阶段权重。
-            abc_state = copy.deepcopy(engine._model_states())
+            # D 从 ABC 结束的完整快照初始化；加载路径会严格校验协议元数据。
+            abc_payload = copy.deepcopy(payload)
 
-            # D：rollout 与 replay 都使用 eval 模式，但三个模块仍可训练。
+            # D：rollout/replay 用 eval 模式，但条件编码器与 DiT 仍可训练；
+            # 参考模块只有 ref_dit 与 ref_condition_encoder。
             d_metrics = engine.run_stage("D")
             self.assertTrue(np.isfinite(d_metrics["iou"]))
-            self.assertFalse(engine.sam.sam.mask_decoder.training)
+            self._assert_frozen_sam(self, engine, sam_before)
             self.assertFalse(engine.condition_encoder.training)
             self.assertFalse(engine.dit.training)
+            self.assertTrue(all(p.requires_grad for p in engine.condition_encoder.parameters()))
+            self.assertTrue(all(p.requires_grad for p in engine.dit.parameters()))
+            self.assertIsNotNone(engine.ref_dit)
             self.assertFalse(engine.ref_dit.training)
+            self.assertTrue(all(not p.requires_grad for p in engine.ref_dit.parameters()))
+            self.assertIsNotNone(engine.ref_condition_encoder)
+            self.assertFalse(engine.ref_condition_encoder.training)
+            self.assertTrue(
+                all(not p.requires_grad for p in engine.ref_condition_encoder.parameters())
+            )
+            self.assertIsNone(getattr(engine, "ref_sam_decoder", None))
             payload = read_checkpoint(engine.output_dir / "last.pt")
-            self.assertEqual(payload["stage"], "D")
-            self.assertEqual(payload["format_version"], 4)
-            self.assertEqual(payload["training_protocol"], "joint_abc_v1")
-            for name in ("ref_dit", "ref_condition_encoder", "ref_sam_decoder"):
+            self._assert_protocol_payload(self, payload, "D")
+            for name in ("ref_dit", "ref_condition_encoder"):
                 self.assertIn(name, payload["models"])
+            self.assertNotIn("ref_sam_decoder", payload["models"])
             self.assertTrue((engine.output_dir / "stage_D.pth").is_file())
             self.assertEqual([item["stage"] for item in engine.history], ["ABC", "D"])
             self.assertGreater(engine.global_step, 0)
@@ -219,15 +270,14 @@ class EnginePipelineTest(unittest.TestCase):
             config["stages"]["D"]["epochs"] = 2
             config["output_dir"] = str(root / "continuous")
             continuous = self._engine(config)
-            continuous.load_models_from_payload(
-                {"models": copy.deepcopy(abc_state), "stage": "ABC"}
-            )
+            continuous.load_models_from_payload(copy.deepcopy(abc_payload))
             uninterrupted_config = copy.deepcopy(config)
             uninterrupted_config["output_dir"] = str(root / "uninterrupted")
             uninterrupted = self._engine(uninterrupted_config)
-            uninterrupted.load_models_from_payload(
-                {"models": copy.deepcopy(abc_state), "stage": "ABC"}
-            )
+            uninterrupted.load_models_from_payload(copy.deepcopy(abc_payload))
+            # 监督锚定使用全局 torch RNG；两次独立 D 运行必须从同一 RNG
+            # 状态出发，恢复等价性才只检验 checkpoint 语义。
+            torch.manual_seed(int(config.get("seed", 42)))
             uninterrupted.run_stage("D")
             original_builder = continuous._build_train_loader
 
@@ -236,34 +286,53 @@ class EnginePipelineTest(unittest.TestCase):
                     raise KeyboardInterrupt
                 return original_builder(epoch)
 
-            with patch.object(continuous, "_build_train_loader", side_effect=interrupt_second_epoch):
+            torch.manual_seed(int(config.get("seed", 42)))
+            with patch.object(
+                continuous, "_build_train_loader", side_effect=interrupt_second_epoch
+            ):
                 with self.assertRaises(KeyboardInterrupt):
                     continuous.run_stage("D")
             checkpoint = read_checkpoint(continuous.output_dir / "last.pt")
             self.assertEqual(checkpoint["epoch"], 1)
             # D: 2 个样本、batch_size=1 -> 2 步/epoch，两轮共 4 步。
             self.assertEqual(checkpoint["schedule"]["total_steps"], 4)
-            for name in ("ref_dit", "ref_condition_encoder", "ref_sam_decoder"):
+            for name in ("ref_dit", "ref_condition_encoder"):
                 self.assertIn(name, checkpoint["models"])
-            continuous.run_stage("D", start_epoch=1, resume_payload=copy.deepcopy(checkpoint))
+            self.assertNotIn("ref_sam_decoder", checkpoint["models"])
+            continuous.run_stage(
+                "D", start_epoch=1, resume_payload=copy.deepcopy(checkpoint)
+            )
 
             config["output_dir"] = str(root / "resumed")
             # A CLI override must not silently replace the checkpoint's LR curve.
-            config["stages"]["D"].update(warmup_steps=0, warmup_ratio=0.0, min_lr_ratio=0.9)
+            config["stages"]["D"].update(
+                warmup_steps=0, warmup_ratio=0.0, min_lr_ratio=0.9
+            )
             resumed = self._engine(config)
-            resumed.run_stage("D", start_epoch=1, resume_payload=copy.deepcopy(checkpoint))
+            resumed.run_stage(
+                "D", start_epoch=1, resume_payload=copy.deepcopy(checkpoint)
+            )
             self.assertEqual(resumed.global_step, continuous.global_step)
-            self.assertEqual(resumed.grpo_groups_processed, continuous.grpo_groups_processed)
-            self.assertEqual(resumed.scheduler.state_dict(), continuous.scheduler.state_dict())
-            self.assertEqual(resumed.optimizer.param_groups[0]["lr"], continuous.optimizer.param_groups[0]["lr"])
+            self.assertEqual(
+                resumed.grpo_groups_processed, continuous.grpo_groups_processed
+            )
+            self.assertEqual(
+                resumed.scheduler.state_dict(), continuous.scheduler.state_dict()
+            )
+            self.assertEqual(
+                resumed.optimizer.param_groups[0]["lr"],
+                continuous.optimizer.param_groups[0]["lr"],
+            )
             self.assertEqual(uninterrupted.global_step, continuous.global_step)
-            # 三个策略模块与三个固定参考模块都必须逐位恢复。
+            # 两个策略模块与两个固定参考模块都必须逐位恢复；SAM 始终不变。
             module_names = (
                 "sam", "condition_encoder", "dit",
-                "ref_dit", "ref_condition_encoder", "ref_sam_decoder",
+                "ref_dit", "ref_condition_encoder",
             )
             _assert_module_states_equal(self, uninterrupted, continuous, module_names)
             _assert_module_states_equal(self, uninterrupted, resumed, module_names)
+            for name, value in continuous.sam.state_dict().items():
+                torch.testing.assert_close(value, sam_before[name], rtol=0, atol=0)
 
     def test_stage_throughput_overrides_apply_before_loader_and_scheduler(self):
         with tempfile.TemporaryDirectory() as temporary, patch(
@@ -327,11 +396,13 @@ class EnginePipelineTest(unittest.TestCase):
                 self.assertEqual(snapshot, (1, 2, 1, 1, 1))
             self.assertEqual(abc_steps, 3)
 
-            # D 回退全局值：batch 2 -> 3 个 loader 批次，GRPO 每批一组。
+            # D 回退全局值：batch 2 -> 3 个 loader 批次，每个批次一组。
             self.assertTrue(d_observed)
             for snapshot in d_observed:
                 self.assertEqual(snapshot, (2, 1, 0, 2, 0))
-            self.assertEqual((d_batch_size, d_accumulation_steps, d_num_workers), (2, 1, 0))
+            self.assertEqual(
+                (d_batch_size, d_accumulation_steps, d_num_workers), (2, 1, 0)
+            )
             self.assertEqual(d_steps, 3)
 
             # D 自身覆盖：batch 3 -> 2 个 loader 批次。
@@ -404,6 +475,7 @@ class EnginePipelineTest(unittest.TestCase):
         ):
             root = Path(temporary)
             config = self._make_config(root, samples=4, batch_size=1)
+            config["stages"]["ABC"]["batch_size"] = 1
             config["train"]["log_every"] = 2
             config["logging"] = {
                 "tensorboard": False, "log_every": 2, "flush_secs": 1
@@ -463,7 +535,7 @@ class EnginePipelineTest(unittest.TestCase):
                 [(1, 1)],
             )
             self.assertIn("loss", epoch_rows[0]["metrics"])
-            # 联合 ABC 同时记录分段与采样分割损失。
+            # ABC 同时记录一步重建与纯噪声采样的分割损失。
             self.assertIn("seg", epoch_rows[0]["metrics"])
             self.assertIn("sampled_seg", epoch_rows[0]["metrics"])
 
@@ -473,9 +545,7 @@ class EnginePipelineTest(unittest.TestCase):
                 [(1, 1)],
             )
             self.assertIn("iou", validation[0]["metrics"])
-            self.assertIn("positive_on_road_rate", validation[0]["metrics"])
-            self.assertIn("heatmap_above_threshold_rate", validation[0]["metrics"])
-            self.assertIn("quality_reward", validation[0]["metrics"])
+            self.assertIn("score", validation[0]["metrics"])
 
             system = scoped("ABC", "system")
             self.assertEqual(
@@ -488,15 +558,13 @@ class EnginePipelineTest(unittest.TestCase):
             self.assertEqual([record["step"] for record in groups], [1, 2, 4])
             self.assertEqual({record["epoch"] for record in groups}, {1})
             self.assertIn("reward", groups[0]["metrics"])
+            # 终端 Bernoulli 策略已移除，只保留扩散轨迹 GRPO 诊断。
+            self.assertNotIn("terminal_grpo", groups[0]["metrics"])
+            self.assertNotIn("terminal_kl", groups[0]["metrics"])
             details = groups[0]["metrics"]["trajectory_diagnostics"]
             self.assertTrue(details)
-            # 联合 D 的逐轨迹日志：密集提示没有离散点，点惩罚恒为 0。
-            for key in ("image_id", "advantage", "reward", "quality_reward", "point_penalty"):
+            for key in ("image_id", "advantage", "reward", "quality_reward"):
                 self.assertIn(key, details[0])
-            self.assertAlmostEqual(
-                details[0]["quality_reward"] - details[0]["point_penalty"],
-                details[0]["reward"],
-            )
             d_epoch = scoped("D", "train_epoch")
             self.assertEqual(
                 [(record["step"], record["epoch"]) for record in d_epoch], [(1, 1)]

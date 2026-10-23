@@ -1,10 +1,10 @@
-# SAM 2.1 Hiera-B+，输入 1024 / 热图 256；SAM1 历史探针不等于 SAM2 参数实测。
-# 运行选择与尚待确认的效果参数集中记录于 docs/probe_3090.md。
-training_protocol: joint_abc_v1
+# 单通道有符号道路山脊场；旧双通道快照禁止直接 resume。
+training_protocol: signed_ridge_v1
+target_representation: signed_ridge_v1
+sam_frozen: true
 seed: 42
 output_dir: runs/diffpeak
 
-# CLI 每次启动创建独立日志会话；epoch 指标始终记录，批次/组按间隔采样。
 logging:
   tensorboard: true
   log_every: 10
@@ -14,53 +14,37 @@ data:
   root: DeepGlobe_Road
   train_split: splits/protocol_v1/train.json
   val_split: splits/protocol_v1/val.json
-  # Vast.ai 32GiB 短程实测优先4；AutoDL 90GiB 可独立复测8。
   num_workers: 4
   augment: true
-  heatmap_sigma: 1.0
-  target_min_distance: 4.0
-  sampling_config:
-    positive:
-      min_spacing: 24.0
-      max_spacing: 64.0
-      junction_probability: 0.5
-      endpoint_probability: 0.5
-      min_branch_length: 4.0
-    negative:
-      boundary_margin: 2.0
-      boundary_band: 12.0
-      boundary_count: [8, 20]
-      background_count: [4, 12]
-      min_separation: 12.0
+  ridge_config: {center_radius: 1.0, boundary_band: 2.0, epsilon: 0.000001}
 
 model:
   sam_checkpoint: checkpoints/sam2.1_hiera_base_plus.pt
   sam_config: configs/sam2.1/sam2.1_hiera_b+.yaml
   sam_architecture: sam2.1_hiera_base_plus
   sam_apply_postprocessing: false
-  # 默认去噪器为 ConditionalDiT；旧 ConditionalUNet 快照不兼容，需从 ABC 重训。
   dit:
+    in_channels: 1
     patch_size: 8
     hidden_size: 256
     depth: 6
     num_heads: 8
     mlp_ratio: 4.0
-    # 与 ConditionEncoder 的 256/128/64/32 四尺度输出保持一致。
     condition_channels: [64, 128, 256, 256]
-    # seetacloud3 ABC 短测：关闭检查点、batch4 峰值 reserved 16.03 GiB。
+    # 延续旧吞吐配置作为起点；新协议尚需重新实测显存和吞吐。
     gradient_checkpointing: false
 
 diffusion:
+  latent_channels: 1
   timesteps: 1000
   sampling_steps: 20
   min_std: 0.02
 
-# ABC/D 及推理共享；进入 D 后不要单独修改。
-peaks:
-  sigma: 0.5
-  h: 0.05
-  threshold: 0.3
-  min_distance: 4
+# 对终端场裁剪后以 U=scale*H 输入冻结 SAM，padding 固定为0。
+# scale=1 是待验证初值，需先用标注场接口诊断在验证集选择。
+prompt:
+  scale: 1.0
+  terminal_mapping: clamp
 
 train:
   batch_size: 2
@@ -75,47 +59,31 @@ train:
   aux_weight: 0.2
   cldice_weight: 0.2
   save_every: 1
-  # 线性 warmup + cosine 退火。warmup_steps > 0 时优先；
-  # 否则按 warmup_ratio * 当前阶段总更新步数计算，两者均为 0 时关闭预热。
-  # 完整训练调度尚待确认；LR 开发筛选使用恒定 LR，详见探针记录。
   warmup_steps: 0
   warmup_ratio: 0.05
   min_lr_ratio: 0.05
 
-# ABC 吞吐选择见 docs/probe_3090.md；D 联合版本尚未单独测速。
 stages:
   ABC: {epochs: 60, lr: 0.0001, batch_size: 4, accumulation_steps: 1, num_workers: 4}
   D: {epochs: 10, lr: 0.0000003, batch_size: 1, accumulation_steps: 1, warmup_ratio: 0.1, min_lr_ratio: 0.1}
 
 rl:
-  # 当前只实现 GRPO；显式写入算法名，避免旧 DDPO 配置被误读为新协议。
   algorithm: grpo
-  # 每张影像采样 G 条轨迹，同图组内标准化优势；G 必须 >= 2。
   group_size: 4
-  # 高维动作使用联合 log-prob 的 sum，不用 mean 偷换目标。
-  # 键名沿用 ppo_clip 以兼容旧配置；语义是 GRPO 裁剪半径 epsilon。
+  # 单通道联合 SUM log-prob 尺度改变；以下为待校准初值。
   ppo_clip: 0.0001
   kl_weight: 0.01
-  # 建议默认 0.0：参考 GRPO 设计不含监督锚定项。
-  # 设为非零时是可选监督锚定，对整个 ABC 额外加联合监督损失。
-  anchor_weight: 0.0
+  # ABC 全监督锚定，小权重保留；设0进行关闭锚定消融。
+  anchor_weight: 0.01
   update_epochs: 1
-  # 组内奖励标准差下限，只作为优势分母的 clamp；
-  # 非零低方差组仍参与学习，只有奖励完全相同的组优势为零。
   advantage_std_delta: 0.0001
-  # 策略点成本按已处理的 D 组数线性升到 reward.point_cost（第 1 组为 1/N）；
-  # 0 表示禁用预热。组内奖励完全常量、没有实际 backward 的组也会推进，
-  # 避免预热永远停在 0；验证始终使用未预热的基准成本。
-  point_cost_warmup_steps: 100
   amp_init_scale: 64.0
 
 reward:
   iou_weight: 0.6
   cldice_weight: 0.4
   path_weight: 0.0
-  # 密集提示不消耗离散点；峰值仅作诊断。
   point_cost: 0.0
-  point_reference: 32
   path_samples: 32
   path_match_radius: 8
 

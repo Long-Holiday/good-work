@@ -309,6 +309,7 @@ def auxiliary_loss(
     ],
     masks: torch.Tensor,
     skeletons: torch.Tensor,
+    valid_sizes: Sequence[Tuple[int, int]] | None = None,
 ) -> torch.Tensor:
     """辅助头损失：道路区域监督 + 中心线（骨架）监督。
 
@@ -352,6 +353,24 @@ def auxiliary_loss(
         skeletons, skeleton_logits, preserve_connectivity=True
     )
 
-    road_loss = _bce_dice_loss(road_logits, road_target)
-    skeleton_loss = _bce_dice_loss(skeleton_logits, skeleton_target)
-    return 0.5 * (road_loss + skeleton_loss)
+    if valid_sizes is None:
+        road_loss = _bce_dice_loss(road_logits, road_target)
+        skeleton_loss = _bce_dice_loss(skeleton_logits, skeleton_target)
+        return 0.5 * (road_loss + skeleton_loss)
+    if len(valid_sizes) != masks.shape[0]:
+        raise ValueError("valid_sizes 数量必须与 batch 一致")
+    # Targets are aligned on the full canvas before cropping so padding cannot
+    # change the interpolation coordinates. Exclude partial cells at the edge.
+    values = []
+    for index, (height, width) in enumerate(valid_sizes):
+        if not (0 < height <= masks.shape[-2] and 0 < width <= masks.shape[-1]):
+            raise ValueError("valid_sizes 必须在标注画布内且非空")
+        region_losses = []
+        for logits, target in ((road_logits, road_target), (skeleton_logits, skeleton_target)):
+            h = max(1, int(height * logits.shape[-2] / masks.shape[-2]))
+            w = max(1, int(width * logits.shape[-1] / masks.shape[-1]))
+            region_losses.append(_bce_dice_loss(
+                logits[index:index + 1, :, :h, :w], target[index:index + 1, :, :h, :w]
+            ))
+        values.append(0.5 * (region_losses[0] + region_losses[1]))
+    return torch.stack(values).mean()

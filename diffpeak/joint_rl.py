@@ -1,54 +1,59 @@
-"""联合 ABC 端到端 GRPO：扩散轨迹与终端分割动作共享组内优势。
+"""仅扩散轨迹的 GRPO：冻结 SAM 的确定性评分 + 高斯轨迹策略更新。
 
-本模块只实现 ``training_protocol=joint_abc_v1`` 的 D 阶段更新，不修改引擎、
-模型或数据代码。每个 GRPO 组由**同一影像的 G 条轨迹**组成，两条策略共享
-同一组相对优势 ``A_gb``：
+本模块实现 ``training_protocol=signed_ridge_v1`` 新协议下的 D 阶段更新。与旧版
+联合策略不同，**终端分割不再是一个随机 Bernoulli 策略**：
 
 * **扩散转移策略**：``GaussianDiffusion.sample(record=True)`` 记录的每一步
   ``z_t -> z_{t-1}`` 是高斯动作；重放时条件特征由 ``condition_encoder``
-  **带梯度**重新计算，梯度经冻结的 SAM 图像编码器之外的 condition_encoder
-  与 DiT 回传。参考 KL 使用固定的 ``engine.ref_condition_encoder``
-  （只编码一次，``no_grad``）与 ``engine.ref_dit``；
-* **终端 Bernoulli 策略**：把最终热图作为 SAM 密集提示，经
-  ``engine.sam.decode_heatmaps`` 得到逐像素道路 logits，并采样二值分割动作
-  ``a ~ Bernoulli(sigmoid(logits))``。该动作只用于组奖励与策略重放；
-  重放时终端热图被 ``detach``，因此梯度只训练 SAM mask decoder，不会把
-  终端 Bernoulli 目标反传到扩散/条件策略。参考 KL 使用固定的完整参考
-  mask decoder ``engine.ref_sam_decoder``（无需复制整个 SAM，提示编码器与
-  图像编码器本来就冻结且共享）。
+  **带梯度**重新计算，梯度只回传到 ``condition_encoder`` 与 DiT。参考 KL
+  使用固定的 ``engine.ref_condition_encoder``（只编码一次，``no_grad``）与
+  ``engine.ref_dit``；
+* **终端评分**：最终的单通道有符号场直接作为密集提示交给冻结 SAM 的
+  ``decode_heatmaps``，得到逐像素道路 logits，并用**确定性阈值**
+  ``sigmoid(logits) >= threshold`` 生成二值掩码。该掩码只用于奖励，不参与
+  策略重放；因此没有终端 Bernoulli 动作、终端对数概率、终端 KL，也不需要
+  参考 SAM 解码器。
 
-奖励使用已有的 numpy 指标（``compute_image_metrics``）在**采样得到的二值
-掩码**上计算 IoU/F1/clDice/路径项，提示点计数固定为 0：密集热图没有稀疏
-点，因此不施加任何点成本惩罚，只保留峰值/热图诊断语义。
+奖励使用已有的 numpy 指标（``compute_image_metrics``）在确定性二值掩码上
+计算 IoU/F1/clDice/路径项；密集山脊场没有稀疏点，因此不产生任何提示点
+计数或点成本日志。
+路径项的随机采样通过 ``RewardConfig.seed`` 固定到**每张图像**的稳定种子
+（``stable_seed(seed, "D-reward", image_id)``），同一图像的所有候选在不同
+epoch 使用完全相同的采样规则，避免额外的非策略随机性并保证组内可比。
 
 目标函数（每个 ``update_epochs`` 轮）
 ------------------------------------
-令 ``D = G * T * B`` 为扩散 sample-step 项数，终端项数为 ``G * B``::
+令 ``D = G * T * B`` 为扩散 sample-step 项数::
 
-    L = - 1/D * sum_{g,t,b} [ A_gb * min(rho^d, clip(rho^d))
+    L = - 1/D * sum_{g,t,b} [ A_gb * min(rho, clip(rho))
                               - beta * KL(N(mu) || N(mu_ref)) ]
-        - 1/(G*B) * sum_{g,b} [ A_gb * min(rho^s, clip(rho^s))
-                                - beta * KL(Bern(p) || Bern(p_ref)) ]
         + alpha * L_anchor
 
-其中 ``rho`` 是新旧策略概率比，``beta=kl_weight``，``alpha=anchor_weight``。
-``L_anchor`` 是引擎统一监督锚定 ``_supervised_loss("ABC", ...)["loss"]``。
-每个时间步/终端损失在计算后立即 ``backward``，每个更新轮只做一次
-``optimizer.step()``。整组奖励完全常量且 ``kl_weight == 0``、
-``anchor_weight == 0`` 时不构造计算图、不 backward、不 step。
+其中 ``rho = exp(log p_new - log p_old)``，``beta=kl_weight``，
+``alpha=anchor_weight``。``L_anchor`` 是引擎统一监督锚定
+``_supervised_loss("ABC", ...)["loss"]``。每个时间步损失在计算后立即
+``backward``，每个更新轮只做一次 ``optimizer.step()``。
+
+参数边界
+--------
+本函数在开始前把 SAM 整体设为 ``eval`` 并逐参数 ``requires_grad_(False)``，
+同时冻结参考模块；更新过程中只重算条件编码器与 DiT，不调用任何 SAM 解码
+路径。ABC 监督锚定依赖的 SAM 前向仍可传递输入梯度（冻结参数不等于禁止
+输入梯度），但不会更新 SAM 参数。
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from contextlib import nullcontext
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
+from diffpeak.diagnostics import FIELD_METRIC_KEYS, field_quality
 from diffpeak.grpo import (
     gaussian_kl_divergence,
     group_relative_advantages,
@@ -61,19 +66,15 @@ from diffpeak.inference import (
     stable_seed,
 )
 
-__all__ = [
-    "joint_grpo_group",
-    "bernoulli_log_prob",
-    "bernoulli_kl_divergence",
-]
+__all__ = ["joint_grpo_group"]
 
-# 逐像素 Bernoulli 对数概率/KL 统一升到 float64 后求和，避免 1024² 动作维
-# 在 float32 中累积出可观误差。
-_FLOAT64 = torch.float64
+# 奖励路径采样的稳定种子域：与扩散采样种子（"D"）分开，避免两者共享随机流。
+_REWARD_SEED_TAG = "D-reward"
+_DEFAULT_THRESHOLD = 0.5
 
 
 # ---------------------------------------------------------------------------
-# 有效区域与 Bernoulli 数学
+# 有效区域与确定性阈值
 # ---------------------------------------------------------------------------
 def _valid_regions(
     valid_sizes: Optional[Union[Sequence[Optional[Tuple[int, int]]], Tensor]],
@@ -85,7 +86,7 @@ def _valid_regions(
 
     与 SAM 解码器一致：``None`` 元素表示整幅 ``(height, width)``。只接受
     输入画布 ``(height, width)`` 内的区域，越界直接报错，避免把 padding
-    静默计入策略概率或 KL。
+    静默计入奖励。
     """
     if valid_sizes is None:
         return [(int(height), int(width)) for _ in range(batch_size)]
@@ -136,142 +137,48 @@ def _valid_regions(
     return regions
 
 
-def _as_batched_pair(
+def _segmentation_threshold(engine: Any) -> float:
+    """返回确定性评分阈值，默认 ``0.5``。
+
+    优先使用引擎已解析的 ``threshold``（``inference.threshold``）；轻量测试
+    替身没有该属性时退回默认值。阈值必须位于 ``[0, 1]``。
+    """
+    value = getattr(engine, "threshold", None)
+    if value is None:
+        config = getattr(engine, "config", None)
+        inference = config.get("inference", {}) if isinstance(config, Mapping) else {}
+        value = inference.get("threshold", _DEFAULT_THRESHOLD)
+    threshold = float(value)
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError(f"分割阈值必须是 [0, 1] 内的有限数，实际为 {threshold}")
+    return threshold
+
+
+def _threshold_predictions(
     logits: Tensor,
-    actions: Tensor,
-    name: str,
-) -> Tuple[Tensor, Tensor]:
-    """把 ``[B, 1, H, W]`` 或 ``[B, H, W]`` 的 logits/actions 统一为四维。"""
-    if not torch.is_tensor(logits):
-        raise TypeError(f"logits 必须是张量，实际为 {type(logits)!r}")
-    if not torch.is_tensor(actions):
-        raise TypeError(f"{name} 必须是张量，实际为 {type(actions)!r}")
-    if logits.ndim == 3:
-        logits = logits.unsqueeze(1)
-    if actions.ndim == 3:
-        actions = actions.unsqueeze(1)
-    if logits.ndim != 4 or logits.shape[1] != 1:
+    threshold: float,
+    regions: Sequence[Tuple[int, int]],
+) -> List[np.ndarray]:
+    """把 SAM logits 确定性二值化为逐图预测：``sigmoid(logits) >= threshold``。
+
+    返回 ``H x W`` 的 bool numpy 数组（已裁掉右下 padding）。这里必须使用
+    ``>=``：恰好在阈值上的像素视为道路，与方案约定一致。函数内不做任何
+    采样，因此奖励不依赖终端随机动作。
+    """
+    if not torch.is_tensor(logits) or logits.ndim != 4 or logits.shape[1] != 1:
         raise ValueError(
-            f"logits 应为 B x 1 x H x W 或 B x H x W，实际为 {tuple(logits.shape)}"
+            "decode_heatmaps 必须返回 B x 1 x H x W 的 logits，"
+            f"实际为 {type(logits)!r} / "
+            f"{tuple(logits.shape) if torch.is_tensor(logits) else 'N/A'}"
         )
-    if actions.shape != logits.shape:
-        raise ValueError(
-            f"{name} 形状必须与 logits 一致："
-            f"{tuple(actions.shape)} vs {tuple(logits.shape)}"
+    probabilities = torch.sigmoid(logits.detach().float())
+    binary = probabilities >= float(threshold)
+    predictions: List[np.ndarray] = []
+    for index, (height, width) in enumerate(regions):
+        predictions.append(
+            binary[index, 0, :height, :width].detach().cpu().numpy()
         )
-    return logits, actions
-
-
-def bernoulli_log_prob(
-    logits: Tensor,
-    actions: Tensor,
-    valid_sizes: Optional[Union[Sequence[Optional[Tuple[int, int]]], Tensor]] = None,
-) -> Tensor:
-    """逐像素 Bernoulli 对数概率，对有效像素**求和**（不取平均）。
-
-    ``log p(a|x) = a * log sigmoid(x) + (1-a) * log(1-sigmoid(x))``。
-    使用 ``-softplus(-x)`` / ``-softplus(x)`` 的稳定形式，并在 float64 中
-    按有效区域求和，保证高维终端动作的概率比不会被 padding 或精度污染。
-
-    Args:
-        logits: ``B x 1 x H x W``（或 ``B x H x W``）的 Bernoulli logits。
-        actions: 与 logits 同形状的 0/1 或 bool 动作。
-        valid_sizes: 可选每样本有效区域 ``(h, w)``；``None`` 元素表示整幅。
-
-    Returns:
-        ``[B]`` float64 张量，每个元素是该样本有效像素的联合对数概率。
-    """
-    logits, actions = _as_batched_pair(logits, actions, "actions")
-    batch_size, _, height, width = (
-        int(logits.shape[0]),
-        int(logits.shape[1]),
-        int(logits.shape[2]),
-        int(logits.shape[3]),
-    )
-    regions = _valid_regions(valid_sizes, batch_size, height, width)
-    totals: List[Tensor] = []
-    for index, (valid_height, valid_width) in enumerate(regions):
-        values = logits[index, 0, :valid_height, :valid_width].to(_FLOAT64)
-        sampled = actions[index, 0, :valid_height, :valid_width].to(_FLOAT64)
-        log_probability = sampled * (-F.softplus(-values)) + (
-            1.0 - sampled
-        ) * (-F.softplus(values))
-        totals.append(log_probability.sum())
-    return torch.stack(totals) if totals else logits.new_zeros((0,), dtype=_FLOAT64)
-
-
-def bernoulli_kl_divergence(
-    logits: Tensor,
-    reference_logits: Tensor,
-    valid_sizes: Optional[Union[Sequence[Optional[Tuple[int, int]]], Tensor]] = None,
-) -> Tensor:
-    """逐像素 Bernoulli KL ``KL(Bern(p) || Bern(q))``，对有效像素求和。
-
-    解析式::
-
-        p * (log p - log q) + (1-p) * (log(1-p) - log(1-q))
-
-    其中 ``p=sigmoid(logits)``、``q=sigmoid(reference_logits)``。参考 logits
-    在函数内 ``detach``，梯度只回到当前策略 logits。结果 clamp 到非负以
-    消除浮点舍入造成的极小负值。
-    """
-    logits, reference_logits = _as_batched_pair(
-        logits, reference_logits, "reference_logits"
-    )
-    batch_size, _, height, width = (
-        int(logits.shape[0]),
-        int(logits.shape[1]),
-        int(logits.shape[2]),
-        int(logits.shape[3]),
-    )
-    regions = _valid_regions(valid_sizes, batch_size, height, width)
-    totals: List[Tensor] = []
-    for index, (valid_height, valid_width) in enumerate(regions):
-        values = logits[index, 0, :valid_height, :valid_width].to(_FLOAT64)
-        reference = (
-            reference_logits[index, 0, :valid_height, :valid_width]
-            .to(_FLOAT64)
-            .detach()
-        )
-        probability = torch.sigmoid(values)
-        log_probability = -F.softplus(-values)
-        log_one_minus_probability = -F.softplus(values)
-        log_reference = -F.softplus(-reference)
-        log_one_minus_reference = -F.softplus(reference)
-        elementwise = probability * (log_probability - log_reference) + (
-            1.0 - probability
-        ) * (log_one_minus_probability - log_one_minus_reference)
-        totals.append(elementwise.clamp_min(0.0).sum())
-    return torch.stack(totals) if totals else logits.new_zeros((0,), dtype=_FLOAT64)
-
-
-def _sample_terminal_actions(
-    logits: Tensor,
-    generator: Optional[torch.Generator],
-) -> Tensor:
-    """从 ``Bernoulli(sigmoid(logits))`` 采样二值动作。
-
-    随机数使用调用方提供的生成器。``torch.Generator`` 可能位于 CPU 而
-    logits 位于 CUDA；此时先在生成器设备上采样再搬到 logits 设备，避免
-    "Expected a 'cuda' device type for generator" 之类的设备不匹配错误。
-    """
-    probabilities = torch.sigmoid(logits.float())
-    if generator is None:
-        uniform = torch.rand(
-            probabilities.shape,
-            device=probabilities.device,
-            dtype=torch.float32,
-        )
-    else:
-        uniform = torch.rand(
-            probabilities.shape,
-            device=generator.device,
-            dtype=torch.float32,
-            generator=generator,
-        )
-        if uniform.device != probabilities.device:
-            uniform = uniform.to(probabilities.device)
-    return uniform < probabilities
+    return predictions
 
 
 # ---------------------------------------------------------------------------
@@ -334,27 +241,36 @@ def _decode_heatmaps(
     heatmaps: Tensor,
     output_size: Tuple[int, int],
     valid_sizes: Any,
-    decoder: Optional[torch.nn.Module] = None,
 ) -> Tensor:
-    """调用 ``RoadSAM.decode_heatmaps``，可选覆盖 mask decoder。
+    """调用冻结 SAM 的 ``RoadSAM.decode_heatmaps``。
 
-    参考终端 KL 不需要复制整个 SAM：图像编码器与提示编码器始终冻结且与
-    当前策略共享，只有 mask decoder 需要冻结副本 ``engine.ref_sam_decoder``。
+    新协议只使用单通道有符号山脊场：提示张量原样传入解码器
+    （``B x 1 x h x w``，范围 ``[-1, 1]``）。本模块不构造正负通道差，也不
+    使用任何稀疏点或参考解码器。
     """
     method = getattr(getattr(engine, "sam", None), "decode_heatmaps", None)
     if not callable(method):
         raise AttributeError(
-            "当前 SAM 模型缺少可微 decode_heatmaps；联合 ABC 协议需要 "
+            "当前 SAM 模型缺少 decode_heatmaps；新协议需要 "
             "RoadSAM.decode_heatmaps(embeddings, heatmaps, output_size, "
-            "valid_sizes=None, decoder=None)"
+            "valid_sizes=None)"
         )
-    kwargs: Dict[str, Any] = {
-        "output_size": (int(output_size[0]), int(output_size[1])),
-        "valid_sizes": valid_sizes,
-    }
-    if decoder is not None:
-        kwargs["decoder"] = decoder
-    logits = method(embeddings, heatmaps, **kwargs)
+    if (
+        not torch.is_tensor(heatmaps)
+        or heatmaps.ndim != 4
+        or int(heatmaps.shape[1]) != 1
+    ):
+        raise ValueError(
+            "heatmaps 必须是 B x 1 x H x W 的单通道有符号场，"
+            f"实际为 {type(heatmaps)!r} / "
+            f"{tuple(heatmaps.shape) if torch.is_tensor(heatmaps) else 'N/A'}"
+        )
+    logits = method(
+        embeddings,
+        heatmaps,
+        output_size=(int(output_size[0]), int(output_size[1])),
+        valid_sizes=valid_sizes,
+    )
     if not torch.is_tensor(logits) or logits.ndim != 4 or logits.shape[1] != 1:
         raise ValueError(
             "decode_heatmaps 必须返回 B x 1 x H x W 的 logits，"
@@ -370,7 +286,7 @@ def _eval_policy_modules(engine: Any) -> None:
         module = getattr(engine, name, None)
         if isinstance(module, torch.nn.Module):
             module.eval()
-    for name in ("ref_dit", "ref_condition_encoder", "ref_sam_decoder"):
+    for name in ("ref_dit", "ref_condition_encoder"):
         reference = getattr(engine, name, None)
         if reference is None:
             continue
@@ -378,6 +294,19 @@ def _eval_policy_modules(engine: Any) -> None:
             reference.eval()
             for parameter in reference.parameters():
                 parameter.requires_grad_(False)
+
+
+def _freeze_sam(engine: Any) -> None:
+    """防御性地把 SAM 整体设为 eval 且所有参数冻结。
+
+    新协议只允许 ``condition_encoder`` 与 DiT 接收梯度；即使引擎阶段设置
+    残留了 SAM 解码器的可训练标记，本函数也会在 rollout/更新前清除。
+    """
+    sam = getattr(engine, "sam", None)
+    if isinstance(sam, torch.nn.Module):
+        sam.eval()
+        for parameter in sam.parameters():
+            parameter.requires_grad_(False)
 
 
 def _target_arrays(
@@ -412,41 +341,63 @@ def _reference_conditions(
 
 
 def _require_references(engine: Any) -> None:
+    """参考 KL 只需要参考条件编码器与参考 DiT；不需要参考 SAM。"""
     if getattr(engine, "ref_dit", None) is None:
         raise RuntimeError("joint GRPO 缺少 engine.ref_dit")
     if getattr(engine, "ref_condition_encoder", None) is None:
         raise RuntimeError("joint GRPO 缺少 engine.ref_condition_encoder")
-    if getattr(engine, "ref_sam_decoder", None) is None:
-        raise RuntimeError(
-            "joint GRPO 缺少 engine.ref_sam_decoder；终端 Bernoulli KL "
-            "需要冻结的参考 mask decoder"
-        )
+
+
+def _image_reward_config(
+    reward_config: Any,
+    engine: Any,
+    image_id: Any,
+) -> Any:
+    """为一张图像构造固定种子的奖励配置。
+
+    ``compute_image_metrics`` 内部的路径采样使用 ``RewardConfig.seed``。这里
+    把种子固定为 ``stable_seed(seed, "D-reward", image_id)``：同一图像的所有
+    候选在任何 epoch 使用完全相同的路径采样规则，既不随全局 numpy 随机流
+    漂移，也保证组内候选在同一采样规则下比较。配置不是 ``RewardConfig``
+    数据类（例如测试用的轻量映射）时原样返回，保持
+    ``compute_image_metrics`` 的鸭子类型契约。
+    """
+    if reward_config is None or not dataclasses.is_dataclass(reward_config):
+        return reward_config
+    if not hasattr(reward_config, "seed"):
+        return reward_config
+    seed = stable_seed(
+        int(getattr(engine, "seed", 0)),
+        _REWARD_SEED_TAG,
+        image_id,
+    ) % (1 << 32)
+    try:
+        return dataclasses.replace(reward_config, seed=int(seed))
+    except (TypeError, ValueError):
+        return reward_config
 
 
 # ---------------------------------------------------------------------------
-# 组内 rollout / 更新
+# 组内 rollout
 # ---------------------------------------------------------------------------
 def _rollout_group(
     engine: Any,
     batch: Mapping[str, Any],
     epoch: int,
-    reward_config: Any,
     use_reference_kl: bool,
 ) -> Tuple[
     List[List[Dict[str, Any]]],
     List[Dict[str, Any]],
-    List[Dict[str, Any]],
     Any,
     List[Tensor],
-    List[np.ndarray],
     List[List[float]],
 ]:
-    """执行 G 条完整 rollout 并计量终端二值动作的奖励。
+    """执行 G 条完整扩散 rollout，并用确定性 SAM 掩码计算奖励。
 
     Returns:
-        ``(trajectories, terminal_records, metric_rows, embeddings,
-        reference_conditions, targets_np, rewards)``；``rewards`` 形状为
-        ``[G][B]``，``metric_rows`` 按轨迹优先排列（``g * B + b``）。
+        ``(trajectories, metric_rows, embeddings, reference_conditions,
+        rewards)``；``rewards`` 形状为 ``[G][B]``，``metric_rows`` 按轨迹优先
+        排列（``g * B + b``）。
     """
     images = batch["image"]
     target_masks = batch["mask"]
@@ -456,7 +407,14 @@ def _rollout_group(
     output_size = (int(engine.image_size), int(engine.image_size))
     regions = _valid_regions(valid_sizes, batch_size, *output_size)
     targets_np = _target_arrays(target_masks, regions)
-    reference_decoder = getattr(engine, "ref_sam_decoder", None)
+    threshold = _segmentation_threshold(engine)
+
+    reward_config_method = getattr(engine, "_effective_reward_config", None)
+    reward_config = (
+        reward_config_method()
+        if callable(reward_config_method)
+        else getattr(engine, "reward_config", None)
+    )
 
     with torch.no_grad(), _autocast(engine):
         embeddings = encode_images(engine.sam, images, valid_sizes)
@@ -474,7 +432,6 @@ def _rollout_group(
     )
 
     trajectories: List[List[Dict[str, Any]]] = []
-    terminal_records: List[Dict[str, Any]] = []
     metric_rows: List[Dict[str, Any]] = []
     rewards: List[List[float]] = []
 
@@ -495,81 +452,48 @@ def _rollout_group(
                 generator=generator,
                 record=True,
             )
-            # 终端策略：密集热图 -> SAM logits -> Bernoulli 二值动作。
+            # 终端评分：单通道有符号场 -> 冻结 SAM logits -> 确定性阈值。
             terminal_logits = _decode_heatmaps(
                 engine, embeddings, heatmaps, output_size, valid_sizes
             )
-            actions = _sample_terminal_actions(terminal_logits, generator)
-            old_terminal_log_prob = bernoulli_log_prob(
-                terminal_logits, actions, valid_sizes
-            )
-            reference_logits: Optional[Tensor] = None
-            if use_reference_kl:
-                reference_logits = _decode_heatmaps(
-                    engine,
-                    embeddings,
-                    heatmaps,
-                    output_size,
-                    valid_sizes,
-                    decoder=reference_decoder,
-                )
+        predictions = _threshold_predictions(terminal_logits, threshold, regions)
 
         sample_rewards: List[float] = []
         for image_index, (height, width) in enumerate(regions):
-            prediction = (
-                actions[image_index, 0, :height, :width]
-                .detach()
-                .cpu()
-                .numpy()
-                .astype(bool, copy=False)
+            prediction = np.asarray(predictions[image_index], dtype=bool)
+            if prediction.shape != (height, width):
+                raise ValueError(
+                    "确定性掩码形状与有效区域不一致："
+                    f"{prediction.shape} vs {(height, width)}"
+                )
+            candidate_config = _image_reward_config(
+                reward_config, engine, ids[image_index]
             )
-            # 密集提示没有离散点：point_count=0，点成本恒为 0。峰值/热图
-            # 诊断可另由日志记录，但不进入奖励的稀疏点惩罚。
+            # 密集山脊场没有离散点；point_count 参数仅为兼容指标签名。
             metrics = compute_image_metrics(
-                prediction, targets_np[image_index], 0, reward_config
+                prediction, targets_np[image_index], 0, candidate_config
             )
+            foreground_rate = float(prediction.mean())
             sample_rewards.append(float(metrics["reward"]))
             metric_rows.append(
                 {
                     **metrics,
+                    **field_quality(heatmaps[image_index], targets_np[image_index], image_size=engine.image_size),
                     "quality_reward": float(metrics["reward"]),
-                    "point_penalty": 0.0,
-                    "point_count": 0.0,
-                    "positive_point_count": 0.0,
-                    "negative_point_count": 0.0,
-                    "terminal_foreground_rate": float(prediction.mean()),
+                    "prediction_foreground_rate": foreground_rate,
                 }
             )
 
         rewards.append(sample_rewards)
         trajectories.append(trace)
-        terminal_records.append(
-            {
-                # 终端热图必须 detach：Bernoulli 重放只训练 SAM decoder，
-                # 不能把终端策略梯度反传到条件编码器/DiT。
-                "heatmaps": heatmaps.detach().to("cpu", dtype=torch.float32),
-                "actions": actions.detach().to("cpu"),
-                "old_log_prob": old_terminal_log_prob.detach().cpu().double(),
-                "reference_logits": (
-                    None
-                    if reference_logits is None
-                    else reference_logits.detach().to("cpu", dtype=torch.float32)
-                ),
-            }
-        )
-        del heatmaps, trace, terminal_logits, actions, old_terminal_log_prob, reference_logits
+        del heatmaps, trace, terminal_logits, predictions
 
-    return (
-        trajectories,
-        terminal_records,
-        metric_rows,
-        embeddings,
-        reference_conditions,
-        targets_np,
-        rewards,
-    )  # type: ignore[return-value]
+    return trajectories, metric_rows, embeddings, reference_conditions, rewards
 
 
+# ---------------------------------------------------------------------------
+# 更新
+# ---------------------------------------------------------------------------
 def _empty_update_stats(engine: Any) -> Dict[str, float]:
     return {
         "grpo": float("nan"),
@@ -583,9 +507,7 @@ def _empty_update_stats(engine: Any) -> Dict[str, float]:
         "skipped_updates": float(max(1, int(getattr(engine, "update_epochs", 1)))),
         "policy_terms": 0.0,
         "diffusion_grpo": float("nan"),
-        "terminal_grpo": float("nan"),
         "diffusion_kl": float("nan"),
-        "terminal_kl": float("nan"),
     }
 
 
@@ -595,12 +517,15 @@ def _joint_update(
     embeddings: Any,
     reference_conditions: Sequence[Tensor],
     trajectories: Sequence[Sequence[Mapping[str, Any]]],
-    terminal_records: Sequence[Mapping[str, Any]],
     advantages: Tensor,
     active_groups: Tensor,
     epoch: int,
 ) -> Dict[str, float]:
-    """固定整组轨迹后做联合 GRPO/KL/anchor 更新；每个更新轮 step 一次。"""
+    """固定整组轨迹后做扩散 GRPO/KL/anchor 更新；每轮 step 一次。
+
+    只重放扩散时间步，不调用 SAM 解码；因此梯度只可能流向
+    ``condition_encoder`` 与 DiT。
+    """
     optimizer = getattr(engine, "optimizer", None)
     scheduler = getattr(engine, "scheduler", None)
     scaler = getattr(engine, "scaler", None)
@@ -612,6 +537,10 @@ def _joint_update(
 
     batch_size = int(advantages.shape[1])
     group_size = int(advantages.shape[0])
+    if group_size != len(trajectories):
+        raise ValueError(
+            "优势组数与轨迹数不一致：" f"{group_size} vs {len(trajectories)}"
+        )
     update_epochs = max(1, int(getattr(engine, "update_epochs", 1)))
     epsilon = float(getattr(engine, "ppo_clip", 0.0))
     kl_weight = float(getattr(engine, "kl_weight", 0.0))
@@ -636,24 +565,16 @@ def _joint_update(
         stats["skipped_updates"] = float(update_epochs)
         return stats
 
-    # 扩散项分母 G*T*B；终端项分母 G*B。T 取实际记录步数，兼容不同
-    # sampling_steps 的轨迹。
+    # 扩散项分母 G*T*B；T 取实际记录步数，兼容不同 sampling_steps 的轨迹。
     diffusion_terms = sum(len(trajectory) for trajectory in trajectories) * batch_size
-    terminal_terms = len(trajectories) * batch_size
-    per_epoch_terms = diffusion_terms + terminal_terms
-    total_terms = max(1, per_epoch_terms * update_epochs)
     if diffusion_terms <= 0:
         raise ValueError("扩散轨迹不能为空")
+    total_terms = max(1, diffusion_terms * update_epochs)
 
     images = batch["image"]
-    valid_sizes = batch["valid_sizes"]
-    output_size = (int(engine.image_size), int(engine.image_size))
-    reference_decoder = getattr(engine, "ref_sam_decoder", None)
 
     diffusion_grpo_sum = 0.0
-    terminal_grpo_sum = 0.0
     diffusion_kl_sum = 0.0
-    terminal_kl_sum = 0.0
     anchor_values: List[float] = []
     clip_values: List[float] = []
     logratio_abs_sum = 0.0
@@ -681,7 +602,8 @@ def _joint_update(
     for _ in range(update_epochs):
         optimizer.zero_grad(set_to_none=True)
 
-        # 统一监督锚定：ABC 单阶段总损失（扩散 + 热图 + 辅助 + 分割）。
+        # 可选监督锚定：ABC 单阶段总损失（扩散 + 场 + 辅助 + 分割）。
+        # SAM 已整体冻结，锚定只能更新条件编码器/DiT。
         if has_anchor:
             supervised = getattr(engine, "_supervised_loss", None)
             if not callable(supervised):
@@ -738,7 +660,7 @@ def _joint_update(
                         step["old_log_prob"].to(engine.device).reshape(-1).double()
                     )
 
-                    # 每个时间步都带梯度重算条件；这是联合训练 condition_encoder
+                    # 每个时间步都带梯度重算条件；这是训练 condition_encoder
                     # 的关键，不能复用 rollout 的 detached 条件。
                     with _autocast(engine):
                         conditions = _encode_conditions(
@@ -816,115 +738,18 @@ def _joint_update(
                         kl_element,
                     )
 
-                # 终端 Bernoulli 策略：heatmaps 已 detach，只有 mask decoder
-                # 接收梯度；同一 A_gb 同时驱动扩散与终端策略。
-                terminal = terminal_records[trajectory_index]
-                heatmaps = terminal["heatmaps"].to(
-                    engine.device, dtype=torch.float32, non_blocking=True
-                )
-                actions = terminal["actions"].to(engine.device)
-                old_terminal_log_prob = (
-                    terminal["old_log_prob"].to(engine.device).reshape(-1).double()
-                )
-                with _autocast(engine):
-                    terminal_logits = _decode_heatmaps(
-                        engine,
-                        embeddings,
-                        heatmaps.detach(),
-                        output_size,
-                        valid_sizes,
-                    )
-                new_terminal_log_prob = bernoulli_log_prob(
-                    terminal_logits, actions, valid_sizes
-                ).reshape(-1).double()
-                if (
-                    old_terminal_log_prob.numel() == 1
-                    and new_terminal_log_prob.numel() > 1
-                ):
-                    old_terminal_log_prob = old_terminal_log_prob.expand_as(
-                        new_terminal_log_prob
-                    )
-                if old_terminal_log_prob.numel() != new_terminal_log_prob.numel():
-                    raise ValueError(
-                        "old/new 终端 log-prob 形状不一致："
-                        f"{old_terminal_log_prob.numel()} vs "
-                        f"{new_terminal_log_prob.numel()}"
-                    )
-                raw_terminal_log_ratio = (
-                    new_terminal_log_prob - old_terminal_log_prob
-                )
-                terminal_log_ratio = torch.clamp(
-                    raw_terminal_log_ratio, min=-20.0, max=20.0
-                )
-                terminal_ratio = torch.exp(terminal_log_ratio)
-                terminal_clipped = (
-                    terminal_ratio < 1.0 - epsilon
-                ) | (terminal_ratio > 1.0 + epsilon)
-                _record_ratio(
-                    raw_terminal_log_ratio,
-                    terminal_clipped,
-                    active_mask,
-                    active_count,
-                )
-                if active_count > 0:
-                    policy_terms += active_count
-
-                terminal_grpo_loss = grpo_policy_loss(
-                    terminal_ratio, advantage64, epsilon
-                )
-                terminal_grpo_sum += (
-                    float(terminal_grpo_loss.detach().cpu()) * batch_size
-                )
-
-                terminal_kl_element = torch.zeros(
-                    (), dtype=torch.float64, device=engine.device
-                )
-                if has_kl:
-                    reference_logits = terminal["reference_logits"]
-                    if reference_logits is None:
-                        raise RuntimeError(
-                            "终端 KL 缺少 rollout 阶段保存的参考 logits"
-                        )
-                    terminal_kl_element = bernoulli_kl_divergence(
-                        terminal_logits,
-                        reference_logits.to(
-                            engine.device, dtype=torch.float32, non_blocking=True
-                        ),
-                        valid_sizes,
-                    )
-                    terminal_kl_sum += float(
-                        terminal_kl_element.detach().sum().cpu()
-                    )
-
-                terminal_loss = (
-                    terminal_grpo_loss * batch_size
-                    + kl_weight * terminal_kl_element.sum()
-                ) / float(terminal_terms)
-                scaler.scale(terminal_loss.float()).backward()
-
-                del (
-                    heatmaps,
-                    actions,
-                    terminal_logits,
-                    new_terminal_log_prob,
-                    terminal_log_ratio,
-                    terminal_ratio,
-                    terminal_grpo_loss,
-                    terminal_kl_element,
-                )
-
         if engine._optimizer_step():
             update_steps += 1
         else:
             skipped_updates += 1
 
     grpo_value = (
-        (diffusion_grpo_sum + terminal_grpo_sum) / float(total_terms)
+        diffusion_grpo_sum / float(total_terms)
         if policy_terms > 0
         else float("nan")
     )
     kl_value = (
-        (diffusion_kl_sum + terminal_kl_sum) / float(total_terms)
+        diffusion_kl_sum / float(total_terms)
         if has_kl
         else float("nan")
     )
@@ -950,18 +775,8 @@ def _joint_update(
             if policy_terms > 0
             else float("nan")
         ),
-        "terminal_grpo": (
-            terminal_grpo_sum / float(terminal_terms * update_epochs)
-            if policy_terms > 0
-            else float("nan")
-        ),
         "diffusion_kl": (
             diffusion_kl_sum / float(diffusion_terms * update_epochs)
-            if has_kl
-            else float("nan")
-        ),
-        "terminal_kl": (
-            terminal_kl_sum / float(terminal_terms * update_epochs)
             if has_kl
             else float("nan")
         ),
@@ -981,22 +796,23 @@ def joint_grpo_group(
     batch: Mapping[str, Any],
     epoch: int,
 ) -> Dict[str, Any]:
-    """执行一个联合 ABC GRPO 组并返回训练记录。
+    """执行一个扩散 GRPO 组并返回训练记录（冻结 SAM 的确定性评分）。
 
-    调用方（引擎的 D 阶段循环）负责构建 optimizer/scheduler/scaler，并按
-    ``training_protocol=joint_abc_v1`` 将 trainability 设置为 condition_encoder、
-    dit 与 SAM mask decoder 可训练。本函数内部：
+    调用方（引擎的 D 阶段循环）负责构建 optimizer/scheduler/scaler，并把
+    ``training_protocol=signed_ridge_v1`` 的 trainability 设置为 condition_encoder
+    与 DiT。本函数内部：
 
-    1. 对整个策略与参考模块执行 ``eval()``，并在 ``no_grad`` 下 rollout；
-    2. 用采样二值掩码计算奖励与组内优势；
-    3. 多个 ``update_epochs`` 轮重放：扩散每步带梯度重算条件，终端热图
-       detach 后只训练 SAM decoder；每个损失立即 backward，每轮一次 step。
+    1. 防御性地冻结并 ``eval`` SAM，``eval`` 条件编码器/DiT，冻结参考模块；
+    2. 在 ``no_grad`` 下采样 G 条扩散轨迹，用冻结 SAM 与确定性阈值评分；
+    3. 用每图组内优势计算 GRPO；多个 ``update_epochs`` 轮只重放扩散步骤，
+       每个时间步带梯度重算条件，每个损失立即 backward，每轮一次 step。
 
     Returns:
         与引擎 D 阶段记录兼容的字典，包含 ``reward``/``iou``/``f1``/
         ``cldice``/``path``、组诊断、``grpo``/``kl``/``anchor``、
         ``logratio_*``、``clip_fraction``、``updates``/``skipped_updates``
-        以及联合诊断 ``diffusion_grpo``/``terminal_grpo`` 等。
+        以及 ``diffusion_grpo``/``diffusion_kl``。不再包含
+        ``terminal_grpo``/``terminal_kl``。
     """
     if int(getattr(engine, "group_size", 0)) < 2:
         raise ValueError("D 阶段要求 rl.group_size >= 2 才能做组内相对优势")
@@ -1007,6 +823,7 @@ def joint_grpo_group(
 
     prepared = _prepare_batch(engine, batch)
     _eval_policy_modules(engine)
+    _freeze_sam(engine)
 
     use_reference_kl = float(getattr(engine, "kl_weight", 0.0)) > 0.0
     if use_reference_kl:
@@ -1017,29 +834,15 @@ def joint_grpo_group(
     if hasattr(engine, "grpo_groups_processed"):
         engine.grpo_groups_processed = int(engine.grpo_groups_processed) + 1
 
-    reward_config_method = getattr(engine, "_effective_reward_config", None)
-    reward_config = (
-        reward_config_method()
-        if callable(reward_config_method)
-        else getattr(engine, "reward_config")
-    )
-
     (
         trajectories,
-        terminal_records,
         metric_rows,
         embeddings,
         reference_conditions,
-        targets_np,
         rewards,
     ) = _rollout_group(  # type: ignore[misc]
-        engine,
-        prepared,
-        int(epoch),
-        reward_config,
-        use_reference_kl,
+        engine, prepared, int(epoch), use_reference_kl
     )
-    del targets_np
 
     reward_tensor = torch.tensor(rewards, dtype=torch.float64)  # [G, B]
     if reward_tensor.ndim != 2 or reward_tensor.shape[1] != int(
@@ -1064,7 +867,6 @@ def joint_grpo_group(
         embeddings,
         reference_conditions,
         trajectories,
-        terminal_records,
         advantages,
         active_groups,
         int(epoch),
@@ -1092,26 +894,15 @@ def joint_grpo_group(
                 if advantages.numel()
                 else float("nan")
             ),
-            # 密集提示不使用离散点：点数与点成本严格为 0，避免把稀疏点
-            # 惩罚误加到热图策略上。
-            "point_count": 0.0,
-            "positive_point_count": 0.0,
-            "negative_point_count": 0.0,
-            "point_penalty": 0.0,
+            # 密集山脊场没有离散点：只保留质量奖励诊断。
             "quality_reward": _mean(
                 [row["quality_reward"] for row in metric_rows]
             ),
-            "point_cost": 0.0,
-            "point_cost_scale": (
-                float(engine._point_cost_scale())
-                if callable(getattr(engine, "_point_cost_scale", None))
-                else 1.0
-            ),
-            "terminal_foreground_rate": _mean(
+            "prediction_foreground_rate": _mean(
                 [
-                    row["terminal_foreground_rate"]
+                    row["prediction_foreground_rate"]
                     for row in metric_rows
-                    if "terminal_foreground_rate" in row
+                    if "prediction_foreground_rate" in row
                 ]
             ),
             "trajectory_diagnostics": [
@@ -1128,15 +919,6 @@ def joint_grpo_group(
         }
     )
 
-    # 复用已有的组诊断函数：quality_reward=reward、point_penalty=0 时，
-    # 其 reward 与优势相关性与点数为常量的判断仍然成立。
-    try:
-        from diffpeak.diagnostics import reward_group_diagnostics
-
-        merged.update(reward_group_diagnostics(metric_rows, advantages))
-    except (ImportError, ValueError, KeyError):
-        # 诊断不是训练正确性的必要条件；数值异常不应静默吞掉训练错误，
-        # 但可选的日志辅助失败不应中断整个 D 阶段。
-        pass
-
+    for key in FIELD_METRIC_KEYS:
+        merged[key] = _mean([row[key] for row in metric_rows if key in row])
     return merged

@@ -1,4 +1,4 @@
-"""DiffPeak-SAM 无标注推理入口。
+"""DiffPeak-SAM 无标注推理入口（signed_ridge_v1）。
 
 示例（在项目根目录执行）::
 
@@ -8,12 +8,14 @@
 
     # 目录推理，保留相对路径与文件名，避免覆盖源文件
     python predict.py --checkpoint runs/diffpeak/best.pt \
-        --input DeepGlobe_Road/valid --output predictions/valid --save-points
+        --input DeepGlobe_Road/valid --output predictions/valid --save-field
 
 预测流程固定为：等比 resize + 右下 pad 到 1024 -> 条件编码 -> 20 步扩散采样
--> h-maxima + NMS 峰值提取 -> SAM 逐图解码 -> 裁 padding -> 恢复原图尺寸。
-目录中的同名不同扩展名或同 stem 影像会追加 ``__1``、``__2``……，绝不覆盖
-输入文件或输出目录中已有的同名结果。
+单通道有符号道路山脊场 -> 固定尺度/终端映射 -> 冻结 SAM decode_heatmaps ->
+裁 padding -> 恢复原图尺寸。不再提取峰值点。
+
+旧双通道 checkpoint 不能直接用于推理（协议严格拒绝）；如需只迁移形状兼容
+权重，显式使用 ``--migrate-weights``（不恢复优化器状态）。
 
 分辨率说明：``engine`` 验证在 1024² 画布上按缩放后有效区域计算指标，而本脚本
 把概率图恢复到原图尺寸后再保存/评估。当前 DeepGlobe 影像均为 1024²，两者等价；
@@ -27,6 +29,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+
 from diffpeak.inference import (
     IMAGE_EXTENSIONS,
     Predictor,
@@ -36,7 +40,6 @@ from diffpeak.inference import (
     resolve_output_dir,
     resolve_sam_checkpoint,
     save_mask_file,
-    save_points_file,
     unique_output_path,
 )
 
@@ -88,27 +91,23 @@ def _save_result(
     result: Dict[str, Any],
     mask_path: Path,
     source_path: Path,
-    save_points: bool,
+    save_field: bool,
 ) -> None:
     save_mask_file(result["mask"], mask_path)
-    if save_points:
-        payload = {
-            "image_id": result.get("image_id"),
-            "source_path": str(source_path),
-            "original_size": list(result["original_size"]),
-            "resized_size": list(result["resized_size"]),
-            "padding": list(result["padding"]),
-            "threshold": result["threshold"],
-            **result["points"],
-        }
-        save_points_file(payload, mask_path.with_suffix(".points.json"))
+    if save_field:
+        if "field" not in result:
+            raise ValueError("--save-field 需要 Predictor 返回有符号场")
+        field_path = mask_path.with_suffix(".field.npy")
+        if field_path.exists():
+            raise FileExistsError(f"输出文件已存在，拒绝覆盖：{field_path}")
+        np.save(field_path, np.asarray(result["field"], dtype=np.float32))
 
 
 def _predict_single(
     predictor: Predictor,
     input_path: Path,
     output: Optional[Path],
-    save_points: bool,
+    save_field: bool,
 ) -> Path:
     if output is None:
         mask_path = resolve_output_dir(
@@ -127,12 +126,13 @@ def _predict_single(
         suffix=".png",
         source_path=input_path,
     )
-    result = predictor.predict_file(input_path)
-    _save_result(result, mask_path, input_path, save_points)
+    result = predictor.predict_file(input_path, return_field=save_field)
+    _save_result(result, mask_path, input_path, save_field)
+    probability = np.asarray(result["probability"])
     print(
         f"{input_path} -> {mask_path} "
-        f"(points={result['point_count']}, "
-        f"positive={result['positive_count']})",
+        f"(positive_pixels={int((probability >= result['threshold']).sum())}, "
+        f"field_scale={result['prompt_scale']})",
         flush=True,
     )
     return mask_path
@@ -142,7 +142,7 @@ def _predict_directory(
     predictor: Predictor,
     input_dir: Path,
     output: Optional[Path],
-    save_points: bool,
+    save_field: bool,
     limit: Optional[int],
 ) -> int:
     if output is None:
@@ -185,8 +185,10 @@ def _predict_directory(
         try:
             # 用相对路径作为 image_id；canonical_image_id 会剥离目录与 _sat，
             # 与验证/评估对同一张图的扩散种子保持一致。
-            result = predictor.predict_file(image_path, image_id=str(relative))
-            _save_result(result, mask_path, image_path, save_points)
+            result = predictor.predict_file(
+                image_path, image_id=str(relative), return_field=save_field
+            )
+            _save_result(result, mask_path, image_path, save_field)
         except Exception as exc:  # 单图失败不终止整个目录
             failures += 1
             print(f"[失败] {image_path}: {exc}", file=sys.stderr, flush=True)
@@ -208,7 +210,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--threshold", type=float, default=None, help="覆盖 inference.threshold。")
     parser.add_argument("--device", type=str, default=None, help="cuda、cuda:0 或 cpu。")
     parser.add_argument("--seed", type=int, default=None, help="显式覆盖评估种子。")
-    parser.add_argument("--save-points", action="store_true", help="同时保存提示点 JSON。")
+    parser.add_argument(
+        "--save-field",
+        action="store_true",
+        help="同时保存单通道有符号场（.field.npy）。",
+    )
+    parser.add_argument(
+        "--migrate-weights",
+        action="store_true",
+        help="显式迁移旧快照的形状兼容权重（跳过 SAM/输入输出头，不恢复优化器）。",
+    )
     parser.add_argument("--limit", type=int, default=None, help="目录模式下最多处理的影像数。")
     return parser
 
@@ -230,11 +241,10 @@ def main() -> None:
         config_dir=config_dir,
         threshold=args.threshold,
         payload=preloaded,
+        migrate_weights=bool(args.migrate_weights),
     )
     preloaded = None
-    save_points = bool(
-        args.save_points or config.get("inference", {}).get("save_points", False)
-    )
+    save_field = bool(args.save_field)
 
     input_path = Path(args.input).expanduser()
     if not input_path.exists():
@@ -245,13 +255,13 @@ def main() -> None:
     resolve_sam_checkpoint(config, config_dir)
 
     if input_path.is_file():
-        _predict_single(predictor, input_path, output, save_points)
+        _predict_single(predictor, input_path, output, save_field)
     elif input_path.is_dir():
         _predict_directory(
             predictor,
             input_path,
             output,
-            save_points,
+            save_field,
             args.limit,
         )
     else:

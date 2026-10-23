@@ -1,10 +1,6 @@
-"""ABC 联合预训练与 D 整体 GRPO 后训练。
+"""Signed ridge diffusion training: ABC supervision and diffusion-only GRPO.
 
-ABC 用一个总损失和优化器更新条件编码器与 DiT，SAM 全部冻结但保留输入梯度。
-SAM 图像/提示编码器权重冻结，可微密集提示保留输入梯度。
-D 使用扩散转移及终端 Bernoulli 分割动作的组相对策略梯度；整个策略
-采用 eval 模式重放，并保存条件编码器、DiT、SAM 解码器的固定参考。
-旧 A/B/C 损失辅助实现仅供历史测试，不再作为训练入口。
+SAM stays frozen and in eval mode while retaining derivatives with respect to fields.
 """
 
 from __future__ import annotations
@@ -28,30 +24,23 @@ from torch.utils.data import DataLoader
 
 from diffpeak.data import DeepGlobeDataset
 from diffpeak.diagnostics import (
-    PROMPT_METRIC_KEYS,
-    REWARD_GROUP_METRIC_KEYS,
-    prompt_quality,
-    reward_group_diagnostics,
-)
-from diffpeak.grpo import (
-    gaussian_kl_divergence,
-    group_relative_advantages,
-    grpo_policy_loss,
+    FIELD_METRIC_KEYS,
+    field_quality,
 )
 from diffpeak.inference import (
     aggregate_metrics,
     build_models,
     compute_image_metrics,
     compute_resized_size,
-    decode_with_prompts,
     encode_images,
     evaluation_seed,
-    get_points,
     load_checkpoint_models,
+    validate_checkpoint_protocol,
+    validate_signed_ridge_config,
+    SIGNED_RIDGE_PROTOCOL,
     make_generator,
     make_reward_config,
     normalize_valid_sizes,
-    points_to_prompt,
     read_checkpoint,
     resolve_data_root,
     resolve_output_dir,
@@ -66,19 +55,6 @@ from diffpeak.schedules import resolve_warmup_steps, warmup_cosine_factor
 __all__ = ["DiffPeakEngine", "STAGE_ORDER"]
 
 STAGE_ORDER: Tuple[str, ...] = ("ABC", "D")
-
-
-def _decoder_module(sam: torch.nn.Module) -> Optional[torch.nn.Module]:
-    """定位 RoadSAM 的掩码解码器，兼容 SAM2 与旧测试替身。"""
-    decoder = getattr(sam, "mask_decoder", None)
-    if decoder is not None:
-        return decoder
-    inner = getattr(sam, "sam", None)
-    for name in ("sam_mask_decoder", "mask_decoder"):
-        decoder = getattr(inner, name, None)
-        if decoder is not None:
-            return decoder
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +123,7 @@ class DiffPeakEngine:
         config_dir: Optional[Union[str, Path]] = None,
     ) -> None:
         self.config = copy.deepcopy(dict(config))
+        validate_signed_ridge_config(self.config)
         self.config_dir = (
             Path(config_dir).expanduser().resolve() if config_dir is not None else None
         )
@@ -179,7 +156,7 @@ class DiffPeakEngine:
             resolve_sam_checkpoint(self.config, self.config_dir)
         ).expanduser().resolve()
 
-        self.models, self.peak_extractor = build_models(
+        self.models, _ = build_models(
             self.config, self.device, sam_checkpoint=self.sam_checkpoint
         )
         self.sam = self.models["sam"]
@@ -187,6 +164,8 @@ class DiffPeakEngine:
         self.dit = self.models["dit"]
         self.diffusion = self.models["diffusion"]
         self.reward_config = make_reward_config(self.config)
+        if self.reward_config.point_cost != 0:
+            raise ValueError("signed_ridge_v1 不使用离散点，reward.point_cost 必须为0")
 
         self.output_dir = Path(
             resolve_output_dir(self.config, self.config_dir)
@@ -229,9 +208,6 @@ class DiffPeakEngine:
         self.advantage_std_delta = float(
             self.rl_cfg.get("advantage_std_delta", 1e-4)
         )
-        self.point_cost_warmup_steps = max(
-            0, int(self.rl_cfg.get("point_cost_warmup_steps", 0))
-        )
         if self.ppo_clip < 0.0 or not math.isfinite(self.ppo_clip):
             raise ValueError("rl.ppo_clip（GRPO 裁剪半径）必须是非负有限数")
         if self.kl_weight < 0.0 or not math.isfinite(self.kl_weight):
@@ -256,10 +232,8 @@ class DiffPeakEngine:
         self.scaler: Optional[Any] = None
         self.ref_dit: Optional[torch.nn.Module] = None
         self.ref_condition_encoder: Optional[torch.nn.Module] = None
-        self.ref_sam_decoder: Optional[torch.nn.Module] = None
         self.global_step = 0
-        # 点成本预热按“已处理的 D 组数”推进，而不是按成功的 optimizer step；
-        # 否则整组常量奖励且 KL/anchor 关闭时预热会永远停在 0。
+        # 处理组数独立于优化器步数，常量奖励组也计入诊断。
         self.grpo_groups_processed = 0
         self.best_metric: Optional[float] = None
         self.history: List[Dict[str, Any]] = []
@@ -270,7 +244,6 @@ class DiffPeakEngine:
         self._val_split_cached = False
         self.experiment_logger = None
 
-        self._validate_peak_target_config()
         # 提前解析划分路径：train 缺失或显式配置的 val 缺失时立即失败；
         # val_split=None 才会禁用验证。
         self._resolve_train_split()
@@ -279,16 +252,6 @@ class DiffPeakEngine:
     # ------------------------------------------------------------------
     # 配置与数据
     # ------------------------------------------------------------------
-    def _validate_peak_target_config(self) -> None:
-        """显式检查目标采样间距与最终 NMS 间距一致。"""
-        peaks_min = float(self.config.get("peaks", {}).get("min_distance", 4.0))
-        target_min = float(self.data_cfg.get("target_min_distance", 4.0))
-        if abs(peaks_min - target_min) > 1e-9:
-            raise ValueError(
-                "peaks.min_distance "
-                f"({peaks_min}) 与 data.target_min_distance ({target_min}) 不一致。"
-                "两者必须显式同步，否则目标热图在构造阶段就可能被合并。"
-            )
 
     def _dataset_kwargs(self, split_file: Path, augment: bool) -> Dict[str, Any]:
         return {
@@ -298,11 +261,7 @@ class DiffPeakEngine:
             "image_size": self.image_size,
             "heatmap_size": self.heatmap_size,
             "seed": self.seed,
-            "sampling_config": self.data_cfg.get("sampling_config"),
-            "heatmap_sigma": float(self.data_cfg.get("heatmap_sigma", 1.0)),
-            "target_min_distance": float(
-                self.data_cfg.get("target_min_distance", 4.0)
-            ),
+            "ridge_config": self.data_cfg.get("ridge_config"),
         }
 
     def _resolve_train_split(self) -> Path:
@@ -413,32 +372,19 @@ class DiffPeakEngine:
     # 冻结、模式与优化器
     # ------------------------------------------------------------------
     def _set_requires_grad(self, stage: str) -> None:
-        for parameter in self.sam.parameters():
-            parameter.requires_grad_(False)
-        if stage in ("D", "A", "C"):
-            decoder = _decoder_module(self.sam)
-            if decoder is None:
-                raise AttributeError("RoadSAM 缺少 mask decoder")
-            for parameter in decoder.parameters():
-                parameter.requires_grad_(True)
-
-        for parameter in self.condition_encoder.parameters():
-            parameter.requires_grad_(stage in ("ABC", "B", "D"))
-        for parameter in self.dit.parameters():
-            parameter.requires_grad_(stage in ("ABC", "B", "D"))
+        if stage not in STAGE_ORDER:
+            raise ValueError(f"未知阶段：{stage}")
+        self.sam.requires_grad_(False).eval()
+        self.condition_encoder.requires_grad_(True)
+        self.dit.requires_grad_(True)
 
     def _set_train_modes(self, stage: str) -> None:
-        """设置训练模式；冻结模块始终 eval。"""
-        self.sam.eval()
-        if stage in ("D", "A", "C"):
-            decoder = _decoder_module(self.sam)
-            if decoder is not None:
-                decoder.train(stage != "D")
-        self.condition_encoder.train(stage in ("ABC", "B"))
-        # D 的 rollout 与 replay 对整个策略使用 eval，梯度仍然开启。
-        self.dit.train(stage in ("ABC", "B"))
-        if self.ref_dit is not None:
-            self.ref_dit.eval()
+        self.sam.requires_grad_(False).eval()
+        self.condition_encoder.train(stage == "ABC")
+        self.dit.train(stage == "ABC")
+        for reference in (self.ref_dit, self.ref_condition_encoder):
+            if reference is not None:
+                reference.requires_grad_(False).eval()
 
     def _set_eval_all(self) -> None:
         for module in self.models.values():
@@ -449,7 +395,7 @@ class DiffPeakEngine:
     def _trainable_parameters(self) -> List[torch.nn.Parameter]:
         parameters: List[torch.nn.Parameter] = []
         seen = set()
-        for module in (self.sam, self.condition_encoder, self.dit):
+        for module in (self.condition_encoder, self.dit):
             for parameter in module.parameters():
                 if id(parameter) in seen:
                     continue
@@ -559,9 +505,6 @@ class DiffPeakEngine:
         else:
             self.scheduler.step()
             self.global_step += 1
-            # 注意：点成本预热使用独立的 grpo_groups_processed，不能在这里
-            # 同步到 global_step；常量组安全跳过时 optimizer 不 step，但 D
-            # 组仍然处理过，预热需要按组推进。
         return not skipped
 
     def _current_lr(self) -> float:
@@ -607,10 +550,11 @@ class DiffPeakEngine:
             raise KeyError("数据集样本缺少 heatmaps")
         if heatmaps.ndim == 3:
             heatmaps = heatmaps.unsqueeze(0)
-        if heatmaps.is_floating_point() and heatmaps.numel() and float(heatmaps.max()) > 1.5:
-            heatmaps = heatmaps.float().div_(255.0)
-        else:
-            heatmaps = heatmaps.float()
+        heatmaps = heatmaps.float()
+        if heatmaps.ndim != 4 or heatmaps.shape[1] != 1:
+            raise ValueError("heatmaps 必须是 B x 1 x H x W 有符号山脊场")
+        if not torch.isfinite(heatmaps).all() or bool((heatmaps.abs() > 1).any()):
+            raise ValueError("目标山脊场必须有限且在 [-1,1] 内")
         prepared["heatmaps"] = heatmaps
 
         batch_size = int(image.shape[0])
@@ -634,8 +578,9 @@ class DiffPeakEngine:
                 ]
         prepared["valid_sizes"] = valid_sizes
 
-        for key in ("image", "mask", "skeleton", "heatmaps"):
-            prepared[key] = prepared[key].to(self.device, non_blocking=True)
+        for key in ("image", "mask", "skeleton", "heatmaps", "field_valid_mask", "field_regions"):
+            if key in prepared:
+                prepared[key] = prepared[key].to(self.device, non_blocking=True)
 
         prepared["ids"] = self._batch_ids(prepared, batch_size)
         return prepared
@@ -653,163 +598,48 @@ class DiffPeakEngine:
     def _supervised_loss(
         self, stage: str, batch: Mapping[str, Any], epoch: int
     ) -> Dict[str, Any]:
-        images = batch["image"]
-        masks = batch["mask"]
-        skeletons = batch["skeleton"]
-        target_heatmaps = batch["heatmaps"]
+        if stage != "ABC":
+            raise ValueError(f"未知监督阶段：{stage}")
+        images, masks = batch["image"], batch["mask"]
         valid_sizes = batch["valid_sizes"]
-        ids = batch["ids"]
-
-        # 图像编码器冻结；即使误开梯度也不会回传。
         with torch.no_grad():
             embeddings = encode_images(self.sam, images, valid_sizes)
-
-        if stage == "ABC":
-            conditions, auxiliary_logits = self.condition_encoder(images, embeddings)
-            losses = self.diffusion.training_losses(
-                self.dit, conditions, target_heatmaps, return_prediction=True
-            )
-            # 单步重建监督与纯噪声采样监督同时训练，避免只依赖带真值的 z_t。
-            reconstructed = self.sam.decode_heatmaps(
-                embeddings, losses["heat_pred"],
-                output_size=tuple(masks.shape[-2:]), valid_sizes=valid_sizes,
-            )
-            generated_heatmaps = self.diffusion.sample_differentiable(
-                self.dit, conditions,
-                generator=make_generator(stable_seed(self.seed, "ABC", epoch, *ids)),
-            )
-            generated = self.sam.decode_heatmaps(
-                embeddings, generated_heatmaps,
-                output_size=tuple(masks.shape[-2:]), valid_sizes=valid_sizes,
-            )
-            # 有效区域逐图归一，右下 padding 不参与分割损失。
-            def seg_loss(logits):
-                return torch.stack([
-                    segmentation_loss(
-                        logits[i:i + 1, :, :h, :w], masks[i:i + 1, :, :h, :w],
-                        cldice_weight=self.cldice_weight,
-                    )
-                    for i, (h, w) in enumerate(valid_sizes)
-                ]).mean()
-
-            segmentation = seg_loss(reconstructed)
-            sampled_segmentation = seg_loss(generated)
-            auxiliary = auxiliary_loss(auxiliary_logits, masks, skeletons)
-            total = (
-                losses["diff"] + self.heat_weight * losses["heat"]
-                + self.aux_weight * auxiliary
-                + float(self.train_cfg.get("seg_weight", 1.0)) * segmentation
-                + float(self.train_cfg.get("sampled_seg_weight", 1.0)) * sampled_segmentation
-            )
-            return {
-                "loss": total, "diff": losses["diff"], "heat": losses["heat"],
-                "aux": auxiliary, "seg": segmentation, "sampled_seg": sampled_segmentation,
-            }
-
-        if stage == "A":
-            # 按设计 A 阶段只训练 SAM mask decoder；条件/细节编码器和辅助头
-            # 属于 B 阶段，这里不做无用 forward，也不把 aux 损失加进来。
-            points = get_points(
-                self.peak_extractor,
-                target_heatmaps,
-                image_size=self.image_size,
-                valid_sizes=valid_sizes,
-            )
-            prompts = [points_to_prompt(item, self.device) for item in points]
-            logits, active = decode_with_prompts(
-                self.sam,
-                embeddings,
-                prompts,
-                output_size=(self.image_size, self.image_size),
-            )
-            indices = [index for index, flag in enumerate(active) if flag]
-            segmentation = None
-            if indices:
-                index_tensor = torch.as_tensor(
-                    indices, dtype=torch.long, device=self.device
-                )
-                segmentation = segmentation_loss(
-                    logits.index_select(0, index_tensor),
-                    masks.index_select(0, index_tensor),
+        conditions, auxiliary_logits = self.condition_encoder(images, embeddings)
+        losses = self.diffusion.training_losses(
+            self.dit, conditions, batch["heatmaps"], return_prediction=True,
+            valid_mask=batch.get("field_valid_mask"), field_regions=batch.get("field_regions"),
+        )
+        reconstructed = self.sam.decode_heatmaps(
+            embeddings, losses["heat_pred"], output_size=tuple(masks.shape[-2:]),
+            valid_sizes=valid_sizes,
+        )
+        generated_heatmaps = self.diffusion.sample_differentiable(
+            self.dit, conditions,
+            generator=make_generator(stable_seed(self.seed, "ABC", epoch, *batch["ids"])),
+        )
+        generated = self.sam.decode_heatmaps(
+            embeddings, generated_heatmaps, output_size=tuple(masks.shape[-2:]),
+            valid_sizes=valid_sizes,
+        )
+        def seg_loss(logits):
+            return torch.stack([
+                segmentation_loss(
+                    logits[i:i + 1, :, :h, :w], masks[i:i + 1, :, :h, :w],
                     cldice_weight=self.cldice_weight,
                 )
-            return {
-                "loss": segmentation,
-                "seg": segmentation,
-                "aux": None,
-                "points": float(sum(int(item[1].numel()) for item in points)),
-            }
-
-        if stage == "B":
-            conditions, auxiliary_logits = self.condition_encoder(images, embeddings)
-            diffusion_losses = self.diffusion.training_losses(
-                self.dit, conditions, target_heatmaps
-            )
-            diffusion_loss = diffusion_losses["diff"]
-            heat_loss = diffusion_losses["heat"]
-            auxiliary = auxiliary_loss(auxiliary_logits, masks, skeletons)
-            total = (
-                diffusion_loss
-                + self.heat_weight * heat_loss
-                + self.aux_weight * auxiliary
-            )
-            return {
-                "loss": total,
-                "diff": diffusion_loss,
-                "heat": heat_loss,
-                "aux": auxiliary,
-            }
-
-        if stage == "C":
-            with torch.no_grad():
-                conditions, _ = self.condition_encoder(images, embeddings)
-                conditions = [item.detach() for item in conditions]
-                generator = make_generator(
-                    stable_seed(self.seed, "C", int(epoch), *ids)
-                )
-                heatmaps = self.diffusion.sample(
-                    self.dit,
-                    conditions,
-                    generator=generator,
-                    record=False,
-                )
-            points = get_points(
-                self.peak_extractor,
-                heatmaps,
-                image_size=self.image_size,
-                valid_sizes=valid_sizes,
-            )
-            prompts = [points_to_prompt(item, self.device) for item in points]
-            logits, active = decode_with_prompts(
-                self.sam,
-                embeddings,
-                prompts,
-                output_size=(self.image_size, self.image_size),
-            )
-            indices = [index for index, flag in enumerate(active) if flag]
-            if not indices:
-                # 没有正峰：SAM 输出常量负 logits，分割损失跳过；
-                # stage C 没有辅助头可训练，因此本批次不产生梯度。
-                return {
-                    "loss": None,
-                    "seg": None,
-                    "points": float(sum(int(item[1].numel()) for item in points)),
-                }
-            index_tensor = torch.as_tensor(
-                indices, dtype=torch.long, device=self.device
-            )
-            segmentation = segmentation_loss(
-                logits.index_select(0, index_tensor),
-                masks.index_select(0, index_tensor),
-                cldice_weight=self.cldice_weight,
-            )
-            return {
-                "loss": segmentation,
-                "seg": segmentation,
-                "points": float(sum(int(item[1].numel()) for item in points)),
-            }
-
-        raise ValueError(f"未知监督阶段：{stage}")
+                for i, (h, w) in enumerate(valid_sizes)
+            ]).mean()
+        segmentation = seg_loss(reconstructed)
+        sampled_segmentation = seg_loss(generated)
+        auxiliary = auxiliary_loss(auxiliary_logits, masks, batch["skeleton"], valid_sizes=valid_sizes)
+        total = (
+            losses["diff"] + self.heat_weight * losses["heat"]
+            + self.aux_weight * auxiliary
+            + float(self.train_cfg.get("seg_weight", 1.0)) * segmentation
+            + float(self.train_cfg.get("sampled_seg_weight", 1.0)) * sampled_segmentation
+        )
+        return {"loss": total, "diff": losses["diff"], "heat": losses["heat"],
+                "aux": auxiliary, "seg": segmentation, "sampled_seg": sampled_segmentation}
 
     # ------------------------------------------------------------------
     # 训练循环
@@ -856,7 +686,6 @@ class DiffPeakEngine:
                     "aux": _scalar(loss_dict.get("aux")),
                     "diff": _scalar(loss_dict.get("diff")),
                     "heat": _scalar(loss_dict.get("heat")),
-                    "points": _scalar(loss_dict.get("points")),
                 }
                 records.append(record)
                 batch_index += 1
@@ -872,7 +701,7 @@ class DiffPeakEngine:
                 else:
                     skipped_groups += 1
             else:
-                # 例如 stage C 整组都没有正峰：完全跳过优化器/调度/计数。
+                # 没有可反传损失时不推进优化器和调度器。
                 self.optimizer.zero_grad(set_to_none=True)
                 skipped_groups += 1
 
@@ -890,7 +719,7 @@ class DiffPeakEngine:
                 )
 
         stats: Dict[str, float] = {}
-        for key in ("loss", "seg", "sampled_seg", "aux", "diff", "heat", "points"):
+        for key in ("loss", "seg", "sampled_seg", "aux", "diff", "heat"):
             values = [
                 record[key]
                 for record in records
@@ -919,14 +748,8 @@ class DiffPeakEngine:
                     f"[D] epoch {epoch + 1} group {group_index} "
                     f"reward={record.get('reward')} "
                     f"iou={record.get('iou')} "
-                    f"points={record.get('point_count')} "
-                    f"pts+/-={record.get('positive_point_count')}/"
-                    f"{record.get('negative_point_count')} "
-                    f"div={record.get('point_set_diversity')} "
                     f"active={record.get('active_group_rate')} "
-                    f"inactive={record.get('inactive_group_rate')} "
                     f"var={record.get('reward_variance')} "
-                    f"cost_scale={record.get('point_cost_scale')} "
                     f"lr={record.get('lr')} "
                     f"clip_frac={record.get('clip_fraction')}",
                     flush=True,
@@ -945,31 +768,19 @@ class DiffPeakEngine:
             "f1",
             "cldice",
             "path",
-            "point_count",
-            "positive_point_count",
-            "negative_point_count",
-            "point_set_diversity",
-            "unique_point_sets",
-            "point_set_identical_ratio",
-            "point_cost_scale",
-            "point_cost",
             "lr",
             "grpo",
             "kl",
             "diffusion_grpo",
-            "terminal_grpo",
             "diffusion_kl",
-            "terminal_kl",
-            "terminal_foreground_rate",
             "anchor",
             "logratio_abs_mean",
             "logratio_abs_max",
             "clip_fraction",
             "policy_terms",
             "quality_reward",
-            "point_penalty",
-            *PROMPT_METRIC_KEYS,
-            *REWARD_GROUP_METRIC_KEYS,
+            "prediction_foreground_rate",
+            *FIELD_METRIC_KEYS,
         )
         for key in keys:
             values = [
@@ -987,62 +798,10 @@ class DiffPeakEngine:
         )
         return stats
 
-    def _point_cost_scale(self, groups_processed: Optional[int] = None) -> float:
-        """返回提示成本预热乘子；``1`` 表示已到配置值。
-
-        定义：按**已处理的 D 组数**线性推进。第 1 组使用 ``1/N``，
-        第 ``N`` 组到 ``1`` 后保持（``N = rl.point_cost_warmup_steps``，
-        ``0`` 禁用）。
-        使用独立的组计数器而不是 ``global_step``：整组奖励常量且
-        ``kl_weight=0``、``anchor_weight=0`` 时更新会被安全跳过，
-        ``global_step`` 永不增加；若按它预热，点成本会永远停在 0。
-        AMP 溢出不会提前推进组计数以外的任何状态。
-        """
-        warmup_steps = int(getattr(self, "point_cost_warmup_steps", 0) or 0)
-        if warmup_steps <= 0:
-            return 1.0
-        if groups_processed is None:
-            # 唯一事实来源是独立组计数器；不退回 global_step，避免重新引入
-            # “整组常量时预热永远停在 0”的问题。
-            step = int(getattr(self, "grpo_groups_processed", 0))
-        else:
-            step = int(groups_processed)
-        step = max(0, min(step, warmup_steps))
-        return float(step) / float(warmup_steps)
 
     def _effective_reward_config(self):
-        """D 阶段的提示成本从 0 线性升到配置值。
+        return self.reward_config
 
-        验证始终使用 ``self.reward_config`` 的基准值，避免同一检查点在
-        不同 epoch 的验证协议漂移。
-        """
-        if self._stage != "D" or self.point_cost_warmup_steps <= 0:
-            return self.reward_config
-        return replace(
-            self.reward_config,
-            point_cost=float(self.reward_config.point_cost)
-            * self._point_cost_scale(),
-        )
-
-    @staticmethod
-    def _point_set_signature(points: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[Any, ...]:
-        """返回与点顺序无关的点集签名，用于组内 diversity 诊断。
-
-        坐标取整到 SAM 输入像素；只用于日志，不参与损失。
-        """
-        coords, labels = points
-        coords = coords.detach().cpu().reshape(-1, 2)
-        labels = labels.detach().cpu().reshape(-1)
-        if coords.shape[0] == 0:
-            return ()
-        if labels.numel() != coords.shape[0]:
-            raise ValueError("点集坐标与标签数量不一致")
-        rounded = torch.round(coords).to(torch.long)
-        rows = [
-            (int(labels[index]), int(rounded[index, 0]), int(rounded[index, 1]))
-            for index in range(rounded.shape[0])
-        ]
-        return tuple(sorted(rows))
 
     @staticmethod
     def _payload_algorithm_name(payload: Mapping[str, Any]) -> str:
@@ -1052,26 +811,13 @@ class DiffPeakEngine:
         return str(algorithm or "").strip().lower()
 
     def _validate_resume_algorithm(self, payload: Mapping[str, Any]) -> None:
-        """拒绝把旧 DDPO 的 optimizer/scheduler 状态直接接入 GRPO。
-
-        ``--init`` 只加载权重，不经过这里，因此旧 DDPO 快照仍可作为初始化。
-        """
-        stage = str(payload.get("stage", "")).upper()
-        if getattr(self, "config", {}).get("training_protocol") == "joint_abc_v1":
-            if payload.get("training_protocol") != "joint_abc_v1":
-                raise ValueError("旧分阶段快照不能 --resume 联合训练；请用 --init 迁移权重")
-        if stage == "ABC" and payload.get("abc_sam_frozen") is not True:
-            raise ValueError("此 ABC 快照曾训练 SAM，优化器参数集合已改变；请用 --init 加载权重")
-        if stage != "D":
-            return
-        version = int(payload.get("format_version", 1) or 1)
-        name = self._payload_algorithm_name(payload)
-        if name != "grpo" or version < 2:
-            raise ValueError(
-                "检测到旧 DDPO 阶段的 checkpoint：不能直接 --resume 到 GRPO "
-                "（优化器、调度器和旧策略状态语义不同）。请改用 --init 只加载"
-                "模型权重，然后从阶段 D 的第 0 个 epoch 重新开始。"
-            )
+        validate_checkpoint_protocol(payload, self.config)
+        if int(payload.get("format_version", 0)) < 5:
+            raise ValueError("旧快照不能 --resume；请显式 --init --migrate-legacy 迁移兼容权重")
+        if str(payload.get("stage", "")).upper() == "D":
+            algorithm = payload.get("algorithm", {})
+            if self._payload_algorithm_name(payload) != "grpo" or algorithm.get("version") != 3:
+                raise ValueError("D 快照必须使用仅扩散轨迹的 Gaussian GRPO v3")
 
     @staticmethod
     def _active_group_mask(reward_tensor: torch.Tensor) -> torch.Tensor:
@@ -1085,596 +831,57 @@ class DiffPeakEngine:
         return reward_tensor.amax(dim=0) > reward_tensor.amin(dim=0)
 
     def _grpo_group(self, batch: Mapping[str, Any], epoch: int) -> Dict[str, Any]:
-        """采样一组轨迹、计算 GRPO 优势，并做一次（或多次）更新。"""
-        if getattr(self, "config", {}).get("training_protocol") == "joint_abc_v1":
-            from diffpeak.joint_rl import joint_grpo_group
-            return joint_grpo_group(self, batch, epoch)
-        if self.group_size < 2:
-            raise ValueError("D 阶段要求 rl.group_size >= 2 才能做组内相对优势")
-        if self.ref_dit is None:
-            raise RuntimeError("D 阶段缺少冻结参考 DiT")
+        from diffpeak.joint_rl import joint_grpo_group
+        return joint_grpo_group(self, batch, epoch)
 
-        images = batch["image"]
-        target_heatmaps = batch["heatmaps"]
-        target_masks = batch["mask"]
-        valid_sizes = batch["valid_sizes"]
-        ids = batch["ids"]
-        batch_size = int(images.shape[0])
-
-        with torch.no_grad(), self._autocast():
-            embeddings = encode_images(self.sam, images, valid_sizes)
-            conditions_raw, _ = self.condition_encoder(images, embeddings)
-            conditions = [item.detach() for item in conditions_raw]
-
-        # 先推进独立组计数，再计算成本乘子：第 1 组为 1/N，第 N 组到
-        # 配置值。即使本组最终没有 optimizer step（常量组且 KL/anchor
-        # 关闭），预热仍会随“处理过的 D 组”前进，不会永远停在 0。
-        self.grpo_groups_processed = int(
-            getattr(self, "grpo_groups_processed", 0)
-        ) + 1
-        point_cost_scale = self._point_cost_scale()
-        reward_config = self._effective_reward_config()
-        effective_point_cost = float(reward_config.point_cost)
-
-        targets_np: List[np.ndarray] = []
-        for index in range(batch_size):
-            valid = valid_sizes[index] or (self.image_size, self.image_size)
-            height, width = int(valid[0]), int(valid[1])
-            targets_np.append(
-                (target_masks[index, 0, :height, :width] > 0.5)
-                .detach()
-                .cpu()
-                .numpy()
-            )
-
-        rewards: List[List[float]] = []
-        trajectories: List[List[Dict[str, Any]]] = []
-        metric_rows: List[Dict[str, float]] = []
-        point_signatures: List[List[Tuple[Any, ...]]] = []
-
-        for trajectory_index in range(self.group_size):
-            generator = make_generator(
-                stable_seed(
-                    self.seed, "D", int(epoch), *ids, trajectory_index
-                )
-            )
-            with torch.no_grad(), self._autocast():
-                heatmaps, trace = self.diffusion.sample(
-                    self.dit,
-                    conditions,
-                    generator=generator,
-                    record=True,
-                )
-                points = get_points(
-                    self.peak_extractor,
-                    heatmaps,
-                    image_size=self.image_size,
-                    valid_sizes=valid_sizes,
-                )
-                prompts = [points_to_prompt(item, self.device) for item in points]
-                logits, _ = decode_with_prompts(
-                    self.sam,
-                    embeddings,
-                    prompts,
-                    output_size=(self.image_size, self.image_size),
-                )
-                probabilities = torch.sigmoid(logits)
-
-                sample_rewards: List[float] = []
-                trajectory_signatures: List[Tuple[Any, ...]] = []
-                for index in range(batch_size):
-                    valid = valid_sizes[index] or (self.image_size, self.image_size)
-                    height, width = int(valid[0]), int(valid[1])
-                    prediction = (
-                        probabilities[index, 0, :height, :width] > self.threshold
-                    ).detach().cpu().numpy()
-                    coords, labels = points[index]
-                    point_count = int(labels.numel())
-                    positive_points = int((labels == 1).sum().item())
-                    negative_points = int((labels == 0).sum().item())
-                    metrics = compute_image_metrics(
-                        prediction,
-                        targets_np[index],
-                        point_count,
-                        reward_config,
-                    )
-                    sample_rewards.append(float(metrics["reward"]))
-                    penalty = effective_point_cost * point_count / float(reward_config.point_reference)
-                    quality = prompt_quality(
-                        points[index], targets_np[index], heatmaps[index],
-                        image_size=self.image_size,
-                        threshold=tuple(
-                            getattr(self.peak_extractor, f"{channel}_config", {}).get("threshold", 0.3)
-                            for channel in ("positive", "negative")
-                        ),
-                    )
-                    metric_rows.append(
-                        {
-                            **metrics,
-                            **quality,
-                            "quality_reward": float(metrics["reward"]) + penalty,
-                            "point_penalty": penalty,
-                            "point_count": float(point_count),
-                            "positive_point_count": float(positive_points),
-                            "negative_point_count": float(negative_points),
-                        }
-                    )
-                    trajectory_signatures.append(
-                        self._point_set_signature(points[index])
-                    )
-                rewards.append(sample_rewards)
-                point_signatures.append(trajectory_signatures)
-                # trace 已由扩散模块保存在 CPU；这里只保留轨迹。
-                trajectories.append(trace)
-            # 显式释放采样图，避免 G 条轨迹的完整计算图/激活驻留。
-            del heatmaps, logits, probabilities
-
-        reward_tensor = torch.tensor(rewards, dtype=torch.float64)  # [G, B]
-        # GRPO：同一影像的 G 个候选构成一个组，组内标准化后才作为优势。
-        # 组内奖励完全相同时优势为零，策略项不会用数值噪声放大出虚假信号。
-        advantages = group_relative_advantages(
-            reward_tensor, delta=self.advantage_std_delta
-        )
-        per_image_std = reward_tensor.std(dim=0, unbiased=False)
-        per_image_variance = per_image_std.pow(2)
-        # 只有奖励完全相同的组才真正没有策略信号；低方差组由 delta 限制
-        # 优势幅度，而不是直接跳过。
-        active_groups = self._active_group_mask(reward_tensor)
-        reward_std = float(per_image_std.mean().cpu())
-        reward_variance = float(per_image_variance.mean().cpu())
-        active_group_rate = float(active_groups.double().mean().cpu())
-        inactive_group_rate = 1.0 - active_group_rate
-        invalid_groups = int(batch_size - int(active_groups.sum().item()))
-
-        # 组内点集 diversity：每张图 G 个候选中有多少个不同的点集。
-        # identical_ratio 是“该图所有候选点集完全相同（unique == 1）”
-        # 的图所占比例，不能与 1 - diversity 混为一谈。
-        diversity_values: List[float] = []
-        unique_point_sets: List[float] = []
-        identical_values: List[float] = []
-        for index in range(batch_size):
-            signatures = [
-                point_signatures[trajectory_index][index]
-                for trajectory_index in range(len(point_signatures))
-            ]
-            if signatures:
-                unique_count = len(set(signatures))
-                unique_point_sets.append(float(unique_count))
-                diversity_values.append(
-                    float(unique_count) / float(len(signatures))
-                )
-                identical_values.append(
-                    1.0 if unique_count == 1 else 0.0
-                )
-            else:
-                diversity_values.append(float("nan"))
-                unique_point_sets.append(float("nan"))
-                identical_values.append(float("nan"))
-        point_set_diversity = (
-            _mean_of(diversity_values) if diversity_values else float("nan")
-        )
-        point_set_identical_ratio = (
-            _mean_of(identical_values) if identical_values else float("nan")
-        )
-
-        update_stats = self._grpo_update(
-            conditions,
-            target_heatmaps,
-            trajectories,
-            advantages,
-            active_groups,
-        )
-
-        merged: Dict[str, Any] = dict(update_stats)
-        merged.update(reward_group_diagnostics(metric_rows, advantages))
-        merged["trajectory_diagnostics"] = [
-            {
-                **row,
-                "image_id": ids[position % batch_size],
-                "trajectory_index": position // batch_size,
-                "advantage": float(advantages[position // batch_size, position % batch_size]),
-            }
-            for position, row in enumerate(metric_rows)
-        ]
-        merged["reward_std"] = reward_std
-        merged["reward_variance"] = reward_variance
-        merged["active_group_rate"] = active_group_rate
-        merged["inactive_group_rate"] = inactive_group_rate
-        merged["invalid_groups"] = float(invalid_groups)
-        merged["point_set_diversity"] = point_set_diversity
-        merged["unique_point_sets"] = _mean_of(unique_point_sets)
-        merged["point_set_identical_ratio"] = point_set_identical_ratio
-        merged["advantage_abs_mean"] = float(
-            advantages.abs().mean().cpu()
-        ) if advantages.numel() else float("nan")
-        merged["point_cost_scale"] = point_cost_scale
-        merged["point_cost"] = effective_point_cost
-        for key in (
-            "reward",
-            "iou",
-            "f1",
-            "cldice",
-            "path",
-            "point_count",
-            "positive_point_count",
-            "negative_point_count",
-            "quality_reward",
-            "point_penalty",
-            *PROMPT_METRIC_KEYS,
-        ):
-            values = [
-                float(row[key])
-                for row in metric_rows
-                if key in row and math.isfinite(float(row[key]))
-            ]
-            merged[key] = _mean_of(values) if values else float("nan")
-        return merged
-
-    def _grpo_update(
-        self,
-        conditions: Sequence[torch.Tensor],
-        target_heatmaps: torch.Tensor,
-        trajectories: Sequence[Sequence[Mapping[str, Any]]],
-        advantages: torch.Tensor,
-        active_groups: Optional[torch.Tensor] = None,
-    ) -> Dict[str, float]:
-        """固定整组轨迹后做 GRPO/KL/anchor 更新；每组 step 一次。"""
-        assert self.optimizer is not None and self.scheduler is not None
-        assert self.scaler is not None
-
-        def _empty_stats() -> Dict[str, float]:
-            return {
-                "grpo": float("nan"),
-                "kl": float("nan"),
-                "anchor": float("nan"),
-                "clip_fraction": float("nan"),
-                "logratio_abs_mean": float("nan"),
-                "logratio_abs_max": float("nan"),
-                "lr": self._current_lr(),
-                "updates": 0.0,
-                "skipped_updates": 0.0,
-                "policy_terms": 0.0,
-            }
-
-        if not trajectories:
-            return _empty_stats()
-
-        batch_size = int(conditions[0].shape[0])
-        steps_per_trajectory = sum(len(trajectory) for trajectory in trajectories)
-        # 单轮更新分母是 G*T*B；无效组在分子中贡献 0，但仍占用分母。
-        per_epoch_terms = steps_per_trajectory * batch_size
-        # 日志中的 grpo_sum/kl_sum 会累计 update_epochs 轮，最终分母同步乘上
-        # update_epochs，避免同一组多轮更新时诊断值随轮数线性放大。
-        total_terms = per_epoch_terms * max(1, int(self.update_epochs))
-        if per_epoch_terms <= 0:
-            return _empty_stats()
-
-        active_mask: Optional[torch.Tensor] = None
-        if active_groups is not None:
-            active_mask = active_groups.detach().to(self.device).reshape(-1).bool()
-            if active_mask.numel() == 1 and batch_size > 1:
-                active_mask = active_mask.expand(batch_size)
-            if active_mask.numel() != batch_size:
-                raise ValueError(
-                    "active_groups 数量与 batch size 不一致："
-                    f"{active_mask.numel()} vs {batch_size}"
-                )
-        has_active_policy = (
-            bool(active_mask.any()) if active_mask is not None else True
-        )
-        has_kl = self.kl_weight > 0
-        has_anchor = self.anchor_weight > 0
-        if not has_active_policy and not has_kl and not has_anchor:
-            # 整组奖励完全相同且没有 KL/锚定项：不构造计算图、不 backward、
-            # 不调用 optimizer.step()，也不消耗 scheduler/global_step。
-            skipped = _empty_stats()
-            skipped["skipped_updates"] = float(self.update_epochs)
-            return skipped
-
-        grpo_sum = 0.0
-        kl_sum = 0.0
-        anchor_values: List[float] = []
-        clip_values: List[float] = []
-        logratio_abs_sum = 0.0
-        logratio_abs_max = 0.0
-        logratio_count = 0
-        update_steps = 0
-        skipped_updates = 0
-        policy_terms = 0
-        epsilon = float(self.ppo_clip)
-
-        for _ in range(self.update_epochs):
-            self.optimizer.zero_grad(set_to_none=True)
-
-            # 扩散锚定：只使用噪声 MSE，避免后训练把热图结构完全带偏。
-            if self.anchor_weight > 0:
-                with self._autocast():
-                    anchor_losses = self.diffusion.training_losses(
-                        self.dit, conditions, target_heatmaps
-                    )
-                    anchor = anchor_losses["diff"] * self.anchor_weight
-                self.scaler.scale(anchor.float()).backward()
-                anchor_values.append(float(anchor.detach().float().cpu()))
-
-            # 策略项与 KL 项都依赖 rollout 轨迹；只有锚定时可以完全跳过
-            # 轨迹重放，避免无意义的 backward。
-            if has_active_policy or has_kl:
-                for trajectory_index, trajectory in enumerate(trajectories):
-                    advantage64 = (
-                        advantages[trajectory_index]
-                        .detach()
-                        .to(self.device)
-                        .reshape(-1)
-                        .double()
-                    )
-                    if advantage64.numel() != batch_size:
-                        raise ValueError(
-                            "优势数量与 batch size 不一致："
-                            f"{advantage64.numel()} vs {batch_size}"
-                        )
-                    sample_active = (
-                        active_mask
-                        if active_mask is not None
-                        else torch.ones(batch_size, dtype=torch.bool, device=self.device)
-                    )
-                    active_float = sample_active.to(torch.float64)
-                    active_count = int(sample_active.sum().item())
-                    if active_count > 0:
-                        # 记录真正参与策略项的 sample-step 数；分母仍然是
-                        # G*T*B，不能用这个数替换。
-                        policy_terms += len(trajectory) * active_count
-                    # 常量组优势为 0；显式置零，避免 ratio*0 仍产生浮点噪声。
-                    advantage64 = advantage64 * active_float
-
-                    for step in trajectory:
-                        # 高维动作统一保持 float32；log_prob 内部再升到 float64。
-                        state = step["state"].to(
-                            self.device, dtype=torch.float32, non_blocking=True
-                        )
-                        action = step["action"].to(
-                            self.device, dtype=torch.float32, non_blocking=True
-                        )
-                        timestep = step["timestep"]
-                        previous_timestep = step["previous_timestep"]
-                        old_log_prob = (
-                            step["old_log_prob"].to(self.device).reshape(-1).double()
-                        )
-
-                        # rollout 与 replay 使用同一 AMP 上下文和同一 eval DiT。
-                        with self._autocast():
-                            mean, std = self.diffusion.transition(
-                                self.dit,
-                                state,
-                                timestep,
-                                previous_timestep,
-                                conditions,
-                            )
-                            new_log_prob = self.diffusion.log_prob(action, mean, std)
-
-                        # 全维 SUM log-prob 的差值在 float64 中计算。
-                        new_log_prob = new_log_prob.reshape(-1).double()
-                        if old_log_prob.numel() == 1 and new_log_prob.numel() > 1:
-                            old_log_prob = old_log_prob.expand_as(new_log_prob)
-                        if old_log_prob.numel() != new_log_prob.numel():
-                            raise ValueError(
-                                "old/new log-prob 形状不一致："
-                                f"{old_log_prob.numel()} vs {new_log_prob.numel()}"
-                            )
-                        raw_log_ratio = new_log_prob - old_log_prob
-                        log_ratio = torch.clamp(raw_log_ratio, min=-20.0, max=20.0)
-                        ratio = torch.exp(log_ratio)
-                        clipped_mask = (
-                            (ratio < 1.0 - epsilon)
-                            | (ratio > 1.0 + epsilon)
-                        )
-
-                        if active_count > 0:
-                            selected_clip = clipped_mask[sample_active]
-                            clip_values.append(
-                                float(selected_clip.double().mean().cpu())
-                            )
-                            selected_abs = raw_log_ratio.detach().abs()[sample_active]
-                            logratio_abs_sum += float(selected_abs.sum().cpu())
-                            logratio_abs_max = max(
-                                logratio_abs_max,
-                                float(selected_abs.max().cpu()),
-                            )
-                            logratio_count += active_count
-
-                        # grpo_policy_loss 对传入的 B 个样本取平均；乘回
-                        # batch_size 得到分子求和，再统一除以 G*T*B。
-                        grpo_loss = grpo_policy_loss(
-                            ratio, advantage64, epsilon
-                        )
-                        grpo_sum += float(grpo_loss.detach().cpu()) * batch_size
-
-                        kl_element = torch.zeros(
-                            (), dtype=torch.float64, device=self.device
-                        )
-                        if has_kl:
-                            with torch.no_grad(), self._autocast():
-                                reference_mean, _ = self.diffusion.transition(
-                                    self.ref_dit,
-                                    state,
-                                    timestep,
-                                    previous_timestep,
-                                    conditions,
-                                )
-                            # 同方差高斯 KL = 0.5 * sum((mu - mu_ref)^2 / sigma^2)。
-                            kl_element = gaussian_kl_divergence(
-                                mean, reference_mean, std
-                            )
-                            kl_sum += float(kl_element.detach().sum().cpu())
-
-                        loss = (
-                            grpo_loss * batch_size
-                            + self.kl_weight * kl_element.sum()
-                        ) / float(per_epoch_terms)
-                        self.scaler.scale(loss.float()).backward()
-
-                        del state, action, mean, std, new_log_prob, log_ratio, ratio
-
-            if self._optimizer_step():
-                update_steps += 1
-            else:
-                skipped_updates += 1
-
-        grpo_value = (
-            grpo_sum / float(total_terms)
-            if policy_terms > 0
-            else float("nan")
-        )
-        kl_value = (
-            kl_sum / float(total_terms) if has_kl else float("nan")
-        )
-        return {
-            "grpo": grpo_value,
-            "kl": kl_value,
-            "anchor": _mean_of(anchor_values),
-            "clip_fraction": _mean_of(clip_values),
-            "logratio_abs_mean": (
-                logratio_abs_sum / float(logratio_count)
-                if logratio_count > 0
-                else float("nan")
-            ),
-            "logratio_abs_max": (
-                logratio_abs_max if logratio_count > 0 else float("nan")
-            ),
-            "lr": self._current_lr(),
-            "updates": float(update_steps),
-            "skipped_updates": float(skipped_updates),
-            "policy_terms": float(policy_terms),
-        }
 
     # ------------------------------------------------------------------
     # 验证
     # ------------------------------------------------------------------
     def validate(self, stage: str) -> Optional[Dict[str, float]]:
-        """验证集评估。
-
-        A 使用真实目标热图提示；B/C/D 使用逐图生成的提示。验证逐图进行，
-        扩散种子只由 ``(seed, canonical_image_id)`` 决定，与阶段、顺序无关。
-        """
+        """Evaluate one generated field per image under the inference sampling protocol."""
         loader = self._build_val_loader()
         if loader is None:
             return None
-
         self._set_eval_all()
         rows: List[Dict[str, float]] = []
-        point_counts: List[float] = []
-        empty_predictions = 0
-        empty_targets = 0
-        count = 0
         try:
             with torch.no_grad(), self._autocast():
                 for batch in loader:
                     prepared = self._prepare_batch(batch)
-                    images = prepared["image"]
-                    valid_sizes = prepared["valid_sizes"]
-                    ids = prepared["ids"]
-                    embeddings = encode_images(self.sam, images, valid_sizes)
-
-                    if stage == "A":
-                        heatmaps = prepared["heatmaps"]
-                        points = get_points(
-                            self.peak_extractor,
-                            heatmaps,
-                            image_size=self.image_size,
-                            valid_sizes=valid_sizes,
-                        )
-                    else:
-                        conditions, _ = self.condition_encoder(images, embeddings)
-                        conditions = [item.detach() for item in conditions]
-                        identifier = ids[0] if ids else ""
-                        generator = make_generator(
-                            evaluation_seed(self.seed, identifier)
-                        )
-                        heatmaps = self.diffusion.sample(
-                            self.dit,
-                            conditions,
-                            generator=generator,
-                            record=False,
-                        )
-                        points = get_points(
-                            self.peak_extractor,
-                            heatmaps,
-                            image_size=self.image_size,
-                            valid_sizes=valid_sizes,
-                        )
-
-                    prompts = [
-                        points_to_prompt(item, self.device) for item in points
-                    ]
-                    if self.config.get("training_protocol") == "joint_abc_v1":
-                        logits = self.sam.decode_heatmaps(
-                            embeddings, heatmaps,
-                            output_size=(self.image_size, self.image_size), valid_sizes=valid_sizes,
-                        )
-                    else:
-                        logits, _ = decode_with_prompts(
-                            self.sam, embeddings, prompts,
-                            output_size=(self.image_size, self.image_size),
-                        )
-                    probabilities = torch.sigmoid(logits)
-
-                    for index in range(int(images.shape[0])):
-                        valid = valid_sizes[index] or (
-                            self.image_size,
-                            self.image_size,
-                        )
-                        height, width = int(valid[0]), int(valid[1])
-                        prediction = (
-                            probabilities[index, 0, :height, :width]
-                            > self.threshold
-                        ).detach().cpu().numpy()
-                        target = (
-                            prepared["mask"][index, 0, :height, :width] > 0.5
-                        ).detach().cpu().numpy()
-                        point_count = (0 if self.config.get("training_protocol") == "joint_abc_v1"
-                                       else int(points[index][1].numel()))
+                    images, sizes = prepared["image"], prepared["valid_sizes"]
+                    embeddings = encode_images(self.sam, images, sizes)
+                    conditions, _ = self.condition_encoder(images, embeddings)
+                    fields = self.diffusion.sample(
+                        self.dit, conditions,
+                        generator=make_generator(evaluation_seed(self.seed, prepared["ids"][0])),
+                    )
+                    logits = self.sam.decode_heatmaps(
+                        embeddings, fields, output_size=(self.image_size, self.image_size),
+                        valid_sizes=sizes,
+                    )
+                    for i, (height, width) in enumerate(sizes):
+                        prediction = (logits[i, 0, :height, :width].sigmoid() >= self.threshold).cpu().numpy()
+                        target = (prepared["mask"][i, 0, :height, :width] > 0.5).cpu().numpy()
                         metrics = compute_image_metrics(
-                            prediction,
-                            target,
-                            point_count,
-                            self.reward_config,
+                            prediction, target, 0,
+                            replace(self.reward_config, seed=evaluation_seed(self.seed, prepared["ids"][i]) % (2**32)),
                         )
-                        metrics.update(prompt_quality(
-                            points[index], target, heatmaps[index],
-                            image_size=self.image_size,
-                            threshold=tuple(
-                                getattr(self.peak_extractor, f"{channel}_config", {}).get("threshold", 0.3)
-                                for channel in ("positive", "negative")
-                            ),
-                        ))
-                        penalty = self.reward_config.point_cost * point_count / self.reward_config.point_reference
-                        metrics["point_penalty"] = float(penalty)
-                        metrics["quality_reward"] = float(metrics["reward"]) + float(penalty)
+                        metrics.update(field_quality(fields[i], target, image_size=self.image_size))
+                        metrics["empty_prediction_rate"] = float(not prediction.any())
+                        metrics["empty_target_rate"] = float(not target.any())
                         rows.append(metrics)
-                        point_counts.append(float(point_count))
-                        if not prediction.any():
-                            empty_predictions += 1
-                        if not target.any():
-                            empty_targets += 1
-                        count += 1
-                        if (
-                            self.val_limit is not None
-                            and count >= int(self.val_limit)
-                        ):
+                        if self.val_limit is not None and len(rows) >= int(self.val_limit):
                             break
-                    if self.val_limit is not None and count >= int(self.val_limit):
+                    if self.val_limit is not None and len(rows) >= int(self.val_limit):
                         break
         finally:
             self._set_train_modes(stage)
-
         if not rows:
             return None
         summary = aggregate_metrics(rows)
-        for key in (*PROMPT_METRIC_KEYS, "quality_reward", "point_penalty"):
-            values = [float(row[key]) for row in rows if math.isfinite(float(row[key]))]
-            summary[key] = _mean_of(values) if values else float("nan")
-        summary["mean_point_count"] = _mean_of(point_counts)
-        summary["empty_prediction_rate"] = float(empty_predictions) / float(len(rows))
-        summary["empty_target_rate"] = float(empty_targets) / float(len(rows))
+        for key in (*FIELD_METRIC_KEYS, "empty_prediction_rate", "empty_target_rate"):
+            summary[key] = _mean_of([row[key] for row in rows if key in row])
         return summary
 
     # ------------------------------------------------------------------
@@ -1700,7 +907,6 @@ class DiffPeakEngine:
                 parameter.requires_grad_(False)
             for name, module in (
                 ("ref_condition_encoder", self.condition_encoder),
-                ("ref_sam_decoder", _decoder_module(self.sam)),
             ):
                 reference = getattr(self, name, None)
                 if reference is None:
@@ -1710,7 +916,6 @@ class DiffPeakEngine:
         else:
             self.ref_dit = None
             self.ref_condition_encoder = None
-            self.ref_sam_decoder = None
 
         self._set_train_modes(stage)
         self._build_optimizer(stage, epochs, steps_per_epoch)
@@ -1728,8 +933,8 @@ class DiffPeakEngine:
         stage = str(stage).upper()
         if stage not in STAGE_ORDER:
             raise ValueError(f"未知阶段：{stage}；请使用 ABC 联合预训练或 D 后训练")
-        if self.config.get("training_protocol") != "joint_abc_v1":
-            raise ValueError("训练配置需设置 training_protocol: joint_abc_v1，并定义 stages.ABC/D")
+        if self.config.get("training_protocol") != SIGNED_RIDGE_PROTOCOL:
+            raise ValueError("训练配置需设置 training_protocol: signed_ridge_v1，并定义 stages.ABC/D")
         if stage not in self.stage_cfgs:
             raise ValueError(f"配置缺少 stages.{stage}")
         # 必须在 probe_loader（用于计算调度步数）和 _prepare_stage（构建
@@ -1786,8 +991,7 @@ class DiffPeakEngine:
                 algorithm={"name": self.rl_algorithm, "group_size": self.group_size,
                            "update_epochs": self.update_epochs, "ppo_clip": self.ppo_clip,
                            "kl_weight": self.kl_weight, "anchor_weight": self.anchor_weight,
-                           "advantage_std_delta": self.advantage_std_delta,
-                           "point_cost_warmup_steps": self.point_cost_warmup_steps},
+                           "advantage_std_delta": self.advantage_std_delta},
             )
         last_validation: Optional[Dict[str, float]] = None
         for epoch in range(start_epoch, epochs):
@@ -1948,7 +1152,7 @@ class DiffPeakEngine:
         states["diffusion"] = self._to_cpu_tree(self.diffusion.state_dict())
         if self.ref_dit is not None:
             states["ref_dit"] = self._to_cpu_tree(self.ref_dit.state_dict())
-        for name in ("ref_condition_encoder", "ref_sam_decoder"):
+        for name in ("ref_condition_encoder",):
             reference = getattr(self, name, None)
             if reference is not None:
                 states[name] = self._to_cpu_tree(reference.state_dict())
@@ -1995,11 +1199,13 @@ class DiffPeakEngine:
         self, stage: str, epoch: int, best_metric: Optional[float]
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
-            # v3：SAM2.1 迁移。SAM 权重键与 SAM1 完全不兼容，v2 快照不能
-            # 继续 --resume/--init；payload 同时记录骨干标识。
-            "format_version": 4,
+            # v5：单通道有符号目标、SAM 全冻结及仅扩散轨迹 GRPO。
+            "format_version": 5,
             "training_protocol": self.config.get("training_protocol"),
-            "abc_sam_frozen": True,
+            "target_representation": "signed_ridge_v1",
+            "latent_channels": 1,
+            "sam_frozen": True,
+            "prompt": copy.deepcopy(self.config.get("prompt", {"scale": 1.0, "terminal_mapping": "clamp"})),
             "sam": {
                 "architecture": str(getattr(self.sam, "architecture", "")),
                 "config": str(getattr(self.sam, "config_name", "")),
@@ -2009,19 +1215,15 @@ class DiffPeakEngine:
             },
             "algorithm": {
                 "name": self.rl_algorithm,
-                "version": 2,
+                "version": 3,
                 "group_size": int(self.group_size),
                 "advantage_std_delta": float(self.advantage_std_delta),
                 "ppo_clip": float(self.ppo_clip),
                 "kl_weight": float(self.kl_weight),
                 "anchor_weight": float(self.anchor_weight),
                 "update_epochs": int(self.update_epochs),
-                "point_cost_warmup_steps": int(self.point_cost_warmup_steps),
                 "grpo_groups_processed": int(
                     getattr(self, "grpo_groups_processed", 0)
-                ),
-                "reward_point_cost": float(
-                    getattr(self.reward_config, "point_cost", 0.0)
                 ),
             },
             "schedule": {
@@ -2138,15 +1340,6 @@ class DiffPeakEngine:
             self.update_epochs = max(
                 1, int(algorithm.get("update_epochs", self.update_epochs))
             )
-            self.point_cost_warmup_steps = max(
-                0,
-                int(
-                    algorithm.get(
-                        "point_cost_warmup_steps",
-                        self.point_cost_warmup_steps,
-                    )
-                ),
-            )
             self.grpo_groups_processed = max(
                 0,
                 int(
@@ -2206,6 +1399,7 @@ class DiffPeakEngine:
         ``--init``；真正的 ``--resume`` 由 :meth:`run_stage` 传 ``False``，
         以保持参考策略的严格恢复。
         """
+        validate_checkpoint_protocol(payload, self.config)
         report = load_checkpoint_models(
             self.models, payload, include_ref=False
         )
@@ -2223,26 +1417,25 @@ class DiffPeakEngine:
         if include_ref:
             for name, module in (
                 ("ref_condition_encoder", self.condition_encoder),
-                ("ref_sam_decoder", _decoder_module(self.sam)),
             ):
                 if name in source:
                     reference = copy.deepcopy(module)
                     reference.load_state_dict(source[name], strict=True)
                     reference.to(self.device).eval().requires_grad_(False)
                     setattr(self, name, reference)
-                elif payload_stage == "D" and not allow_missing_ref and self.config.get("training_protocol") == "joint_abc_v1":
+                elif payload_stage == "D" and not allow_missing_ref:
                     raise ValueError(f"联合 D 快照缺少 {name}，不能恢复固定参考策略")
         return report
 
     def load_init_weights(self, path: Union[str, Path]) -> Mapping[str, Any]:
         """``--init``：只加载模型权重，不恢复优化器/epoch/RNG。
 
-        快照含 ref_dit 时保留该冻结参考；缺失时允许只初始化当前策略，
-        随后由 ``_prepare_stage`` 从当前 DiT 建立新的冻结参考模型。
+        只初始化当前策略。新 D 实验从已加载的条件编码器和 DiT
+        建立新的固定参考；恢复旧参考必须使用 --resume。
         """
         payload = read_checkpoint(path)
         report = self.load_models_from_payload(
-            payload, include_ref=True, allow_missing_ref=True
+            payload, include_ref=False, allow_missing_ref=True
         )
         print(f"已从 {path} 初始化模型权重（不含优化器状态）", flush=True)
         return report

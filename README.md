@@ -1,6 +1,6 @@
 # DiffPeak-SAM
 
-**ABC 联合预训练 → D 整体 GRPO 后训练**：条件编码器与 DiT 生成双通道热图，通过可微密集提示连接 SAM2.1 Hiera-B+，联合优化道路分割。峰值提取保留为诊断，不再阻断训练梯度。当前协议见 [`docs/joint_training.md`](docs/joint_training.md)；旧四阶段实验与 `docs/model_grpo.md` 作为历史记录。
+**单通道有符号山脊场 → 全冻结 SAM → 道路分割**：ABC 监督预训练与 D 扩散轨迹 GRPO 只更新条件编码器和 DiT。SAM2.1 的图像、提示、掩码模块与高分辨率投影全阶段冻结；不再提取离散正负点。当前协议为 `signed_ridge_v1`。当前协议见 [`docs/joint_training.md`](docs/joint_training.md)；旧四阶段实验与 `docs/model_grpo.md` 作为历史记录。
 
 > 旧四阶段的 GPU 探针与测试结果不代表新联合训练已收敛；新协议需要重新测量完整采样反传的显存、吞吐及验证集质量。历史实测见 [`docs/probe_3090.md`](docs/probe_3090.md)，日志使用见 [`docs/experiments.md`](docs/experiments.md)。
 
@@ -99,7 +99,7 @@ python scripts/prepare_splits.py --root DeepGlobe_Road --output splits/protocol_
 
 生成 train/val/test **4,980 / 623 / 623** 的有标注清单，另有 `unlabeled.json`、`protocol.json`。默认 `--test-fraction 0` 仍兼容旧两分；正式比较使用上面的三分配置，训练不读取 test。脚本拒绝覆盖已有划分。按原影像划分后才做增强；随机划分不保证地理独立，有分组信息时优先区域隔离。旧诊断与新 test 的样本使用历史须按实验协议登记；内部结果不等于官方隐藏测试集成绩。
 
-影像等比例缩放到最长边 1024、右下填充；SAM2 输入保持 RGB `[0,1]`，标准化在 SAM2 封装内部完成。道路骨架和采样位置在原标注分辨率构建，再映射到 256² 热图，不先缩小二值道路再求骨架。
+影像等比例缩放到最长边 1024、右下填充；SAM2 输入保持 RGB `[0,1]`，标准化在封装内部完成。同步增强后构造单通道 256² 山脊场，中心线为 +1、有效背景为 -1。独立有效掩码排除 padding，细道路投影保留率由目标检查报告。
 
 ## 3. 代码组织
 
@@ -107,10 +107,10 @@ python scripts/prepare_splits.py --root DeepGlobe_Road --output splits/protocol_
 configs/3090.yaml           单卡实验配置
 scripts/prepare_splits.py  数据清单与复现划分
 diffpeak/
-  data/                    数据读取、增强、随机监督布局
-  prompts.py               固定峰值提取与目标回提检查
+  data/                    数据读取、增强、有符号山脊场与有效区域
+  data/ridge.py            山脊场构造、分区与细道路投影
   models/
-    sam.py                 SAM2.1 封装：冻结图像编码器、高分辨率特征与可适配解码器
+    sam.py                 SAM2.1 封装：全冻结模型、高分辨率特征与可微密集提示
     conditioning.py        细节 CNN、多尺度条件与辅助头
     dit.py                 条件 DiT 去噪器（默认）
     diffusion.py           噪声监督、随机采样、轨迹对数概率
@@ -126,49 +126,39 @@ train.py / predict.py / evaluate.py
 
 ## 4. 训练阶段
 
-所有命令在项目根目录运行。下一阶段使用上一阶段的权重初始化；阶段内恢复则使用 `--resume`，不要把二者混用。
-
-| 阶段 | 可更新部分 | 监督 |
+| 阶段 | 更新参数 | 目标 |
 |---|---|---|
-| ABC | 条件编码器 + DiT；SAM 全部冻结 | 一个总 loss：扩散、热图、辅助、重建提示分割、纯噪声采样提示分割 |
-| D | 同一个整体的全部可训练参数 | 扩散转移与 SAM 分割动作的 GRPO + 固定参考 KL（可选 ABC 监督锚定） |
+| ABC | 条件编码器、DiT | 扩散、四区域场重建、辅助道路/骨架、一步重建与纯噪声完整采样分割 |
+| D | 条件编码器、DiT | 扩散轨迹 GRPO、固定参考 KL、可配置完整 ABC 锚定 |
 
-ABC 将 SAM 全部参数冻结并保持 eval，但提示编码器和掩码解码器的前向不包裹 no_grad、不 detach 热图，因此分割损失仍经 SAM 回传到条件编码器和 DiT。总 loss 不变，优化器只包含扩散分支参数。D 保持整体后训练：解冻 SAM 掩码解码器及其高分辨率投影，与条件编码器和 DiT 一起优化；SAM 图像/提示编码器仍冻结。
-
-两个阶段均使用从纯噪声生成的密集提示验证；评估和预测沿用同一通路。采用线性 warmup + cosine；[`configs/3090.yaml`](configs/3090.yaml) 的新预算是待实测的起点，不能沿用旧四阶段的显存与学习率结论。
+SAM 始终冻结且 eval，分割监督仍保留场输入的梯度。验证与推理直接将单通道场按固定尺度送入 SAM，再对概率阈值化。D 使用相同的确定性分割评分，随机性来自扩散轨迹；不采样终端 Bernoulli 掩码。
 
 ```bash
-# 推荐先检查目标热图回提（不需要 SAM2 权重）
+# 无需 SAM 权重：检查场、padding 和细道路保留
 python check_targets.py --config configs/3090.yaml --samples 16
 
-# 完整训练：ABC 联合预训练后自动进行 D 整体后训练
-conda run -n pytorch python train.py --config configs/3090.yaml --stage all
+# 先准备官方 SAM2.1 权重，再检查标注场提示是否有效
+python scripts/diagnose_ridge_sam.py --help
 
-# 也可分别启动预训练和后训练；ABC 内没有模块训练切换
-conda run -n pytorch python train.py --config configs/3090.yaml --stage ABC
-conda run -n pytorch python train.py --config configs/3090.yaml --stage D --init runs/diffpeak/stage_ABC.pth
-
-# 阶段内恢复，默认用 checkpoint 保存的配置
+# ABC → D，使用独立实验输出目录
+python train.py --config configs/3090.yaml --stage all --experiment-name ridge-v1
+python train.py --config configs/3090.yaml --stage D --init runs/diffpeak/stage_ABC.pth
 python train.py --resume runs/diffpeak/last.pt
 
-# 内部有标注验证集评估；默认使用 checkpoint 的峰值与扩散配置
-python evaluate.py --checkpoint runs/diffpeak/stage_D.pth --split-file splits/val.json --output runs/evaluation
+# 显式迁移旧权重兼容部分，重新开始训练；不恢复 SAM 或输入输出头
+python train.py --config configs/3090.yaml --stage ABC --init old.pt --migrate-legacy
 
-# 官方无标注 valid 只输出预测；不读取掩码
-python predict.py --checkpoint runs/diffpeak/stage_D.pth --input DeepGlobe_Road/valid --output predictions/valid --save-points
+python evaluate.py --checkpoint runs/diffpeak/stage_D.pth --split-file splits/protocol_v1/val.json --output runs/evaluation
+python predict.py --checkpoint runs/diffpeak/stage_D.pth --input DeepGlobe_Road/valid --output predictions/valid
 ```
 
-以上正式训练/完整评估命令需准备 SAM2.1 预训练权重后执行，本次未运行完整训练或评估；SAM1 已有结果不能沿用。已在 `runs/grpo_validation/splits` 生成独立验证用划分，并完成 16 张真实样本的目标回提检查；CPU/GPU 测试与漏峰情况单独记录于 [`docs/testing.md`](docs/testing.md)。`--stage all` 按 A→B→C→D 使用阶段结束权重继续；`stage_X.pth` 为阶段结束完整快照，`last.pt` 为最近保存的完整 epoch，`best.pt` 按当前阶段验证 IoU 选择，会随新阶段重新记录。若希望每阶段使用最佳权重而非末轮权重，分阶段运行并把该阶段 `best.pt` 另存后传给下一阶段 `--init`。建议不同实验使用不同 `output_dir`（或用 `--experiment-name` 隔离），不要共享输出目录。
+新快照为版本 5，严格记录 `signed_ridge_v1` 表示、单通道、SAM 全冻结与提示映射。旧双通道或 SAM 微调快照不能普通 `--init`/`--resume`；只允许上述显式迁移并报告跳过的参数，不迁移优化器、参考或训练进度。阶段内恢复以完整 epoch 为单位，恢复优化器、调度器、GradScaler、参考模型与 RNG；保持数据划分、吞吐及训练预算一致。
 
-`predict.py`/`evaluate.py` 省略 `--config` 时使用 checkpoint 内的配置；显式传入 YAML 表示你主动变更协议。checkpoint 保存已解析的数据、划分、SAM2 和输出绝对路径；换机器时应显式提供含新路径的配置。恢复以完整 epoch 为单位，不承诺逐 batch 中断恢复。`train.py --resume` 会恢复 checkpoint 的优化器学习率与调度曲线，即使显式传入新 YAML；阶段内恢复应保持 batch size、梯度累积、划分长度和计划 epoch 数不变，变更训练预算请另用 `--init` 启动新实验。`evaluate.py` 的 `--limit` 只用于子集调试，不应与完整验证集结果混用。
-
-当前 3090 配置为 batch size 1、梯度累积 4、AMP；DiT 默认开启激活检查点（`model.dit.gradient_checkpointing=true`），D 保留 `rl.amp_init_scale=64`。A/B/C 的监督有效批次为 4。D 每图 4 条轨迹串行采样、轨迹暂存 CPU，其组语义不同于监督批次。
-
-**旧 U-Net（包括旧 DDPO）快照不支持加载到当前 DiT。** `--init` 和 `--resume` 都会明确拒绝，旧 `ref_dit` 也不能复用；请使用独立 `output_dir`，从官方 SAM2.1 权重启动新的 A→B→C→D 实验。后续只有参数结构匹配的 DiT 快照才可用于 `--init` 或 `--resume`；即使架构匹配，也不能把不同训练算法的优化器和调度状态当作 GRPO 状态继续恢复。
+`last.pt` 保存最近完整 epoch，`stage_ABC.pth`/`stage_D.pth` 保存阶段结束快照，`best.pt` 按当前阶段验证 IoU 选择。`--init` 开始新实验，新 D 的参考从当前权重建立；`--resume` 恢复原 D 参考。旧双通道吞吐配置只作为起点，新协议显存、吞吐和质量需重新实测。详细语义见 [训练说明](docs/joint_training.md)。
 
 ### 实验日志与 TensorBoard
 
-实验日志已通过文件/事件回读、异常关闭、RNG 隔离与微型 A–D/resume 集成测试；TensorBoard 2.21.0 本地 HTTP 页面及标量接口检查通过。日志已在 CPU 测试与真实 SAM2 有界探针中运行，但尚未验证完整多轮训练的日志轮转与长期曲线；SAM1 时期结果不能外推为 SAM2 结果。
+实验日志已通过文件/事件回读、异常关闭、RNG 隔离与微型 ABC/D/resume 集成测试；TensorBoard 2.21.0 本地 HTTP 页面及标量接口检查通过。日志已在 CPU 测试与真实 SAM2 有界探针中运行，但尚未验证完整多轮训练的日志轮转与长期曲线；SAM1 时期结果不能外推为 SAM2 结果。
 
 - `--output-dir PATH` 覆盖 YAML `output_dir`，作为输出根目录；`--experiment-name NAME` 在其下建立独立子目录，有效输出目录为 `<output_dir>/NAME`（省略时沿用原 `output_dir`；不与 `--resume` 同用）；`--no-tensorboard` 关闭本次事件写入，其余日志照常。
 - 每次启动（包括每次 `--resume`）都在有效输出目录下新建 `<有效输出目录>/experiments/<UTC时间戳>_<随机ID>/`（例如 `20261021T121500.123456Z_ab12cd34`），其中写入 `config.json`、`metadata.json`、`train.log`（stdout/stderr tee）、`metrics.jsonl`（epoch 与 batch/group 结构化指标）和 `tensorboard/` 事件。`experiments/` 之外的既有 `metrics.json`、`last.pt`、`best.pt`、`stage_X.pth` 保持原位置和用途。
@@ -182,7 +172,7 @@ python predict.py --checkpoint runs/diffpeak/stage_D.pth --input DeepGlobe_Road/
   ```
 
   `log_every` 控制 batch/group 记录间隔（每轮首批、末批也记录）；训练 epoch 汇总每轮记录，验证按 `train.val_every` 及末轮记录；`flush_secs` 控制 TensorBoard 事件刷新周期（文本与 JSONL 按写入刷新），缺省协议即上例。
-- TensorBoard tag 按阶段独立，例如 `A/train_batch/loss`、`D/train_group/reward`、`A/train_epoch/loss`、`A/val_epoch/iou`、`A/system/epoch_seconds`。epoch 级轴为 1-based；batch/group 轴使用 `epoch_index * len(loader) + index`，其中 `epoch_index` 为该轮从 0 开始的内部序号，`index` 为该 epoch 内从 1 开始的 batch 序号，D 阶段改用 `group_index`。`--resume` 另起 session，`metadata.json` 记录 resume 快照路径、阶段与 epoch，避免把未保存 epoch 的点追加到旧曲线。
+- TensorBoard tag 按阶段独立，例如 `ABC/train_batch/loss`、`D/train_group/reward`、`ABC/train_epoch/loss`、`ABC/val_epoch/iou`、`ABC/system/epoch_seconds`。epoch 级轴为 1-based；batch/group 轴使用 `epoch_index * len(loader) + index`，其中 `epoch_index` 为该轮从 0 开始的内部序号，`index` 为该 epoch 内从 1 开始的 batch 序号，D 阶段改用 `group_index`。`--resume` 另起 session，`metadata.json` 记录 resume 快照路径、阶段与 epoch，避免把未保存 epoch 的点追加到旧曲线。
 
 ```bash
 # 独立实验子目录；有效输出目录为 runs/diffpeak/grpo-baseline
@@ -201,39 +191,20 @@ tensorboard --logdir runs/diffpeak --port 6006
 
 浏览器打开 `http://localhost:6006`。若使用 `--output-dir` 或 `--experiment-name`，将 `--logdir` 指向对应的有效输出目录（或其 `experiments/`）即可。详细字段、tag 与 resume 隔离口径见 [`docs/experiments.md`](docs/experiments.md)。
 
-## 5. 扩散、峰值与 RL 协议
+## 5. 场与 GRPO 协议
 
-- SAM2.1 Hiera-B+：输入 1024²，冻结图像嵌入 256×64²，并保留各 256 通道的 256² / 128² 原始 FPN 特征；mask decoder 独立将其投影为 32 / 64 通道。
-- 条件金字塔：256/128/64/32，通道 64/128/256/256；统一融合 SAM2 两级原始高分辨率 FPN，投影参数不与解码器共享，不再保留旧低分辨率条件分支或切换开关。旧结构 checkpoint 不支持直接初始化或恢复，新实验从官方 SAM2 权重执行 A→B→C→D。
-- 两个独立提示通道：256²，既不互斥 Softmax，也不逐图 min-max。
-- 训练扩散 1,000 步，生成 20 步；所有随机转移方差非零，包括末步，标准差下限 0.02。
-- 固定峰值：平滑 sigma=0.5，h=0.05，绝对阈值 0.3，NMS 半径 4 热图像素。
-- 每通道峰数可变，无固定 K；不设置隐含 top-k。异常密集热图可能带来很高解码成本，需要监控。
-- 正点/负点一起输入 SAM2；没有正峰时输出空掩码，不强行补全全局最大点。点成本按提取出的峰总数统计：即使负点-only 候选被空掩码规则短路，冗余负峰仍受成本惩罚。
-- 默认去噪器为条件 DiT：双通道 256² 热图按 `patch_size=8` 切成 32×32 token，`hidden_size=256`、`depth=6`、`num_heads=8`、`mlp_ratio=4.0`；四尺度条件特征投影对齐后逐像素融合，时间步经 adaLN-Zero 注入。旧 `ConditionalUNet` 模块已移除，不保留别名。
-- 旧 U-Net checkpoint 与 DiT 参数结构不兼容，`--resume`/`--init` 会被严格加载显式拒绝，不会静默回退为随机权重；U-Net 时期的历史实验结果保留，但不能作为 DiT 的实测依据；架构对照需单独登记并匹配实验协议。20 步采样、峰值参数和可选低噪声热图重建沿用现有实现，均需进一步消融校准。
-- 默认奖励 `0.6*IoU + 0.4*clDice - point_cost*(Kpos+Kneg)/32`，其中 `reward.point_cost=0.05`。D 阶段 `rl.point_cost_warmup_steps=100` 时，策略点成本按**已处理的 D 组数**在 100 组内线性升到该值（第 1 组为 1/100）；`0` 表示禁用预热。组内奖励完全常量、没有实际 backward 的组也会推进预热，避免预热永远停在 0；验证始终使用未预热的基准成本。
-- 原始 `checkpoints/sam2.1_hiera_base_plus.pt` 在训练和预测构造时都需要保留，即便训练快照已经包含 SAM2 权重；SAM1 权重 `sam_vit_b_01ec64.pth` 不可替代。完整快照较大，实验磁盘空间需预留。
-- 可开启双向抽样路径代理（例如权重 0.5/0.3/0.2），**不是正式 APLS**；二值标注无法区分立交跨越。
-- D 阶段用 GRPO：同一影像的 G 条轨迹组成一个组，优势为 `(R_i - mean(R)) / max(std(R), advantage_std_delta)`，均值和标准差只来自该组。`rl.algorithm=grpo` 显式标识协议。动作维联合 log-prob 对所有热图维度**求和**，没有用均值替代联合密度；默认裁剪半径 `rl.ppo_clip=1e-4` 是高维策略的谨慎起点，需监控实际 KL、奖励方差与更新比例。键名保留 `ppo_clip` 只是为了兼容旧配置。
-- `rl.advantage_std_delta=1e-4` 是组内标准差的分母下限，不是“低方差组跳过阈值”：非零但方差很小的组仍按该下限缩放后参与学习，只有奖励完全相同的组优势为零。KL 同样对动作维度求和，再按样本/轨迹/时间步取平均。
-- 每条轨迹的旧策略 log-prob 在该组 rollout 时保存并冻结，重放时只重算当前策略；它与长期参考策略不是同一个对象。首次从 ABC 进入 D 时，条件编码器、DiT 和 SAM 解码器分别深拷贝为固定 KL 参考。D 快照保存全部参考，恢复时严格加载。奖励本身不反传，扩散转移和 SAM 终端分割动作各自通过保存动作的重新计分获得策略梯度。
-- `rl.anchor_weight` 默认 `0.0`，即不启用监督锚定。参考 GRPO 设计没有把目标热图 MSE 列为必需项；设为非零时是**可选**监督锚定，只作为稳定项，不是当前默认协议。
-- 推理默认沿用随机生成协议；确定性采样不能默认与训练等价。
+- 条件金字塔和 DiT 主体保持原尺寸：输入 1024²、场 256²，四尺度条件通道 64/128/256/256，DiT patch8/hidden256/depth6/heads8。
+- 扩散直接处理有符号场，不做逐图 min-max、通道 Softmax 或旧仿射变换；不加入旧背景均值补偿。带噪状态无界，终端场裁剪到 [-1,1] 后以 `U=prompt.scale*H` 提示 SAM，padding 固定为0。
+- 随机转移包括末步均保持正标准差；记录原始高斯动作后再裁剪终端输出，轨迹概率按原始动作重放。
+- 每图 G 条轨迹独立形成奖励组，优势为 `(R-mean(R))/max(std(R),delta)`；常量组优势为0，低方差非零组仍学习。高斯联合 log-prob 与 KL 对动作维求和，再按样本、轨迹和时间步平均。
+- 默认奖励 `0.6*IoU+0.4*clDice`，路径代理默认关闭，候选之间固定奖励随机种子。不奖励点数、峰谷、高频或幅度对比。
+- D 固定参考条件编码器与 DiT，不创建参考 SAM。`anchor_weight=0.01` 保留完整 ABC 监督锚定，设0消融。单通道改变概率尺度，裁剪、KL 与更新幅度需重新校准。
 
-## 6. 实验注意事项
+## 6. 实验边界
 
-消融与主流模型比较按 [实验协议](docs/experimental_protocol.md) 冻结数据、预算、模型选择及评估口径。运行参数集中于配置，资源实测及开发筛选集中于 [3090 探针记录](docs/probe_3090.md)，避免在多份文档维护重复参数表。SAM2 替换 SAM1 属于骨干变更：旧 SAM1 快照、A/B/C/D 结果和探针数据全部失效，必须用 SAM2.1 权重执行 ABC 联合预训练 → D 后训练，并重新测量吞吐与显存。探针工具已归档到 `experiments/3090-throughput-probes-20261021` 分支，主分支仅保留训练实现。正式训练建议用 `--cpu-threads 2 --interop-threads 1` 限制 CPU 线程；SAM1 与 SAM2 的 worker 数、吞吐和显存均按骨干分开记录，参见实测文档。
+正式训练前先验证标注山脊场和二值 mask 提示在真实冻结 SAM 上的可用性及固定尺度，再比较确定性同场预测基线、监督扩散、监督加 GRPO、关闭锚定。主报告采用固定协议单次生成与跨种子波动。多候选标注最优只作潜力诊断，路径奖励不是正式 APLS。完整实验顺序及风险见 [方案](docs/signed_ridge_diffusion_plan.md)。
 
-先完成 ABC 联合监督预训练再进行 D；D 可能因组内奖励相同、优势为零而停滞，不保证必然改善。先检查目标热图的 `target_recovery_report`，确保随机目标峰经最终提取器仍可恢复。困难负点只在具备阶段性假阳性数据时启用，不把普通背景采样冒充困难负点挖掘。
-
-D 阶段至少记录终端奖励、组内奖励标准差、无效（零优势）组比例、正负点数、联合 log-ratio、KL 与裁剪比例。`advantage_std_delta` 只限制标准差分母；若许多组奖励完全相同，应检查探索是否不足，而不是把它当作已发生的学习。点成本预热只在前 100 个已处理 D 组内改变成本权重，比较实验时应固定该协议或显式设为 0。
-
-建议分别记录 IoU、F1、clDice、正负点数分布、无正峰率、点落点正确率、多种子波动和包含峰值 CPU 处理的端到端耗时。指标聚合需区分逐图宏平均与全数据混淆矩阵微平均。无道路图的空预测得分规则见奖励实现。
-
-若 OOM，先检查意外解冻和保留计算图，再降低 micro-batch、开启检查点并保留 AMP。worker 数主要影响主存和数据等待；改变 G、采样步数或分辨率会改变实验定义，需单独登记。实测显存范围与样本数见探针记录。
-
-本实现是原设计的可扩展研究基线，不是复现已发表性能的成品；交叉注意力、自动困难负点闭环、正式 APLS 评估、细边界细化和全部消融实验需单独开展。
+持续记录 IoU/F1/clDice、边界与细路表现、空预测率、场分布、提示干预响应、奖励方差、KL 和裁剪比例。仅扩散损失下降不能证明有效收敛。旧双通道和旧四阶段实测保留作历史记录，不代表当前协议性能。
 
 ## 7. 测试入口
 
@@ -251,4 +222,4 @@ conda run -n pytorch python scripts/gpu_smoke.py
 conda run -n pytorch python -m compileall -q diffpeak tests scripts train.py predict.py evaluate.py check_targets.py
 ```
 
-GPU smoke 使用 128² 输入、32² 热图、G=2 和 4 步采样，检查 AMP、GRPO 组内优势（奖励 `[0.4, 0.6]` 得到 `[-1, 1]`）、KL、逐步重算 log-prob、梯度与参数更新，而非完整 SAM2 分割效果。历史实测：完整 CPU 测试 221 项 OK；GPU smoke `passed=true`，重算 ratio 最大误差 0，B/D 峰值 allocated 339.51 / 369.08 MiB。该合成 smoke 不加载真实 SAM2 权重，也不替代完整训练。SAM2 接口测试及真实 3090 有界训练另见实测记录；不要把合成 smoke 的数字冒充完整模型占用。历史范围与未执行项见 [`docs/testing.md`](docs/testing.md)。
+GPU smoke 使用微型条件 DiT 和模拟 SAM 特征验证 CUDA/AMP、单通道采样、概率重放、GRPO 更新和冻结状态，不加载真实 SAM2.1 预训练权重，不能替代正式训练、提示有效性或分割质量评估。当前验收与历史记录见 [测试说明](docs/testing.md)。
