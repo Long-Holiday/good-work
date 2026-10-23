@@ -1,6 +1,7 @@
 """Tiny ABC,D control-flow integration for the signed-ridge protocol.
 
-No pretrained weights and no quality claims: the tiny SAM/diffusion only verify
+No pretrained weights and no quality claims: the tiny SAM/Flow Matching models
+only verify
 stage wiring, frozen-SAM invariants, checkpoint protocol, throughput overrides,
 logging scopes and exact resume equivalence.
 """
@@ -21,8 +22,14 @@ from torch import nn
 
 from diffpeak.engine import DiffPeakEngine
 from diffpeak.experiment_logging import ExperimentLogger
-from diffpeak.inference import DEFAULT_CONFIG, read_checkpoint
-from diffpeak.models import ConditionEncoder, ConditionalDiT, GaussianDiffusion
+from diffpeak.inference import (
+    CHECKPOINT_FORMAT_VERSION,
+    DEFAULT_CONFIG,
+    DENOISER_ARCHITECTURE,
+    GENERATIVE_PROCESS,
+    read_checkpoint,
+)
+from diffpeak.models import ConditionEncoder, ConditionalFlowMatching, ConditionalUNet
 from diffpeak.models.sam import SAM2ImageFeatures
 
 PROTOCOL = "signed_ridge_v1"
@@ -96,12 +103,16 @@ def _build_tiny_models(config, device, sam_checkpoint=None):
         "condition_encoder": ConditionEncoder(
             sam_channels=4, condition_channels=(4, 8, 8, 8)
         ),
-        "dit": ConditionalDiT(
-            hidden_size=32, depth=2, num_heads=4, patch_size=4,
+        "unet": ConditionalUNet(
+            base_channels=4, channel_mults=(1, 2, 2, 4), num_res_blocks=1,
+            attention_levels=(3,), num_heads=2,
             condition_channels=(4, 8, 8, 8), gradient_checkpointing=True,
+            time_scale=1000.0,
         ),
-        "diffusion": GaussianDiffusion(
-            timesteps=8, sampling_steps=2, heatmap_size=16
+        "diffusion": ConditionalFlowMatching(
+            sampling_steps=2, policy_std=0.02, latent_channels=1,
+            heatmap_size=16, time_scale=1000.0,
+            field_loss_min_time=0.5, solver="heun",
         ),
     }
     # Signed-ridge 协议不再构造峰值提取器；build_models 返回 (models, None)。
@@ -151,10 +162,16 @@ class EnginePipelineTest(unittest.TestCase):
         # 默认配置必须是单通道有符号山脊场协议，且只保留 ABC,D。
         self.assertEqual(config["training_protocol"], PROTOCOL)
         self.assertEqual(tuple(config["stages"]), ("ABC", "D"))
-        # 快照配置必须描述测试工厂实际构建的微型 DiT。
-        config["model"]["dit"].update(
-            hidden_size=32, depth=2, num_heads=4, patch_size=4,
+        # 快照配置必须描述测试工厂实际构建的微型 UNet。
+        config["model"]["unet"].update(
+            base_channels=4, channel_mults=(1, 2, 2, 4), num_res_blocks=1,
+            attention_levels=(3,), num_heads=2,
             condition_channels=(4, 8, 8, 8), gradient_checkpointing=True,
+            time_scale=1000.0,
+        )
+        config["flow_matching"].update(
+            sampling_steps=2, policy_std=0.02, heatmap_size=16,
+            time_scale=1000.0, field_loss_min_time=0.5, solver="heun",
         )
         config["data"].update(
             root=str(data), train_split=str(split), val_split=str(split),
@@ -203,8 +220,10 @@ class EnginePipelineTest(unittest.TestCase):
 
     def _assert_protocol_payload(self, test, payload, stage):
         test.assertEqual(payload["stage"], stage)
-        test.assertEqual(payload["format_version"], 5)
+        test.assertEqual(payload["format_version"], CHECKPOINT_FORMAT_VERSION)
         test.assertEqual(payload["training_protocol"], PROTOCOL)
+        test.assertEqual(payload["denoiser_architecture"], DENOISER_ARCHITECTURE)
+        test.assertEqual(payload["generative_process"], GENERATIVE_PROCESS)
         test.assertEqual(payload["target_representation"], PROTOCOL)
         test.assertIs(payload["sam_frozen"], True)
         test.assertEqual(payload["latent_channels"], 1)
@@ -219,36 +238,36 @@ class EnginePipelineTest(unittest.TestCase):
             config = self._make_config(root)
             engine = self._engine(config)
 
-            # ABC：SAM 全冻结且保持 eval；条件编码器与 DiT 正常训练。
+            # ABC：SAM 全冻结且保持 eval；条件编码器与 UNet 正常训练。
             sam_before = copy.deepcopy(engine.sam.state_dict())
             abc_metrics = engine.run_stage("ABC")
             self.assertTrue(np.isfinite(abc_metrics["iou"]))
             self._assert_frozen_sam(self, engine, sam_before)
             self.assertTrue(engine.condition_encoder.training)
-            self.assertTrue(engine.dit.training)
-            self.assertIsNone(engine.ref_dit)
+            self.assertTrue(engine.unet.training)
+            self.assertIsNone(engine.ref_unet)
             self.assertIsNone(engine.ref_condition_encoder)
             self.assertIsNone(getattr(engine, "ref_sam_decoder", None))
             payload = read_checkpoint(engine.output_dir / "last.pt")
             self._assert_protocol_payload(self, payload, "ABC")
-            for name in ("ref_dit", "ref_condition_encoder", "ref_sam_decoder"):
+            for name in ("ref_unet", "ref_condition_encoder", "ref_sam_decoder"):
                 self.assertNotIn(name, payload["models"])
             self.assertTrue((engine.output_dir / "stage_ABC.pth").is_file())
             # D 从 ABC 结束的完整快照初始化；加载路径会严格校验协议元数据。
             abc_payload = copy.deepcopy(payload)
 
-            # D：rollout/replay 用 eval 模式，但条件编码器与 DiT 仍可训练；
-            # 参考模块只有 ref_dit 与 ref_condition_encoder。
+            # D：rollout/replay 用 eval 模式，但条件编码器与 UNet 仍可训练；
+            # 参考模块只有 ref_unet 与 ref_condition_encoder。
             d_metrics = engine.run_stage("D")
             self.assertTrue(np.isfinite(d_metrics["iou"]))
             self._assert_frozen_sam(self, engine, sam_before)
             self.assertFalse(engine.condition_encoder.training)
-            self.assertFalse(engine.dit.training)
+            self.assertFalse(engine.unet.training)
             self.assertTrue(all(p.requires_grad for p in engine.condition_encoder.parameters()))
-            self.assertTrue(all(p.requires_grad for p in engine.dit.parameters()))
-            self.assertIsNotNone(engine.ref_dit)
-            self.assertFalse(engine.ref_dit.training)
-            self.assertTrue(all(not p.requires_grad for p in engine.ref_dit.parameters()))
+            self.assertTrue(all(p.requires_grad for p in engine.unet.parameters()))
+            self.assertIsNotNone(engine.ref_unet)
+            self.assertFalse(engine.ref_unet.training)
+            self.assertTrue(all(not p.requires_grad for p in engine.ref_unet.parameters()))
             self.assertIsNotNone(engine.ref_condition_encoder)
             self.assertFalse(engine.ref_condition_encoder.training)
             self.assertTrue(
@@ -257,7 +276,7 @@ class EnginePipelineTest(unittest.TestCase):
             self.assertIsNone(getattr(engine, "ref_sam_decoder", None))
             payload = read_checkpoint(engine.output_dir / "last.pt")
             self._assert_protocol_payload(self, payload, "D")
-            for name in ("ref_dit", "ref_condition_encoder"):
+            for name in ("ref_unet", "ref_condition_encoder"):
                 self.assertIn(name, payload["models"])
             self.assertNotIn("ref_sam_decoder", payload["models"])
             self.assertTrue((engine.output_dir / "stage_D.pth").is_file())
@@ -296,7 +315,7 @@ class EnginePipelineTest(unittest.TestCase):
             self.assertEqual(checkpoint["epoch"], 1)
             # D: 2 个样本、batch_size=1 -> 2 步/epoch，两轮共 4 步。
             self.assertEqual(checkpoint["schedule"]["total_steps"], 4)
-            for name in ("ref_dit", "ref_condition_encoder"):
+            for name in ("ref_unet", "ref_condition_encoder"):
                 self.assertIn(name, checkpoint["models"])
             self.assertNotIn("ref_sam_decoder", checkpoint["models"])
             continuous.run_stage(
@@ -326,8 +345,8 @@ class EnginePipelineTest(unittest.TestCase):
             self.assertEqual(uninterrupted.global_step, continuous.global_step)
             # 两个策略模块与两个固定参考模块都必须逐位恢复；SAM 始终不变。
             module_names = (
-                "sam", "condition_encoder", "dit",
-                "ref_dit", "ref_condition_encoder",
+                "sam", "condition_encoder", "unet",
+                "ref_unet", "ref_condition_encoder",
             )
             _assert_module_states_equal(self, uninterrupted, continuous, module_names)
             _assert_module_states_equal(self, uninterrupted, resumed, module_names)

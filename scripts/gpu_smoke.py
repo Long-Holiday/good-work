@@ -1,4 +1,4 @@
-"""RTX 3050 GPU smoke test for ABC supervision and diffusion-only D.
+"""RTX 3050 GPU smoke test for ABC supervision and stochastic Flow Matching D.
 
 只依赖 ``torch`` 与 ``diffpeak`` 的 models/losses 模块；不导入 inference/engine，
 不加载 SAM 权重（用随机低分辨率与两级高分辨率张量模拟 SAM2 图像特征），
@@ -8,15 +8,15 @@
 
     conda run -n pytorch python scripts/gpu_smoke.py
 
-ABC：128x128 输入 -> ConditionEncoder 多尺度条件 -> ConditionalDiT +
-GaussianDiffusion.training_losses（单通道有符号山脊场 + valid_mask +
+ABC：128x128 输入 -> ConditionEncoder 多尺度条件 -> ConditionalUNet +
+ConditionalFlowMatching.training_losses（单通道有符号山脊场 + valid_mask +
 field_regions）+ auxiliary_loss(valid_sizes=...)，AMP float16 + GradScaler
 前向/反向，检查损失、梯度有限且参数确实更新。
 
-D：DiT eval、条件 detach，固定 CUDA generator 采样 G=2 条扩散轨迹
+D：UNet eval、条件 detach，固定 CUDA generator 采样 G=2 条随机 Flow Matching 轨迹
 （timesteps=32, steps=4），检查原始高斯动作、记录 dtype、逐步重算 log-prob
 的 ratio≈1，再用组内奖励 [0.4, 0.6] 走真实的 ``diffpeak.grpo`` 优势/裁剪/KL
-工具，做 GRPO + KL + 扩散 anchor 组合反向，检查梯度有限、参数更新。该阶段
+工具，做 GRPO + KL + Flow Matching anchor 组合反向，检查梯度有限、参数更新。该阶段
 没有终端 Bernoulli 策略或参考 SAM 解码器。
 
 另有一组纯张量检查覆盖 GRPO 工具的多图组（``[G, B]`` 按列独立标准化）、
@@ -49,8 +49,8 @@ from diffpeak.grpo import (  # noqa: E402
 )
 from diffpeak.losses import auxiliary_loss  # noqa: E402
 from diffpeak.models.conditioning import ConditionEncoder  # noqa: E402
-from diffpeak.models.diffusion import GaussianDiffusion  # noqa: E402
-from diffpeak.models.dit import ConditionalDiT  # noqa: E402
+from diffpeak.models.flow_matching import ConditionalFlowMatching  # noqa: E402
+from diffpeak.models.unet import ConditionalUNet  # noqa: E402
 from diffpeak.models.sam import SAM2ImageFeatures  # noqa: E402
 
 DEVICE = torch.device("cuda")
@@ -59,16 +59,18 @@ HEATMAP_SIZE = IMAGE_SIZE // 4
 EMBED_SIZE = 8
 BATCH = 1
 GROUP = 2
-TIMESTEPS = 32
 SAMPLING_STEPS = 4
+FLOW_POLICY_STD = 0.02
+FLOW_TIME_SCALE = 1000.0
+FLOW_FIELD_LOSS_MIN_TIME = 0.5
 SEED = 1234
-# 冒烟测试用的小 DiT：32x32 潜变量按 patch_size=4 得到 8x8 token。
-DIT_PATCH_SIZE = 4
-DIT_HIDDEN_SIZE = 128
-DIT_DEPTH = 2
-DIT_NUM_HEADS = 4
-DIT_MLP_RATIO = 4.0
-DIT_CONDITION_CHANNELS = (64, 128, 256, 256)
+# 冒烟测试用的小型四尺度 UNet：32x32 潜变量，level3（4x4）启用注意力。
+UNET_BASE_CHANNELS = 16
+UNET_CHANNEL_MULTS = (1, 2, 4, 4)
+UNET_NUM_RES_BLOCKS = 1
+UNET_ATTENTION_LEVELS = (3,)
+UNET_NUM_HEADS = 4
+UNET_CONDITION_CHANNELS = (16, 32, 64, 64)
 # 山脊场四区域：中心线邻域、其余道路、边界外窄带、远端背景。
 REGION_COUNT = 4
 
@@ -118,7 +120,7 @@ def build_targets() -> Dict[str, torch.Tensor]:
     """构造单通道有符号山脊场、有效掩码与四区域标签。
 
     128x128 掩码/骨架用于辅助监督；场与区域按 ``adaptive_max_pool2d`` 降到
-    32x32 潜变量分辨率，与 ``diffusion.sample`` 的潜变量空间一致。中心线为
+    32x32 潜变量分辨率，与 ``diffusion.sample``（Flow Matching 容器）的潜变量空间一致。中心线为
     +1，道路内部为 +0.5，有效背景为 -1；四个区域互斥。
     """
     yy, xx = torch.meshgrid(
@@ -252,27 +254,28 @@ def grpo_utility_checks() -> Dict[str, Any]:
 
 def phase_abc(
     encoder: ConditionEncoder,
-    dit: ConditionalDiT,
-    diffusion: GaussianDiffusion,
+    unet: ConditionalUNet,
+    diffusion: ConditionalFlowMatching,
     images: torch.Tensor,
     embedding: SAM2ImageFeatures,
     targets: Dict[str, torch.Tensor],
 ) -> Dict[str, Any]:
-    """ABC：条件编码 + 单通道场/扩散/辅助损失 + AMP 反向与参数更新。"""
+    """ABC：条件编码 + 单通道场/flow/辅助损失 + AMP 反向与参数更新。"""
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
 
     encoder.train()
-    dit.train()
-    params = list(encoder.parameters()) + list(dit.parameters())
+    unet.train()
+    params = list(encoder.parameters()) + list(unet.parameters())
     optimizer = torch.optim.Adam(params, lr=2e-3)
-    scaler = torch.amp.GradScaler("cuda")
+    # 与 configs/3090.yaml 的 ABC 初始缩放一致，避免首步 FP16 输出头梯度溢出。
+    scaler = torch.amp.GradScaler("cuda", init_scale=1024.0)
     valid_sizes = [(IMAGE_SIZE, IMAGE_SIZE)] * BATCH
 
     with autocast():
         conditions, aux_logits = encoder(images, embedding)
         losses = diffusion.training_losses(
-            dit,
+            unet,
             conditions,
             targets["heatmaps"],
             valid_mask=targets["field_valid_mask"],
@@ -282,14 +285,14 @@ def phase_abc(
             aux_logits, targets["road"], targets["skeleton"],
             valid_sizes=valid_sizes,
         )
-        total = losses["diff"] + losses["heat"] + 0.5 * aux
+        total = losses["flow"] + losses["heat"] + 0.5 * aux
 
     condition_shapes = [list(c.shape) for c in conditions]
     assert condition_shapes == [
-        [BATCH, 64, HEATMAP_SIZE, HEATMAP_SIZE],
-        [BATCH, 128, HEATMAP_SIZE // 2, HEATMAP_SIZE // 2],
-        [BATCH, 256, HEATMAP_SIZE // 4, HEATMAP_SIZE // 4],
-        [BATCH, 256, HEATMAP_SIZE // 8, HEATMAP_SIZE // 8],
+        [BATCH, UNET_CONDITION_CHANNELS[0], HEATMAP_SIZE, HEATMAP_SIZE],
+        [BATCH, UNET_CONDITION_CHANNELS[1], HEATMAP_SIZE // 2, HEATMAP_SIZE // 2],
+        [BATCH, UNET_CONDITION_CHANNELS[2], HEATMAP_SIZE // 4, HEATMAP_SIZE // 4],
+        [BATCH, UNET_CONDITION_CHANNELS[3], HEATMAP_SIZE // 8, HEATMAP_SIZE // 8],
     ], f"条件形状不符合预期: {condition_shapes}"
     assert list(aux_logits.shape) == [BATCH, 2, HEATMAP_SIZE, HEATMAP_SIZE], (
         tuple(aux_logits.shape)
@@ -304,7 +307,7 @@ def phase_abc(
         BATCH, REGION_COUNT, HEATMAP_SIZE, HEATMAP_SIZE,
     ], tuple(targets["field_regions"].shape)
     assert all_finite([*conditions, aux_logits]), "条件特征或辅助 logits 出现非有限值"
-    assert all_finite([losses["diff"], losses["heat"], aux, total]), "ABC 损失非有限"
+    assert all_finite([losses["flow"], losses["heat"], aux, total]), "ABC 损失非有限"
     assert total.requires_grad, "ABC 总损失未连接计算图"
 
     before = snapshot(params)
@@ -333,7 +336,7 @@ def phase_abc(
         "latent_shape": list(conditions[0].shape),
         "aux_logits_shape": list(aux_logits.shape),
         "losses": {
-            "diff": round(float(losses["diff"].detach()), 6),
+            "flow": round(float(losses["flow"].detach()), 6),
             "heat": round(float(losses["heat"].detach()), 6),
             "aux": round(float(aux.detach()), 6),
             "total": round(float(total.detach()), 6),
@@ -350,13 +353,13 @@ def phase_abc(
 
 def phase_d(
     encoder: ConditionEncoder,
-    dit: ConditionalDiT,
-    diffusion: GaussianDiffusion,
+    unet: ConditionalUNet,
+    diffusion: ConditionalFlowMatching,
     images: torch.Tensor,
     embedding: SAM2ImageFeatures,
     targets: Dict[str, torch.Tensor],
 ) -> Dict[str, Any]:
-    """D：eval DiT、detach 条件、记录式采样、重算与扩散策略梯度反向。"""
+    """D：eval UNet、detach 条件、记录式采样、重算与随机 Flow Matching 策略梯度反向。"""
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
 
@@ -369,8 +372,8 @@ def phase_d(
     latent_size = int(conditions[0].shape[-1])
     assert latent_size == HEATMAP_SIZE, latent_size
 
-    dit.eval()
-    assert dit.gradient_checkpointing, "D 阶段要求 gradient_checkpointing=True"
+    unet.eval()
+    assert unet.gradient_checkpointing, "D 阶段要求 gradient_checkpointing=True"
 
     # 与 engine/inference.make_generator 一致：CPU generator，噪声生成后搬到 GPU。
     generator = torch.Generator(device="cpu")
@@ -378,7 +381,7 @@ def phase_d(
 
     with autocast():
         heatmaps, records = diffusion.sample(
-            dit, conditions, generator=generator, record=True
+            unet, conditions, generator=generator, record=True
         )
 
     assert list(heatmaps.shape) == [GROUP, 1, latent_size, latent_size], tuple(
@@ -415,7 +418,7 @@ def phase_d(
     generator.manual_seed(SEED)
     with autocast():
         heatmaps_repeat, _ = diffusion.sample(
-            dit, conditions, generator=generator, record=True
+            unet, conditions, generator=generator, record=True
         )
     repeat_diff = float((heatmaps - heatmaps_repeat).abs().max())
     assert repeat_diff < 1e-6, f"固定 generator 采样不可复现: {repeat_diff}"
@@ -431,13 +434,13 @@ def phase_d(
     )
     clip_epsilon = 1e-4  # 与 engine rl.ppo_clip（GRPO 裁剪半径）默认配置一致
 
-    # 合成参考 DiT：微小扰动权重，专门让 KL 项有非零梯度可走。
-    ref_dit = copy.deepcopy(dit)
-    ref_dit.eval()
+    # 合成参考 UNet：微小扰动权重，专门让 KL 项有非零梯度可走。
+    ref_unet = copy.deepcopy(unet)
+    ref_unet.eval()
     ref_generator = torch.Generator(device="cuda")
     ref_generator.manual_seed(SEED + 1)
     with torch.no_grad():
-        for param in ref_dit.parameters():
+        for param in ref_unet.parameters():
             noise = torch.randn(
                 param.shape,
                 device=param.device,
@@ -454,13 +457,13 @@ def phase_d(
     policy_mean_grads: List[float] = []
     kl_mean_grads: List[float] = []
 
-    optimizer = torch.optim.Adam(dit.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(unet.parameters(), lr=1e-4)
     # 高维高斯 log-prob 对均值的梯度约为 noise/std（~50/元素），默认 65536
     # 的初始 scale 会把 fp16 中间梯度推到 inf。这里用保守 scale 且不增长。
     scaler = torch.amp.GradScaler(
         "cuda", init_scale=64.0, growth_interval=1000000
     )
-    before = snapshot(list(dit.parameters()))
+    before = snapshot(list(unet.parameters()))
 
     total_terms = float(len(records))
     policy_kl_loss = torch.zeros((), device=DEVICE, dtype=torch.float64)
@@ -471,7 +474,7 @@ def phase_d(
 
         with torch.no_grad(), autocast():
             ref_mean, _ = diffusion.transition(
-                ref_dit,
+                ref_unet,
                 state,
                 record["timestep"],
                 record["previous_timestep"],
@@ -479,10 +482,10 @@ def phase_d(
             )
         ref_mean_stats.append(float(ref_mean.double().abs().mean()))
 
-        # rollout 与 replay 使用同一 AMP 上下文和同一 eval DiT。
+        # rollout 与 replay 使用同一 AMP 上下文和同一 eval UNet。
         with autocast():
             mean, std = diffusion.transition(
-                dit,
+                unet,
                 state,
                 record["timestep"],
                 record["previous_timestep"],
@@ -512,21 +515,21 @@ def phase_d(
         kl_values.append(float(kl.detach()))
         policy_kl_loss = policy_kl_loss + (grpo_loss + 0.01 * kl) / total_terms
 
-    # 扩散 anchor：与 engine 的 D 锚定一致，只用噪声 MSE，并传有效掩码/区域。
+    # Flow Matching anchor：与 engine 的 D 锚定一致，只用噪声 MSE，并传有效掩码/区域。
     anchor_valid = targets["field_valid_mask"].expand(GROUP, -1, -1, -1)
     anchor_regions = targets["field_regions"].expand(GROUP, -1, -1, -1)
     with autocast():
         anchor_losses = diffusion.training_losses(
-            dit,
+            unet,
             conditions,
             targets["heatmaps"].expand(GROUP, -1, -1, -1),
             valid_mask=anchor_valid,
             field_regions=anchor_regions,
         )
-    anchor = 0.1 * anchor_losses["diff"]
+    anchor = 0.1 * anchor_losses["flow"]
     combined = (policy_kl_loss + anchor.double()).float()
 
-    assert all_finite([combined, anchor, anchor_losses["diff"]]), "D 阶段组合损失非有限"
+    assert all_finite([combined, anchor, anchor_losses["flow"]]), "D 阶段组合损失非有限"
     assert combined.requires_grad, "D 阶段组合损失未连接计算图"
     assert len(ratio_errors) == SAMPLING_STEPS
     max_ratio_error = max(ratio_errors)
@@ -539,15 +542,15 @@ def phase_d(
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(combined).backward()
     scaler.unscale_(optimizer)
-    stats = grad_stats(list(dit.parameters()))
+    stats = grad_stats(list(unet.parameters()))
     assert stats["missing"] == 0, f"D 阶段有 {stats['missing']} 个参数没有梯度"
     assert stats["nonfinite"] == 0, f"D 阶段有 {stats['nonfinite']} 个参数梯度非有限"
     assert stats["global_norm"] > 0.0, "D 阶段梯度范数为 0"
 
     scaler.step(optimizer)
     scaler.update()
-    changed = changed_elements(before, list(dit.parameters()))
-    finite_after = all_finite(dit.parameters())
+    changed = changed_elements(before, list(unet.parameters()))
+    finite_after = all_finite(unet.parameters())
     assert finite_after, "D 阶段更新后参数出现非有限值"
     assert changed > 0, "D 阶段参数没有更新"
 
@@ -574,8 +577,8 @@ def phase_d(
             sum(kl_mean_grads) / len(kl_mean_grads), 6
         ),
         "kl_tool": "diffpeak.grpo.gaussian_kl_divergence",
-        "kl_reference": "deepcopy(dit) + 1e-4 合成扰动，仅用于打通 KL 梯度路径",
-        "anchor_diff": round(float(anchor_losses["diff"].detach()), 6),
+        "kl_reference": "deepcopy(unet) + 1e-4 合成扰动，仅用于打通 KL 梯度路径",
+        "anchor_flow": round(float(anchor_losses["flow"].detach()), 6),
         "combined_loss": round(float(combined.detach()), 6),
         "terminal_policy": None,
         "gradients": stats,
@@ -620,25 +623,31 @@ def main() -> None:
     targets = build_targets()
     utility_checks = grpo_utility_checks()
 
-    encoder = ConditionEncoder().to(DEVICE)
-    # 小型 DiT（patch 4，hidden 128，depth 2），保持 CPU/GPU 冒烟可控。
-    dit = ConditionalDiT(
-        patch_size=DIT_PATCH_SIZE,
-        hidden_size=DIT_HIDDEN_SIZE,
-        depth=DIT_DEPTH,
-        num_heads=DIT_NUM_HEADS,
-        mlp_ratio=DIT_MLP_RATIO,
-        condition_channels=DIT_CONDITION_CHANNELS,
-        gradient_checkpointing=True,
+    encoder = ConditionEncoder(
+        condition_channels=UNET_CONDITION_CHANNELS
     ).to(DEVICE)
-    diffusion = GaussianDiffusion(
-        timesteps=TIMESTEPS,
+    # 小型四尺度 UNet（base 16，res block 1），保持 CPU/GPU 冒烟可控。
+    unet = ConditionalUNet(
+        base_channels=UNET_BASE_CHANNELS,
+        channel_mults=UNET_CHANNEL_MULTS,
+        num_res_blocks=UNET_NUM_RES_BLOCKS,
+        attention_levels=UNET_ATTENTION_LEVELS,
+        num_heads=UNET_NUM_HEADS,
+        condition_channels=UNET_CONDITION_CHANNELS,
+        gradient_checkpointing=True,
+        time_scale=FLOW_TIME_SCALE,
+    ).to(DEVICE)
+    diffusion = ConditionalFlowMatching(
         sampling_steps=SAMPLING_STEPS,
         heatmap_size=IMAGE_SIZE,
+        time_scale=FLOW_TIME_SCALE,
+        field_loss_min_time=FLOW_FIELD_LOSS_MIN_TIME,
+        solver="heun",
+        policy_std=FLOW_POLICY_STD,
     ).to(DEVICE)
 
-    abc_result = phase_abc(encoder, dit, diffusion, images, embedding, targets)
-    d_result = phase_d(encoder, dit, diffusion, images, embedding, targets)
+    abc_result = phase_abc(encoder, unet, diffusion, images, embedding, targets)
+    d_result = phase_d(encoder, unet, diffusion, images, embedding, targets)
 
     elapsed = time.perf_counter() - started
     peak_mib = max(
@@ -664,22 +673,25 @@ def main() -> None:
             "field_valid_mask_shape": list(targets["field_valid_mask"].shape),
             "field_regions_shape": list(targets["field_regions"].shape),
             "aux_target_shape": list(targets["road"].shape),
-            "denoiser": "ConditionalDiT",
-            "dit": {
-                "in_channels": dit.in_channels,
-                "out_channels": dit.out_channels,
-                "patch_size": DIT_PATCH_SIZE,
-                "hidden_size": DIT_HIDDEN_SIZE,
-                "depth": DIT_DEPTH,
-                "num_heads": DIT_NUM_HEADS,
-                "mlp_ratio": DIT_MLP_RATIO,
-                "condition_channels": list(DIT_CONDITION_CHANNELS),
-                "gradient_checkpointing": dit.gradient_checkpointing,
+            "denoiser": "ConditionalUNet",
+            "unet": {
+                "in_channels": unet.in_channels,
+                "out_channels": unet.out_channels,
+                "base_channels": UNET_BASE_CHANNELS,
+                "channel_mults": list(UNET_CHANNEL_MULTS),
+                "num_res_blocks": UNET_NUM_RES_BLOCKS,
+                "attention_levels": list(UNET_ATTENTION_LEVELS),
+                "num_heads": UNET_NUM_HEADS,
+                "condition_channels": list(UNET_CONDITION_CHANNELS),
+                "gradient_checkpointing": unet.gradient_checkpointing,
             },
             "amp": "cuda autocast float16 + GradScaler",
-            "diffusion": {
-                "timesteps": TIMESTEPS,
+            "flow_matching": {
                 "sampling_steps": SAMPLING_STEPS,
+                "policy_std": FLOW_POLICY_STD,
+                "solver": "heun",
+                "time_scale": FLOW_TIME_SCALE,
+                "field_loss_min_time": FLOW_FIELD_LOSS_MIN_TIME,
                 "latent_channels": diffusion.latent_channels,
             },
             "phase_d_group_size": GROUP,

@@ -30,9 +30,11 @@ def _mock_logger():
 def _valid_protocol_payload(stage="ABC"):
     return {
         "stage": stage,
-        "format_version": 5,
+        "format_version": 7,
         "training_protocol": PROTOCOL,
         "target_representation": PROTOCOL,
+        "denoiser_architecture": "conditional_unet_flow_v1",
+        "generative_process": "conditional_flow_matching_v1",
         "sam_frozen": True,
         "latent_channels": 1,
         "prompt": {"scale": 1.0, "terminal_mapping": "clamp"},

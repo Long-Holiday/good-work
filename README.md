@@ -1,6 +1,6 @@
 # DiffPeak-SAM
 
-**单通道有符号山脊场 → 全冻结 SAM → 道路分割**：ABC 监督预训练与 D 扩散轨迹 GRPO 只更新条件编码器和 DiT。SAM2.1 的图像、提示、掩码模块与高分辨率投影全阶段冻结；不再提取离散正负点。当前协议为 `signed_ridge_v1`。当前协议见 [`docs/joint_training.md`](docs/joint_training.md)；旧四阶段实验与 `docs/model_grpo.md` 作为历史记录。
+**条件 Flow Matching → 单通道有符号山脊场 → 全冻结 SAM → 道路分割**：ABC 监督预训练与 D 随机流轨迹 GRPO 只更新条件编码器和 U-Net。SAM2.1 的图像、提示、掩码模块与高分辨率投影全阶段冻结；不再提取离散正负点。当前协议为 `signed_ridge_v1`。当前协议见 [`docs/joint_training.md`](docs/joint_training.md)；旧四阶段实验与 `docs/model_grpo.md` 作为历史记录。
 
 > 旧四阶段的 GPU 探针与测试结果不代表新联合训练已收敛；新协议需要重新测量完整采样反传的显存、吞吐及验证集质量。历史实测见 [`docs/probe_3090.md`](docs/probe_3090.md)，日志使用见 [`docs/experiments.md`](docs/experiments.md)。
 
@@ -112,8 +112,10 @@ diffpeak/
   models/
     sam.py                 SAM2.1 封装：全冻结模型、高分辨率特征与可微密集提示
     conditioning.py        细节 CNN、多尺度条件与辅助头
-    dit.py                 条件 DiT 去噪器（默认）
-    diffusion.py           噪声监督、随机采样、轨迹对数概率
+    unet.py                四尺度条件 U-Net 去噪器（默认，最低分辨率注意力）
+    dit.py                 历史 DiT 实现，仅供独立回归与架构比较
+    flow_matching.py       连续时间速度监督、随机积分采样与轨迹对数概率
+    diffusion.py           历史 DDPM/DDIM；部分通用掩码和高斯工具供复用
   grpo.py                  组内优势、裁剪策略损失与固定方差高斯 KL
   schedules.py             线性 warmup + cosine 退火
   losses.py                BCE / Dice / soft-clDice 与辅助损失
@@ -124,12 +126,14 @@ diffpeak/
 train.py / predict.py / evaluate.py
 ```
 
+`docs/model-architecture.html` 和 `.svg` 是基线提交 `42f4595` 保存的历史 DiT 结构图，不代表本次 U-Net；当前结构以 `models/unet.py`、配置及本说明为准。
+
 ## 4. 训练阶段
 
 | 阶段 | 更新参数 | 目标 |
 |---|---|---|
-| ABC | 条件编码器、DiT | 扩散、四区域场重建、辅助道路/骨架、一步重建与纯噪声完整采样分割 |
-| D | 条件编码器、DiT | 扩散轨迹 GRPO、固定参考 KL、可配置完整 ABC 锚定 |
+| ABC | 条件编码器、U-Net | Flow Matching速度、四区域场重建、辅助道路/骨架、一步终端估计与纯噪声完整生成分割 |
+| D | 条件编码器、U-Net | 扩散轨迹 GRPO、固定参考 KL、可配置完整 ABC 锚定 |
 
 SAM 始终冻结且 eval，分割监督仍保留场输入的梯度。验证与推理直接将单通道场按固定尺度送入 SAM，再对概率阈值化。D 使用相同的确定性分割评分，随机性来自扩散轨迹；不采样终端 Bernoulli 掩码。
 
@@ -145,14 +149,14 @@ python train.py --config configs/3090.yaml --stage all --experiment-name ridge-v
 python train.py --config configs/3090.yaml --stage D --init runs/diffpeak/stage_ABC.pth
 python train.py --resume runs/diffpeak/last.pt
 
-# 显式迁移旧权重兼容部分，重新开始训练；不恢复 SAM 或输入输出头
+# 显式迁移旧条件编码器兼容权重；U-Net 随机初始化，不恢复 SAM
 python train.py --config configs/3090.yaml --stage ABC --init old.pt --migrate-legacy
 
 python evaluate.py --checkpoint runs/diffpeak/stage_D.pth --split-file splits/protocol_v1/val.json --output runs/evaluation
 python predict.py --checkpoint runs/diffpeak/stage_D.pth --input DeepGlobe_Road/valid --output predictions/valid
 ```
 
-新快照为版本 5，严格记录 `signed_ridge_v1` 表示、单通道、SAM 全冻结与提示映射。旧双通道或 SAM 微调快照不能普通 `--init`/`--resume`；只允许上述显式迁移并报告跳过的参数，不迁移优化器、参考或训练进度。阶段内恢复以完整 epoch 为单位，恢复优化器、调度器、GradScaler、参考模型与 RNG；保持数据划分、吞吐及训练预算一致。
+新 Flow Matching 快照为版本 7，显式记录 `conditional_unet_flow_v1` 速度网络及 `conditional_flow_matching_v1` 生成过程，严格记录 `signed_ridge_v1` 表示、单通道、SAM 全冻结与提示映射。旧 DiT、DDPM式U-Net、双通道或 SAM 微调快照不能普通 `--init`/`--resume`；只允许上述显式迁移条件编码器并报告跳过的参数，U-Net 随机初始化，不迁移优化器、参考或训练进度。阶段内恢复以完整 epoch 为单位，恢复优化器、调度器、GradScaler、参考模型与 RNG；保持数据划分、吞吐及训练预算一致。
 
 `last.pt` 保存最近完整 epoch，`stage_ABC.pth`/`stage_D.pth` 保存阶段结束快照，`best.pt` 按当前阶段验证 IoU 选择。`--init` 开始新实验，新 D 的参考从当前权重建立；`--resume` 恢复原 D 参考。旧双通道吞吐配置只作为起点，新协议显存、吞吐和质量需重新实测。详细语义见 [训练说明](docs/joint_training.md)。
 
@@ -193,18 +197,21 @@ tensorboard --logdir runs/diffpeak --port 6006
 
 ## 5. 场与 GRPO 协议
 
-- 条件金字塔和 DiT 主体保持原尺寸：输入 1024²、场 256²，四尺度条件通道 64/128/256/256，DiT patch8/hidden256/depth6/heads8。
-- 扩散直接处理有符号场，不做逐图 min-max、通道 Softmax 或旧仿射变换；不加入旧背景均值补偿。带噪状态无界，终端场裁剪到 [-1,1] 后以 `U=prompt.scale*H` 提示 SAM，padding 固定为0。
+- 输入 1024²、场 256²，四尺度条件通道 64/128/256/256。默认 U-Net 通道为 64/128/256/256，每级编码和解码各有两个时间调制残差块，逐块融合对应尺度条件；拼接跳连保留细节。仅最小的 32² 尺度使用 8 头全局自注意力，默认启用非重入梯度检查点。
+- 生成过程改为条件 Flow Matching：`x_t=(1-t)ε+tH*`，`t∈[0,1]`，U-Net 回归速度 `H*-ε`；时间编码在网络内部乘固定 `time_scale=1000`，不取整。默认20步Heun积分（每步两次速度预测）。此前DDPM/DDIM的吞吐与显存不能代表当前实现。
+- 为保留GRPO，每步定义为高斯策略：均值为Heun/Euler积分结果，标准差为 `policy_std*sqrt(dt)`，默认 `policy_std=0.02`，末步也非退化。这是显式随机积分策略，不是标准确定性ODE，也不保证保留ODE的边缘分布；ABC生成监督、D rollout/replay和推理使用同一策略。新增探索幅度、步数及策略比率需要重新校准。
+- 随机时间的终端估计为 `H_hat=x_t+(1-t)*v_theta`；四区域场损失在未裁剪估计上计算，默认只监督 `t>=0.5`，避免硬裁剪截断这条重建梯度。送入SAM的估计与最终生成场仍裁剪到[-1,1]。
+- Flow Matching直接处理有符号场，不做逐图 min-max、通道 Softmax 或旧仿射变换；不加入旧背景均值补偿。带噪状态无界，终端场裁剪到 [-1,1] 后以 `U=prompt.scale*H` 提示 SAM，padding 固定为0。
 - 随机转移包括末步均保持正标准差；记录原始高斯动作后再裁剪终端输出，轨迹概率按原始动作重放。
 - 每图 G 条轨迹独立形成奖励组，优势为 `(R-mean(R))/max(std(R),delta)`；常量组优势为0，低方差非零组仍学习。高斯联合 log-prob 与 KL 对动作维求和，再按样本、轨迹和时间步平均。
 - 默认奖励 `0.6*IoU+0.4*clDice`，路径代理默认关闭，候选之间固定奖励随机种子。不奖励点数、峰谷、高频或幅度对比。
-- D 固定参考条件编码器与 DiT，不创建参考 SAM。`anchor_weight=0.01` 保留完整 ABC 监督锚定，设0消融。单通道改变概率尺度，裁剪、KL 与更新幅度需重新校准。
+- D 固定参考条件编码器与 U-Net，不创建参考 SAM。`anchor_weight=0.01` 保留完整 ABC 监督锚定，设0消融。单通道改变概率尺度，裁剪、KL 与更新幅度需重新校准。
 
 ## 6. 实验边界
 
 正式训练前先验证标注山脊场和二值 mask 提示在真实冻结 SAM 上的可用性及固定尺度，再比较确定性同场预测基线、监督扩散、监督加 GRPO、关闭锚定。主报告采用固定协议单次生成与跨种子波动。多候选标注最优只作潜力诊断，路径奖励不是正式 APLS。完整实验顺序及风险见 [方案](docs/signed_ridge_diffusion_plan.md)。
 
-持续记录 IoU/F1/clDice、边界与细路表现、空预测率、场分布、提示干预响应、奖励方差、KL 和裁剪比例。仅扩散损失下降不能证明有效收敛。旧双通道和旧四阶段实测保留作历史记录，不代表当前协议性能。
+持续记录 IoU/F1/clDice、边界与细路表现、空预测率、场分布、提示干预响应、奖励方差、KL 和裁剪比例。仅扩散损失下降不能证明有效收敛。旧DDPM/DiT、双通道和四阶段实测保留作历史记录，不代表当前Flow Matching协议性能。
 
 ## 7. 测试入口
 
@@ -222,4 +229,4 @@ conda run -n pytorch python scripts/gpu_smoke.py
 conda run -n pytorch python -m compileall -q diffpeak tests scripts train.py predict.py evaluate.py check_targets.py
 ```
 
-GPU smoke 使用微型条件 DiT 和模拟 SAM 特征验证 CUDA/AMP、单通道采样、概率重放、GRPO 更新和冻结状态，不加载真实 SAM2.1 预训练权重，不能替代正式训练、提示有效性或分割质量评估。当前验收与历史记录见 [测试说明](docs/testing.md)。
+GPU smoke 使用微型条件 U-Net 和模拟 SAM 特征验证 CUDA/AMP、单通道采样、概率重放、GRPO 更新和冻结状态，不加载真实 SAM2.1 预训练权重，不能替代正式训练、提示有效性或分割质量评估。当前验收与历史记录见 [测试说明](docs/testing.md)。

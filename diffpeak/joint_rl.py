@@ -1,13 +1,13 @@
-"""仅扩散轨迹的 GRPO：冻结 SAM 的确定性评分 + 高斯轨迹策略更新。
+"""随机 Flow Matching 轨迹的 GRPO：冻结 SAM 的确定性评分 + 高斯轨迹策略更新。
 
 本模块实现 ``training_protocol=signed_ridge_v1`` 新协议下的 D 阶段更新。与旧版
 联合策略不同，**终端分割不再是一个随机 Bernoulli 策略**：
 
-* **扩散转移策略**：``GaussianDiffusion.sample(record=True)`` 记录的每一步
+* **随机 Flow Matching 转移策略**：``ConditionalFlowMatching.sample(record=True)`` 记录的每一步
   ``z_t -> z_{t-1}`` 是高斯动作；重放时条件特征由 ``condition_encoder``
-  **带梯度**重新计算，梯度只回传到 ``condition_encoder`` 与 DiT。参考 KL
+  **带梯度**重新计算，梯度只回传到 ``condition_encoder`` 与 UNet。参考 KL
   使用固定的 ``engine.ref_condition_encoder``（只编码一次，``no_grad``）与
-  ``engine.ref_dit``；
+  ``engine.ref_unet``；
 * **终端评分**：最终的单通道有符号场直接作为密集提示交给冻结 SAM 的
   ``decode_heatmaps``，得到逐像素道路 logits，并用**确定性阈值**
   ``sigmoid(logits) >= threshold`` 生成二值掩码。该掩码只用于奖励，不参与
@@ -23,7 +23,7 @@ epoch 使用完全相同的采样规则，避免额外的非策略随机性并�
 
 目标函数（每个 ``update_epochs`` 轮）
 ------------------------------------
-令 ``D = G * T * B`` 为扩散 sample-step 项数::
+令 ``D = G * T * B`` 为Flow Matching sample-step 项数::
 
     L = - 1/D * sum_{g,t,b} [ A_gb * min(rho, clip(rho))
                               - beta * KL(N(mu) || N(mu_ref)) ]
@@ -37,7 +37,7 @@ epoch 使用完全相同的采样规则，避免额外的非策略随机性并�
 参数边界
 --------
 本函数在开始前把 SAM 整体设为 ``eval`` 并逐参数 ``requires_grad_(False)``，
-同时冻结参考模块；更新过程中只重算条件编码器与 DiT，不调用任何 SAM 解码
+同时冻结参考模块；更新过程中只重算条件编码器与 UNet，不调用任何 SAM 解码
 路径。ABC 监督锚定依赖的 SAM 前向仍可传递输入梯度（冻结参数不等于禁止
 输入梯度），但不会更新 SAM 参数。
 """
@@ -68,7 +68,7 @@ from diffpeak.inference import (
 
 __all__ = ["joint_grpo_group"]
 
-# 奖励路径采样的稳定种子域：与扩散采样种子（"D"）分开，避免两者共享随机流。
+# 奖励路径采样的稳定种子域：与 Flow Matching 采样种子（"D"）分开，避免两者共享随机流。
 _REWARD_SEED_TAG = "D-reward"
 _DEFAULT_THRESHOLD = 0.5
 
@@ -282,11 +282,11 @@ def _decode_heatmaps(
 
 def _eval_policy_modules(engine: Any) -> None:
     """rollout/replay 一律 eval；参考模块同时永久冻结。"""
-    for name in ("sam", "condition_encoder", "dit"):
+    for name in ("sam", "condition_encoder", "unet"):
         module = getattr(engine, name, None)
         if isinstance(module, torch.nn.Module):
             module.eval()
-    for name in ("ref_dit", "ref_condition_encoder"):
+    for name in ("ref_unet", "ref_condition_encoder"):
         reference = getattr(engine, name, None)
         if reference is None:
             continue
@@ -299,7 +299,7 @@ def _eval_policy_modules(engine: Any) -> None:
 def _freeze_sam(engine: Any) -> None:
     """防御性地把 SAM 整体设为 eval 且所有参数冻结。
 
-    新协议只允许 ``condition_encoder`` 与 DiT 接收梯度；即使引擎阶段设置
+    新协议只允许 ``condition_encoder`` 与 UNet 接收梯度；即使引擎阶段设置
     残留了 SAM 解码器的可训练标记，本函数也会在 rollout/更新前清除。
     """
     sam = getattr(engine, "sam", None)
@@ -341,9 +341,9 @@ def _reference_conditions(
 
 
 def _require_references(engine: Any) -> None:
-    """参考 KL 只需要参考条件编码器与参考 DiT；不需要参考 SAM。"""
-    if getattr(engine, "ref_dit", None) is None:
-        raise RuntimeError("joint GRPO 缺少 engine.ref_dit")
+    """参考 KL 只需要参考条件编码器与参考 UNet；不需要参考 SAM。"""
+    if getattr(engine, "ref_unet", None) is None:
+        raise RuntimeError("joint GRPO 缺少 engine.ref_unet")
     if getattr(engine, "ref_condition_encoder", None) is None:
         raise RuntimeError("joint GRPO 缺少 engine.ref_condition_encoder")
 
@@ -392,7 +392,7 @@ def _rollout_group(
     List[Tensor],
     List[List[float]],
 ]:
-    """执行 G 条完整扩散 rollout，并用确定性 SAM 掩码计算奖励。
+    """执行 G 条完整 Flow Matching rollout，并用确定性 SAM 掩码计算奖励。
 
     Returns:
         ``(trajectories, metric_rows, embeddings, reference_conditions,
@@ -447,7 +447,7 @@ def _rollout_group(
         )
         with torch.no_grad(), _autocast(engine):
             heatmaps, trace = engine.diffusion.sample(
-                engine.dit,
+                engine.unet,
                 rollout_conditions,
                 generator=generator,
                 record=True,
@@ -521,10 +521,10 @@ def _joint_update(
     active_groups: Tensor,
     epoch: int,
 ) -> Dict[str, float]:
-    """固定整组轨迹后做扩散 GRPO/KL/anchor 更新；每轮 step 一次。
+    """固定整组轨迹后做 Flow Matching GRPO/KL/anchor 更新；每轮 step 一次。
 
-    只重放扩散时间步，不调用 SAM 解码；因此梯度只可能流向
-    ``condition_encoder`` 与 DiT。
+    只重放 Flow Matching 时间步，不调用 SAM 解码；因此梯度只可能流向
+    ``condition_encoder`` 与 UNet。
     """
     optimizer = getattr(engine, "optimizer", None)
     scheduler = getattr(engine, "scheduler", None)
@@ -565,10 +565,10 @@ def _joint_update(
         stats["skipped_updates"] = float(update_epochs)
         return stats
 
-    # 扩散项分母 G*T*B；T 取实际记录步数，兼容不同 sampling_steps 的轨迹。
+    # Flow Matching 项分母 G*T*B；T 取实际记录步数，兼容不同 sampling_steps 的轨迹。
     diffusion_terms = sum(len(trajectory) for trajectory in trajectories) * batch_size
     if diffusion_terms <= 0:
-        raise ValueError("扩散轨迹不能为空")
+        raise ValueError("Flow Matching 轨迹不能为空")
     total_terms = max(1, diffusion_terms * update_epochs)
 
     images = batch["image"]
@@ -602,8 +602,8 @@ def _joint_update(
     for _ in range(update_epochs):
         optimizer.zero_grad(set_to_none=True)
 
-        # 可选监督锚定：ABC 单阶段总损失（扩散 + 场 + 辅助 + 分割）。
-        # SAM 已整体冻结，锚定只能更新条件编码器/DiT。
+        # 可选监督锚定：ABC 单阶段总损失（flow + 场 + 辅助 + 分割）。
+        # SAM 已整体冻结，锚定只能更新条件编码器/UNet。
         if has_anchor:
             supervised = getattr(engine, "_supervised_loss", None)
             if not callable(supervised):
@@ -667,7 +667,7 @@ def _joint_update(
                             engine.condition_encoder, images, embeddings
                         )
                         mean, std = engine.diffusion.transition(
-                            engine.dit,
+                            engine.unet,
                             state,
                             timestep,
                             previous_timestep,
@@ -680,7 +680,7 @@ def _joint_update(
                         old_log_prob = old_log_prob.expand_as(new_log_prob)
                     if old_log_prob.numel() != new_log_prob.numel():
                         raise ValueError(
-                            "old/new 扩散 log-prob 形状不一致："
+                            "old/new Flow Matching log-prob 形状不一致："
                             f"{old_log_prob.numel()} vs {new_log_prob.numel()}"
                         )
                     raw_log_ratio = new_log_prob - old_log_prob
@@ -706,7 +706,7 @@ def _joint_update(
                     if has_kl:
                         with torch.no_grad(), _autocast(engine):
                             reference_mean, _ = engine.diffusion.transition(
-                                getattr(engine, "ref_dit"),
+                                getattr(engine, "ref_unet"),
                                 state,
                                 timestep,
                                 previous_timestep,
@@ -796,15 +796,15 @@ def joint_grpo_group(
     batch: Mapping[str, Any],
     epoch: int,
 ) -> Dict[str, Any]:
-    """执行一个扩散 GRPO 组并返回训练记录（冻结 SAM 的确定性评分）。
+    """执行一个随机 Flow Matching GRPO 组并返回训练记录（冻结 SAM 的确定性评分）。
 
     调用方（引擎的 D 阶段循环）负责构建 optimizer/scheduler/scaler，并把
     ``training_protocol=signed_ridge_v1`` 的 trainability 设置为 condition_encoder
-    与 DiT。本函数内部：
+    与 UNet。本函数内部：
 
-    1. 防御性地冻结并 ``eval`` SAM，``eval`` 条件编码器/DiT，冻结参考模块；
-    2. 在 ``no_grad`` 下采样 G 条扩散轨迹，用冻结 SAM 与确定性阈值评分；
-    3. 用每图组内优势计算 GRPO；多个 ``update_epochs`` 轮只重放扩散步骤，
+    1. 防御性地冻结并 ``eval`` SAM，``eval`` 条件编码器/UNet，冻结参考模块；
+    2. 在 ``no_grad`` 下采样 G 条随机 Flow Matching 轨迹，用冻结 SAM 与确定性阈值评分；
+    3. 用每图组内优势计算 GRPO；多个 ``update_epochs`` 轮只重放 Flow Matching 步骤，
        每个时间步带梯度重算条件，每个损失立即 backward，每轮一次 step。
 
     Returns:

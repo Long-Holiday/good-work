@@ -2,7 +2,7 @@
 
 推理主链路只使用单通道有符号道路山脊场：
 
-``影像 -> 条件编码 -> 扩散采样 H -> 固定尺度/终端映射 -> 冻结 SAM decode_heatmaps``
+``影像 -> 条件编码 -> 随机 Flow Matching 采样 H -> 固定尺度/终端映射 -> 冻结 SAM decode_heatmaps``
 
 本协议不再提取离散峰值点。旧的 ``PeakExtractor`` / 点提示工具仅为兼容历史
 纯函数而保留，不参与 ``Predictor``、``predict.py`` 或 ``evaluate.py``。
@@ -16,7 +16,7 @@
 
 确定性
 ------
-推理链路中的随机性只来自扩散采样。每张图的生成器种子由
+推理链路中的随机性只来自随机 Flow Matching 积分。每张图的生成器种子由
 ``stable_seed(base_seed, image_id)`` 计算，与 batch 大小、目录遍历顺序和
 DataLoader 顺序无关。
 
@@ -47,7 +47,12 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from diffpeak.models import ConditionEncoder, ConditionalDiT, GaussianDiffusion, RoadSAM
+from diffpeak.models import (
+    ConditionEncoder,
+    ConditionalFlowMatching,
+    ConditionalUNet,
+    RoadSAM,
+)
 from diffpeak.models.sam import (
     DEFAULT_SAM2_ARCHITECTURE,
     DEFAULT_SAM2_CONFIG,
@@ -58,6 +63,8 @@ from diffpeak.prompts import PeakExtractor
 
 __all__ = [
     "CHECKPOINT_FORMAT_VERSION",
+    "DENOISER_ARCHITECTURE",
+    "GENERATIVE_PROCESS",
     "CheckpointProtocolError",
     "DEFAULT_CONFIG",
     "JOINT_ABC_PROTOCOL",
@@ -119,8 +126,16 @@ JOINT_ABC_PROTOCOL = SIGNED_RIDGE_PROTOCOL
 # 目标表示版本：单通道有符号道路山脊场。
 TARGET_REPRESENTATION = "signed_ridge_v1"
 
-# 新快照格式版本；旧快照（v4 及更早）不能 --resume。
-CHECKPOINT_FORMAT_VERSION = 5
+# 去噪器架构标识。v7 起默认去噪器是连续时间 ConditionalUNet +
+# Conditional Flow Matching；旧 DiT/扩散 UNet 快照均不能普通加载。
+DENOISER_ARCHITECTURE = "conditional_unet_flow_v1"
+
+# 生成过程标识：条件 Flow Matching 的确定性 ODE 采样。
+GENERATIVE_PROCESS = "conditional_flow_matching_v1"
+
+# 新快照格式版本；v7 记录 Flow Matching UNet 架构与生成过程标识。
+# 旧快照（v6 及更早，包括 DiT/扩散 UNet）不能 --resume/普通加载。
+CHECKPOINT_FORMAT_VERSION = 7
 
 # 终端映射：第一版只允许 ``clamp``。扩散采样、RoadSAM 内部 prompt_scale 与
 # 推理都必须使用同一映射；``identity`` 会引入训练/推理不一致，暂不支持。
@@ -137,6 +152,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # 唯一协议标记；推理、验证与快照读取都使用该字段。
     "training_protocol": SIGNED_RIDGE_PROTOCOL,
     "target_representation": TARGET_REPRESENTATION,
+    # 生成过程标识；checkpoint 根级也会写入同一值。
+    "generative_process": GENERATIVE_PROCESS,
     # SAM 图像编码器、提示编码器与掩码解码器全阶段冻结。
     "sam_frozen": True,
     "output_dir": "runs/diffpeak",
@@ -162,31 +179,37 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "sam_apply_postprocessing": False,
         # SAM 图像编码器、提示编码器与掩码解码器全阶段冻结。
         "sam_frozen": True,
-        # 默认去噪器：ConditionalDiT（单通道有符号场上的 patch Transformer）。
-        "dit": {
+        # 去噪器架构标识；快照根级也会写入同一值。
+        "denoiser_architecture": DENOISER_ARCHITECTURE,
+        # 连续时间 ConditionalUNet（单通道有符号场）。
+        "unet": {
             "in_channels": 1,
             "out_channels": 1,
-            "patch_size": 8,
-            "hidden_size": 256,
-            "depth": 6,
+            "base_channels": 64,
+            "channel_mults": (1, 2, 4, 4),
+            "num_res_blocks": 2,
+            # 仅在 level3（默认 32x32）启用注意力。
+            "attention_levels": (3,),
             "num_heads": 8,
-            "mlp_ratio": 4.0,
             # 与 ConditionEncoder 的四尺度输出一致：256/128/64/32。
             "condition_channels": (64, 128, 256, 256),
             "gradient_checkpointing": True,
+            # UNet 内部把连续时间 [0,1] 映射到嵌入尺度；FM 容器不负责。
+            "time_scale": 1000.0,
         },
     },
-    "diffusion": {
-        "timesteps": 1000,
+    # Conditional Flow Matching：连续时间 [0,1]，从噪声积分到数据。
+    "flow_matching": {
         "sampling_steps": 20,
-        "min_std": 0.02,
-        # 显式写出 DDIM/损失调度参数，避免快照记录与实际构造不一致。
-        "eta": 0.0,
-        "beta_start": 1e-4,
-        "beta_end": 0.02,
-        "heat_loss_max_timestep": None,
-        # 单通道有符号场；与 ConditionalDiT 输入/输出通道一致。
         "latent_channels": 1,
+        "heatmap_size": 256,
+        # 仅作为容器元数据；网络时间缩放由 model.unet.time_scale 控制。
+        "time_scale": 1000.0,
+        # 场重建损失只监督靠近数据端的时间。
+        "field_loss_min_time": 0.5,
+        "solver": "heun",
+        # 显式随机积分策略：所有步（含末步）注入 std=policy_std*sqrt(dt)。
+        "policy_std": 0.02,
     },
     # 有符号场 H -> SAM 密集提示 U 的固定映射：U = scale * clamp(H)。
     # scale 在 clamp 之后施加，允许 s > 1 时保留 >1 的提示幅度。
@@ -216,20 +239,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "deterministic": False,
     },
     "stages": {
-        # ABC：条件编码器与 DiT 训练，SAM 全阶段冻结。
+        # ABC：条件编码器与 UNet 训练，SAM 全阶段冻结。
         "ABC": {
             "epochs": 60,
             "lr": 0.0001,
             "batch_size": 1,
             "accumulation_steps": 4,
         },
-        # D 只训练扩散 DiT；更小的学习率见 README。
+        # D 只训练 Flow Matching UNet（随机策略转移，支持 GRPO）。
         "D": {
             "epochs": 10,
             "lr": 0.0000003,
             "batch_size": 1,
         },
     },
+    # GRPO 配置（D 阶段）。
     "rl": {
         # 当前只实现 GRPO；显式算法名便于拒绝旧 DDPO 配置。
         "algorithm": "grpo",
@@ -308,6 +332,23 @@ def load_config(path: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
         loaded = yaml.safe_load(handle) or {}
     if not isinstance(loaded, Mapping):
         raise ValueError(f"配置文件顶层必须是映射：{config_path}")
+    # 默认配置现在只包含 model.unet。若旧 YAML 仍写 model.dit，深合并会把
+    # 它当成额外键静默忽略，导致用户以为自己的去噪器设置生效。这里显式
+    # 拒绝，并要求迁移到 model.unet。
+    loaded_model = loaded.get("model")
+    if isinstance(loaded_model, Mapping) and "dit" in loaded_model:
+        raise ValueError(
+            f"{config_path} 使用旧的 model.dit 配置；默认去噪器已是连续时间 "
+            "ConditionalUNet + Flow Matching，请迁移到 model.unet。"
+        )
+    # 旧扩散配置不能被默认 flow_matching 静默遮蔽。
+    if "diffusion" in loaded:
+        raise ValueError(
+            f"{config_path} 使用旧的 diffusion 配置；生成过程已切换为 "
+            "Conditional Flow Matching，请把 diffusion 重命名为 "
+            "flow_matching（solver='heun'、sampling_steps=20 等），"
+            "旧扩散调度字段不会被静默忽略或映射。"
+        )
     result = _deep_update(json.loads(json.dumps(DEFAULT_CONFIG)), loaded)
     # 历史四阶段 YAML 不能被新增默认 marker 静默改成密集提示模型。
     if "training_protocol" not in loaded and any(
@@ -442,19 +483,81 @@ def validate_signed_ridge_config(
     if sam_frozen is not _MISSING_PROTOCOL_VALUE and sam_frozen is not True:
         errors.append("sam_frozen 必须为 true（SAM 全阶段冻结）")
 
-    dit_cfg = model_cfg.get("dit", {})
-    dit_cfg = dit_cfg if isinstance(dit_cfg, Mapping) else {}
-    for key in ("in_channels", "out_channels"):
-        if key in dit_cfg and int(dit_cfg[key]) != 1:
-            errors.append(f"model.dit.{key}={dit_cfg[key]!r}，单通道协议要求 1")
-
-    diffusion_cfg = config.get("diffusion", {})
-    diffusion_cfg = diffusion_cfg if isinstance(diffusion_cfg, Mapping) else {}
-    if "latent_channels" in diffusion_cfg and int(diffusion_cfg["latent_channels"]) != 1:
+    # 旧 model.dit 配置不能静默忽略：新默认去噪器是 model.unet。
+    if "dit" in model_cfg:
         errors.append(
-            f"diffusion.latent_channels={diffusion_cfg['latent_channels']!r}，"
+            "model.dit 已重命名为 model.unet；旧 DiT 配置不会被映射到 UNet"
+        )
+    architecture = _normalise_protocol(model_cfg.get("denoiser_architecture"))
+    if architecture is not None and architecture != DENOISER_ARCHITECTURE:
+        errors.append(
+            f"model.denoiser_architecture={model_cfg.get('denoiser_architecture')!r}，"
+            f"要求 {DENOISER_ARCHITECTURE!r}"
+        )
+
+    unet_cfg = model_cfg.get("unet", {})
+    unet_cfg = unet_cfg if isinstance(unet_cfg, Mapping) else {}
+    for key in ("in_channels", "out_channels"):
+        if key in unet_cfg and int(unet_cfg[key]) != 1:
+            errors.append(f"model.unet.{key}={unet_cfg[key]!r}，单通道协议要求 1")
+
+    # 旧扩散配置不能静默忽略：生成过程已切换为 Flow Matching。
+    if "diffusion" in config:
+        errors.append(
+            "diffusion 配置已重命名为 flow_matching；旧扩散调度不会被映射到 "
+            "Conditional Flow Matching"
+        )
+    generative_process = _normalise_protocol(config.get("generative_process"))
+    if generative_process is not None and generative_process != GENERATIVE_PROCESS:
+        errors.append(
+            f"generative_process={config.get('generative_process')!r}，要求 "
+            f"{GENERATIVE_PROCESS!r}"
+        )
+    flow_cfg = config.get("flow_matching", {})
+    flow_cfg = flow_cfg if isinstance(flow_cfg, Mapping) else {}
+    if "latent_channels" in flow_cfg and int(flow_cfg["latent_channels"]) != 1:
+        errors.append(
+            f"flow_matching.latent_channels={flow_cfg['latent_channels']!r}，"
             "单通道协议要求 1"
         )
+    solver = _normalise_protocol(flow_cfg.get("solver", "heun"))
+    if solver not in ("heun", "euler"):
+        errors.append(
+            f"flow_matching.solver={flow_cfg.get('solver')!r}，"
+            "只支持 'heun' 或 'euler'"
+        )
+    try:
+        policy_std = float(flow_cfg.get("policy_std", 0.02))
+    except (TypeError, ValueError):
+        policy_std = float("nan")
+    if not math.isfinite(policy_std) or policy_std <= 0.0:
+        errors.append(
+            f"flow_matching.policy_std={flow_cfg.get('policy_std')!r}，"
+            "必须是严格正的有限数（所有步含末步都需要非零策略方差）"
+        )
+    try:
+        field_min = float(flow_cfg.get("field_loss_min_time", 0.5))
+    except (TypeError, ValueError):
+        field_min = float("nan")
+    if not math.isfinite(field_min) or not 0.0 <= field_min <= 1.0:
+        errors.append(
+            f"flow_matching.field_loss_min_time="
+            f"{flow_cfg.get('field_loss_min_time')!r}，必须在 [0, 1] 内"
+        )
+    unet_scale = unet_cfg.get("time_scale")
+    flow_scale = flow_cfg.get("time_scale")
+    if unet_scale is not None and flow_scale is not None:
+        try:
+            scales_match = math.isclose(
+                float(unet_scale), float(flow_scale), rel_tol=0.0, abs_tol=0.0
+            )
+        except (TypeError, ValueError):
+            scales_match = False
+        if not scales_match:
+            errors.append(
+                f"model.unet.time_scale={unet_scale!r} 与 "
+                f"flow_matching.time_scale={flow_scale!r} 必须一致"
+            )
 
     try:
         scale, mapping = resolve_prompt_mapping(config)
@@ -619,7 +722,7 @@ def canonical_image_id(image_id: Any) -> str:
 
     ``"train/100034_sat.jpg"``、``"100034_sat"`` 与 ``"100034"`` 都会得到
     ``"100034"``。这样训练验证、``evaluate.py`` 与 ``predict.py`` 对同一张
-    影像使用完全相同的扩散噪声种子。
+    影像使用完全相同的生成噪声种子。
     """
     if image_id is None:
         return ""
@@ -664,16 +767,17 @@ _PROTOCOL_KEYS: Tuple[str, ...] = (
     "model.sam_config",
     "model.sam_architecture",
     "model.sam_apply_postprocessing",
-    "model.dit.in_channels",
-    "model.dit.out_channels",
-    "diffusion.latent_channels",
-    "diffusion.timesteps",
-    "diffusion.sampling_steps",
-    "diffusion.min_std",
-    "diffusion.eta",
-    "diffusion.beta_start",
-    "diffusion.beta_end",
-    "diffusion.heat_loss_max_timestep",
+    "model.denoiser_architecture",
+    "model.unet.in_channels",
+    "model.unet.out_channels",
+    "model.unet.num_heads",
+    "model.unet.time_scale",
+    "generative_process",
+    "flow_matching.latent_channels",
+    "flow_matching.sampling_steps",
+    "flow_matching.time_scale",
+    "flow_matching.field_loss_min_time",
+    "flow_matching.solver",
     "prompt",
     "train.amp",
     "inference.threshold",
@@ -729,7 +833,7 @@ def warn_protocol_differences(
 def make_generator(seed: int) -> torch.Generator:
     """创建 CPU 随机生成器。
 
-    ``GaussianDiffusion._randn`` 支持 CPU 生成器配合 GPU 张量；固定 CPU 生成器
+    ``ConditionalFlowMatching`` 的随机采样支持 CPU 生成器配合 GPU 张量；固定 CPU 生成器
     可以让同一 ``(seed, image_id)`` 在不同设备布局下更容易复现。
     """
     generator = torch.Generator(device="cpu")
@@ -767,19 +871,19 @@ def build_models(
 ) -> Tuple[Dict[str, torch.nn.Module], None]:
     """构建 signed_ridge_v1 的全部模型组件。
 
-    主链路只包含 ``sam``、``condition_encoder``、``dit``、``diffusion``。
+    主链路只包含 ``sam``、``condition_encoder``、``unet``、``diffusion``。
     返回元组第二项固定为 ``None``，仅为兼容 engine 的 ``(models, second)``
     API；旧 ``PeakExtractor`` 已从新协议主链路移除。
 
     ``sam_checkpoint`` 未给出时按与配置相同的路径基准解析
-    ``model.sam_checkpoint``，并校验文件真实存在。DiT 输入/输出通道与扩散
-    潜变量通道固定为 1；``RoadSAM`` 的 ``prompt_scale`` 来自
-    ``prompt.scale``（默认 1.0，必须有限正数）。
+    ``model.sam_checkpoint``，并校验文件真实存在。ConditionalUNet 输入/输出
+    通道与 Flow Matching 潜变量通道固定为 1；``RoadSAM`` 的 ``prompt_scale``
+    来自 ``prompt.scale``（默认 1.0，必须有限正数）。
 
     Returns:
         ``(models, None)``。
     """
-    # 构建即进入新协议：旧协议/双通道/未冻结 SAM 配置必须立即失败。
+    # 构建即进入新协议：旧协议/双通道/未冻结 SAM/旧 model.dit 配置必须立即失败。
     validate_signed_ridge_config(config)
     device = torch.device(device)
     if sam_checkpoint is not None:
@@ -797,34 +901,66 @@ def build_models(
         )
 
     model_cfg = config.get("model", {})
-    diffusion_cfg = config.get("diffusion", {})
-    dit_cfg = model_cfg.get("dit", {})
-    if not isinstance(dit_cfg, Mapping):
-        raise ValueError("model.dit 必须是映射")
+    if "diffusion" in config:
+        raise ValueError(
+            "diffusion 配置已重命名为 flow_matching；旧扩散调度不能用于 "
+            "Conditional Flow Matching 训练。"
+        )
+    flow_cfg = config.get("flow_matching", {})
+    if not isinstance(flow_cfg, Mapping):
+        raise ValueError("flow_matching 必须是映射")
+    if "dit" in model_cfg:
+        raise ValueError(
+            "model.dit 已重命名为 model.unet；旧 DiT 配置不能用于构建 "
+            "ConditionalUNet。"
+        )
+    unet_cfg = model_cfg.get("unet", {})
+    if not isinstance(unet_cfg, Mapping):
+        raise ValueError("model.unet 必须是映射")
+    # UNet 与 Flow Matching 容器必须共享同一时间尺度；以 flow_matching 为
+    # 单一来源，避免 checkpoint 元数据与网络实际缩放不一致。
+    flow_time_scale = float(
+        flow_cfg.get("time_scale", unet_cfg.get("time_scale", 1000.0))
+    )
+    unet_time_scale = unet_cfg.get("time_scale", flow_time_scale)
+    if float(unet_time_scale) != flow_time_scale:
+        raise ValueError(
+            f"model.unet.time_scale={unet_time_scale!r} 与 "
+            f"flow_matching.time_scale={flow_time_scale!r} 必须一致"
+        )
     sam_config = str(model_cfg.get("sam_config", DEFAULT_SAM2_CONFIG))
     sam_architecture = str(
         model_cfg.get("sam_architecture", DEFAULT_SAM2_ARCHITECTURE)
     )
     _validate_sam_architecture(sam_config, sam_architecture)
-    # 梯度检查点只由 model.dit 控制，默认开启。DEFAULT_CONFIG 始终包含该
+    # 梯度检查点只由 model.unet 控制，默认开启。DEFAULT_CONFIG 始终包含该
     # 嵌套键，因此不再回退到旧 model.gradient_checkpointing（避免 merge 后
     # 旧键看似可覆盖、实际被嵌套默认值遮蔽）。
-    dit_gradient_checkpointing = bool(
-        dit_cfg.get("gradient_checkpointing", True)
+    unet_gradient_checkpointing = bool(
+        unet_cfg.get("gradient_checkpointing", True)
     )
     condition_channels = tuple(
         int(channels)
-        for channels in dit_cfg.get(
+        for channels in unet_cfg.get(
             "condition_channels", (64, 128, 256, 256)
         )
     )
-    in_channels = int(dit_cfg.get("in_channels", 1))
-    out_channels = int(dit_cfg.get("out_channels", 1))
-    latent_channels = int(diffusion_cfg.get("latent_channels", 1))
+    if len(condition_channels) != 4:
+        raise ValueError(
+            "model.unet.condition_channels 必须包含四个尺度，实际为 "
+            f"{condition_channels!r}"
+        )
+    # 不在这里 int() 强转结构参数：由 ConditionalUNet 做严格校验，
+    # 避免把 2.5/2.0/True 等非法配置静默截断为合法整数。
+    channel_mults = tuple(unet_cfg.get("channel_mults", (1, 2, 4, 4)))
+    attention_levels = tuple(unet_cfg.get("attention_levels", (3,)))
+    in_channels = int(unet_cfg.get("in_channels", 1))
+    out_channels = int(unet_cfg.get("out_channels", 1))
+    latent_channels = int(flow_cfg.get("latent_channels", 1))
     if (in_channels, out_channels, latent_channels) != (1, 1, 1):
         raise ValueError(
-            "signed_ridge_v1 要求 model.dit.in_channels=1、"
-            "model.dit.out_channels=1、diffusion.latent_channels=1，实际为 "
+            "signed_ridge_v1 要求 model.unet.in_channels=1、"
+            "model.unet.out_channels=1、flow_matching.latent_channels=1，实际为 "
             f"{(in_channels, out_channels, latent_channels)}"
         )
     prompt_scale, _ = resolve_prompt_mapping(config)
@@ -842,34 +978,35 @@ def build_models(
 
     models: Dict[str, torch.nn.Module] = {
         "sam": RoadSAM(str(checkpoint), **sam_kwargs),
-        # 条件编码器与 DiT 使用同一组四尺度通道，非默认配置也不会静默错配。
+        # 条件编码器与 UNet 使用同一组四尺度通道，非默认配置也不会静默错配。
         "condition_encoder": ConditionEncoder(
             condition_channels=condition_channels
         ),
-        "dit": ConditionalDiT(
+        "unet": ConditionalUNet(
             in_channels=in_channels,
             out_channels=out_channels,
-            patch_size=int(dit_cfg.get("patch_size", 8)),
-            hidden_size=int(dit_cfg.get("hidden_size", 256)),
-            depth=int(dit_cfg.get("depth", 6)),
-            num_heads=int(dit_cfg.get("num_heads", 8)),
-            mlp_ratio=float(dit_cfg.get("mlp_ratio", 4.0)),
+            base_channels=unet_cfg.get("base_channels", 64),
+            channel_mults=channel_mults,
+            num_res_blocks=unet_cfg.get("num_res_blocks", 2),
+            attention_levels=attention_levels,
+            num_heads=unet_cfg.get("num_heads", 8),
             condition_channels=condition_channels,
-            gradient_checkpointing=dit_gradient_checkpointing,
+            gradient_checkpointing=unet_gradient_checkpointing,
+            # 连续时间 [0,1] 在 UNet 内部按该尺度映射到时间嵌入；与 FM 容器
+            # 使用同一来源，避免两处 time_scale 不一致。
+            time_scale=flow_time_scale,
         ),
-        "diffusion": GaussianDiffusion(
-            timesteps=int(diffusion_cfg.get("timesteps", 1000)),
-            sampling_steps=int(diffusion_cfg.get("sampling_steps", 20)),
-            min_std=float(diffusion_cfg.get("min_std", 0.02)),
-            beta_start=float(diffusion_cfg.get("beta_start", 1e-4)),
-            beta_end=float(diffusion_cfg.get("beta_end", 0.02)),
-            eta=float(diffusion_cfg.get("eta", 0.0)),
+        # 槽名保持 diffusion 作为通用生成容器；实例是 ConditionalFlowMatching。
+        "diffusion": ConditionalFlowMatching(
+            sampling_steps=flow_cfg.get("sampling_steps", 20),
             latent_channels=latent_channels,
-            heat_loss_max_timestep=(
-                None
-                if diffusion_cfg.get("heat_loss_max_timestep") is None
-                else int(diffusion_cfg["heat_loss_max_timestep"])
+            heatmap_size=int(flow_cfg.get("heatmap_size", 256)),
+            time_scale=flow_time_scale,
+            field_loss_min_time=float(
+                flow_cfg.get("field_loss_min_time", 0.5)
             ),
+            solver=str(flow_cfg.get("solver", "heun")),
+            policy_std=float(flow_cfg.get("policy_std", 0.02)),
         ),
     }
     for name, module in models.items():
@@ -890,16 +1027,18 @@ PROTOCOL_COMPARISON_KEYS: Tuple[str, ...] = (
     # 目标构造参数变化会改变监督语义，必须拒绝 resume。
     "data.ridge_config",
     "model.sam_frozen",
-    "model.dit.in_channels",
-    "model.dit.out_channels",
-    "diffusion.latent_channels",
-    "diffusion.timesteps",
-    "diffusion.sampling_steps",
-    "diffusion.min_std",
-    "diffusion.eta",
-    "diffusion.beta_start",
-    "diffusion.beta_end",
-    "diffusion.heat_loss_max_timestep",
+    "model.denoiser_architecture",
+    "model.unet.in_channels",
+    "model.unet.out_channels",
+    "model.unet.num_heads",
+    "model.unet.time_scale",
+    "generative_process",
+    "flow_matching.latent_channels",
+    "flow_matching.sampling_steps",
+    "flow_matching.time_scale",
+    "flow_matching.field_loss_min_time",
+    "flow_matching.solver",
+    "flow_matching.policy_std",
     "prompt",
     "rl.algorithm",
     "rl.group_size",
@@ -945,10 +1084,10 @@ def _checkpoint_sources(payload: Mapping[str, Any]) -> Dict[str, List[Any]]:
     config = _checkpoint_config(payload)
     model_cfg = config.get("model", {})
     model_cfg = model_cfg if isinstance(model_cfg, Mapping) else {}
-    diffusion_cfg = config.get("diffusion", {})
-    diffusion_cfg = diffusion_cfg if isinstance(diffusion_cfg, Mapping) else {}
-    dit_cfg = model_cfg.get("dit", {})
-    dit_cfg = dit_cfg if isinstance(dit_cfg, Mapping) else {}
+    flow_cfg = config.get("flow_matching", {})
+    flow_cfg = flow_cfg if isinstance(flow_cfg, Mapping) else {}
+    unet_cfg = model_cfg.get("unet", {})
+    unet_cfg = unet_cfg if isinstance(unet_cfg, Mapping) else {}
 
     return {
         "training_protocol": [
@@ -959,12 +1098,20 @@ def _checkpoint_sources(payload: Mapping[str, Any]) -> Dict[str, List[Any]]:
             _normalise_protocol(payload.get("target_representation")),
             _normalise_protocol(config.get("target_representation")),
         ],
+        "generative_process": [
+            _normalise_protocol(payload.get("generative_process")),
+            _normalise_protocol(config.get("generative_process")),
+        ],
+        "denoiser_architecture": [
+            _normalise_protocol(payload.get("denoiser_architecture")),
+            _normalise_protocol(model_cfg.get("denoiser_architecture")),
+        ],
         "latent_channels": [
             payload.get("latent_channels"),
-            diffusion_cfg.get("latent_channels"),
+            flow_cfg.get("latent_channels"),
         ],
-        "dit_in_channels": [dit_cfg.get("in_channels")],
-        "dit_out_channels": [dit_cfg.get("out_channels")],
+        "unet_in_channels": [unet_cfg.get("in_channels")],
+        "unet_out_channels": [unet_cfg.get("out_channels")],
         "sam_frozen": [
             payload.get("sam_frozen"),
             payload.get("abc_sam_frozen"),
@@ -995,9 +1142,11 @@ def _metadata_contradictions(payload: Mapping[str, Any]) -> List[str]:
     for key in (
         "training_protocol",
         "target_representation",
+        "generative_process",
+        "denoiser_architecture",
         "latent_channels",
-        "dit_in_channels",
-        "dit_out_channels",
+        "unet_in_channels",
+        "unet_out_channels",
         "sam_frozen",
     ):
         present = [
@@ -1027,10 +1176,10 @@ def _checkpoint_metadata(payload: Mapping[str, Any]) -> Dict[str, Any]:
     config = _checkpoint_config(payload)
     model_cfg = config.get("model", {})
     model_cfg = model_cfg if isinstance(model_cfg, Mapping) else {}
-    diffusion_cfg = config.get("diffusion", {})
-    diffusion_cfg = diffusion_cfg if isinstance(diffusion_cfg, Mapping) else {}
-    dit_cfg = model_cfg.get("dit", {})
-    dit_cfg = dit_cfg if isinstance(dit_cfg, Mapping) else {}
+    flow_cfg = config.get("flow_matching", {})
+    flow_cfg = flow_cfg if isinstance(flow_cfg, Mapping) else {}
+    unet_cfg = model_cfg.get("unet", {})
+    unet_cfg = unet_cfg if isinstance(unet_cfg, Mapping) else {}
 
     prompt = _first_value(
         _prompt_candidate(payload.get("prompt")),
@@ -1044,8 +1193,8 @@ def _checkpoint_metadata(payload: Mapping[str, Any]) -> Dict[str, Any]:
 
     latent_channels = _first_value(
         payload.get("latent_channels"),
-        diffusion_cfg.get("latent_channels"),
-        dit_cfg.get("in_channels"),
+        flow_cfg.get("latent_channels"),
+        unet_cfg.get("in_channels"),
     )
     sam_frozen = _first_value(
         payload.get("sam_frozen"),
@@ -1071,11 +1220,23 @@ def _checkpoint_metadata(payload: Mapping[str, Any]) -> Dict[str, Any]:
         "sam_frozen": sam_frozen,
         "prompt_scale": prompt_scale,
         "terminal_mapping": terminal_mapping,
-        "dit_in_channels": _first_value(
-            dit_cfg.get("in_channels"), default=None
+        "generative_process": _normalise_protocol(
+            _first_value(
+                payload.get("generative_process"),
+                config.get("generative_process"),
+            )
         ),
-        "dit_out_channels": _first_value(
-            dit_cfg.get("out_channels"), default=None
+        "denoiser_architecture": _normalise_protocol(
+            _first_value(
+                payload.get("denoiser_architecture"),
+                model_cfg.get("denoiser_architecture"),
+            )
+        ),
+        "unet_in_channels": _first_value(
+            unet_cfg.get("in_channels"), default=None
+        ),
+        "unet_out_channels": _first_value(
+            unet_cfg.get("out_channels"), default=None
         ),
     }
 
@@ -1127,6 +1288,16 @@ def validate_checkpoint_protocol(
             f"target_representation={meta['target_representation']!r}，要求 "
             f"{TARGET_REPRESENTATION!r}"
         )
+    if meta["denoiser_architecture"] != DENOISER_ARCHITECTURE:
+        errors.append(
+            f"denoiser_architecture={meta['denoiser_architecture']!r}，要求 "
+            f"{DENOISER_ARCHITECTURE!r}（旧扩散/DiT 快照不能加载到 FM UNet）"
+        )
+    if meta["generative_process"] != GENERATIVE_PROCESS:
+        errors.append(
+            f"generative_process={meta['generative_process']!r}，要求 "
+            f"{GENERATIVE_PROCESS!r}"
+        )
     try:
         if int(meta["latent_channels"]) != 1:
             errors.append(
@@ -1134,7 +1305,7 @@ def validate_checkpoint_protocol(
             )
     except (TypeError, ValueError):
         errors.append(f"latent_channels={meta['latent_channels']!r} 缺失或无效")
-    for channel_key in ("dit_in_channels", "dit_out_channels"):
+    for channel_key in ("unet_in_channels", "unet_out_channels"):
         value = meta[channel_key]
         if value is not None:
             try:
@@ -1171,10 +1342,10 @@ def validate_checkpoint_protocol(
         raise CheckpointProtocolError(
             "checkpoint 与 signed_ridge_v1 训练协议不兼容："
             + "；".join(errors)
-            + "。旧双通道/SAM 联合微调快照不能 --resume；"
-            "如需只迁移形状兼容权重，请显式使用 "
-            "load_compatible_weights（或 CLI --migrate-weights），"
-            "它不会恢复优化器状态。"
+            + "。旧扩散/旧 DiT/旧双通道/SAM 联合微调快照不能 --resume 或普通加载；"
+            "如需迁移，请显式使用 load_compatible_weights（或 CLI "
+            "--migrate-weights），它只迁移条件编码器兼容权重，"
+            "不会把旧生成模型权重当作 Flow Matching UNet，也不恢复优化器状态。"
         )
     return meta
 
@@ -1184,10 +1355,17 @@ def _load_state(module: torch.nn.Module, state: Mapping[str, Any], name: str) ->
     try:
         module.load_state_dict(state, strict=True)
     except (RuntimeError, ValueError) as exc:
-        if name == "dit":
+        if name in ("unet", "ref_unet"):
             raise ValueError(
-                "checkpoint.models.dit 与当前 ConditionalDiT 不兼容："
-                f"{exc}。请使用相同 DiT 配置生成的训练快照。"
+                f"checkpoint.models.{name} 与当前 ConditionalUNet 不兼容："
+                f"{exc}。请使用相同 Flow Matching UNet 配置生成的训练快照；"
+                "旧扩散/DiT 权重不能加载为 FM UNet。"
+            ) from exc
+        if name == "diffusion":
+            raise ValueError(
+                "checkpoint.models.diffusion 与当前 ConditionalFlowMatching "
+                f"不兼容：{exc}。旧 GaussianDiffusion 状态（beta/alpha 等）"
+                "不能加载到 Flow Matching 容器。"
             ) from exc
         raise
 
@@ -1208,6 +1386,51 @@ def _looks_like_sam2_state(state: Mapping[str, Any]) -> bool:
     return any(str(key).startswith(prefixes) for key in state)
 
 
+_FLOW_METADATA_BUFFERS: Tuple[str, ...] = (
+    "flow_signature",
+    "policy_std_buffer",
+    "time_scale_buffer",
+    "field_loss_min_time_buffer",
+    "solver_id",
+    "sampling_steps_buffer",
+)
+
+
+def _validate_flow_metadata_buffers(
+    module: torch.nn.Module, state: Mapping[str, Any]
+) -> None:
+    """拒绝“严格加载成功但 Python 属性仍是当前值”的 Flow Matching 快照。
+
+    ``policy_std``/``time_scale``/``solver`` 等同时存在于 buffer 与普通属性；
+    ``load_state_dict`` 只更新 buffer，不会更新属性。因此必须在加载前逐值
+    比对 buffer，确保快照的数值积分公式与当前容器完全一致。
+    """
+    target_state = module.state_dict()
+    mismatches: List[str] = []
+    for key in _FLOW_METADATA_BUFFERS:
+        target = target_state.get(key)
+        source = state.get(key) if isinstance(state, Mapping) else None
+        if target is None or source is None:
+            mismatches.append(f"{key}（缺失）")
+            continue
+        try:
+            left = torch.as_tensor(source).detach().cpu().to(torch.float64)
+            right = torch.as_tensor(target).detach().cpu().to(torch.float64)
+        except (TypeError, ValueError, RuntimeError):
+            mismatches.append(f"{key}（无法比较）")
+            continue
+        if left.shape != right.shape or not torch.equal(left, right):
+            mismatches.append(f"{key}: 快照={source!r} 当前={target!r}")
+    if mismatches:
+        raise ValueError(
+            "checkpoint.models.diffusion 与当前 ConditionalFlowMatching 的 "
+            "Flow Matching 元数据不一致："
+            + "；".join(mismatches)
+            + "。policy_std/time_scale/solver/sampling_steps/field_loss_min_time "
+            "必须显式匹配，不能静默沿用当前公式参数。"
+        )
+
+
 def load_checkpoint_models(
     models: Mapping[str, torch.nn.Module],
     payload: Mapping[str, Any],
@@ -1218,14 +1441,16 @@ def load_checkpoint_models(
     """从本项目生成的训练快照中严格加载模型权重（不含优化器状态）。
 
     本项目的 ``last.pt`` / ``best.pt`` / ``stage_X.pth`` 必须包含
-    ``models.{sam, condition_encoder, dit, diffusion}``。
+    ``models.{sam, condition_encoder, unet, diffusion}``。
     缺字段或键不匹配会立即失败，避免用随机或错误权重继续预测。
-    ``ref_dit`` 只存在于 D
-    阶段快照，由 ``include_ref`` 控制是否加载。
+    ``ref_unet`` 只存在于 D 阶段快照，由 ``include_ref`` 控制是否加载。
+    旧 DiT 快照（``models.dit``/``models.ref_dit``）一律拒绝；旧
+    GaussianDiffusion 状态会因 Flow Matching 的 signature buffer 缺失/不匹配
+    被严格加载拒绝。绝不把旧 DiT/扩散权重当作 FM UNet 加载。
 
-    所有快照都会先经过 :func:`validate_checkpoint_protocol`，旧协议或缺少
-    完整 signed_ridge_v1 元数据的 payload 一律拒绝。迁移只能显式调用
-    :func:`load_compatible_weights`（不恢复优化器）。
+    所有快照都会先经过 :func:`validate_checkpoint_protocol`，旧协议、
+    缺少架构标识或缺少完整 signed_ridge_v1 元数据的 payload 一律拒绝。
+    迁移只能显式调用 :func:`load_compatible_weights`（不恢复优化器）。
     """
     if not isinstance(payload, Mapping) or "models" not in payload:
         raise ValueError("checkpoint 缺少顶层 models 字段，不是本项目的训练快照")
@@ -1236,7 +1461,15 @@ def load_checkpoint_models(
     source = payload["models"]
     if not isinstance(source, Mapping):
         raise ValueError("checkpoint.models 必须是映射")
-    required = ("sam", "condition_encoder", "dit", "diffusion")
+    legacy = [name for name in ("dit", "ref_dit") if name in source]
+    if legacy:
+        raise ValueError(
+            "checkpoint.models 含旧 DiT 模块 "
+            + ", ".join(legacy)
+            + "；新架构要求 unet/ref_unet，旧 DiT 权重不能当作 UNet 加载。"
+            "如需复用条件编码器，请显式使用 load_compatible_weights。"
+        )
+    required = ("sam", "condition_encoder", "unet", "diffusion")
     missing = [name for name in required if name not in source]
     if missing:
         raise ValueError(
@@ -1266,14 +1499,16 @@ def load_checkpoint_models(
         saved_model_cfg = saved_config.get("model", {})
         if isinstance(saved_model_cfg, Mapping):
             # 注意力头数不改变权重形状，strict=True 无法发现这种语义错配。
-            saved_dit = saved_model_cfg.get("dit", {})
-            target_dit = models.get("dit")
-            if isinstance(saved_dit, Mapping) and isinstance(target_dit, ConditionalDiT):
-                saved_heads = saved_dit.get("num_heads")
-                if saved_heads is not None and int(saved_heads) != target_dit.num_heads:
+            saved_unet = saved_model_cfg.get("unet", {})
+            target_unet = models.get("unet")
+            if isinstance(saved_unet, Mapping) and isinstance(
+                target_unet, ConditionalUNet
+            ):
+                saved_heads = saved_unet.get("num_heads")
+                if saved_heads is not None and int(saved_heads) != target_unet.num_heads:
                     raise ValueError(
-                        "checkpoint 的 DiT num_heads 与当前配置不一致："
-                        f"{saved_heads} != {target_dit.num_heads}；"
+                        "checkpoint 的 UNet num_heads 与当前配置不一致："
+                        f"{saved_heads} != {target_unet.num_heads}；"
                         "注意力头数必须与训练快照匹配。"
                     )
             saved_architecture = saved_model_cfg.get("sam_architecture")
@@ -1289,27 +1524,30 @@ def load_checkpoint_models(
                     "请使用匹配的 model.sam_architecture / sam_config 与权重。"
                 )
 
-    for name in ("sam", "condition_encoder", "dit"):
+    for name in ("sam", "condition_encoder", "unet"):
         if name not in models:
             raise ValueError(f"目标模型集合缺少 {name}")
         _load_state(models[name], source[name], name)
     if "diffusion" not in models:
         raise ValueError("目标模型集合缺少 diffusion")
-    _load_state(models["diffusion"], source["diffusion"], "diffusion")
+    flow_state = source["diffusion"]
+    if not isinstance(flow_state, Mapping):
+        raise ValueError(
+            "checkpoint.models.diffusion 必须是 Flow Matching state_dict 映射"
+        )
+    _validate_flow_metadata_buffers(models["diffusion"], flow_state)
+    _load_state(models["diffusion"], flow_state, "diffusion")
 
-    if include_ref and "ref_dit" in source:
-        if "ref_dit" not in models:
-            raise ValueError("需要加载 ref_dit，但目标模型集合未创建参考 DiT")
-        _load_state(models["ref_dit"], source["ref_dit"], "ref_dit")
+    if include_ref and "ref_unet" in source:
+        if "ref_unet" not in models:
+            raise ValueError("需要加载 ref_unet，但目标模型集合未创建参考 UNet")
+        _load_state(models["ref_unet"], source["ref_unet"], "ref_unet")
     return {}
 
 
-# Legacy -> signed_ridge_v1 迁移时允许加载的 DiT 参数前缀。输入投影与输出头
-# 的语义随单通道协议改变，即使形状偶然相同也不能复用。
-_DIT_MIGRATION_SKIP_PREFIXES: Tuple[str, ...] = (
-    "patch_embed.",
-    "final_layer.",
-)
+# 旧 DiT 模块名。迁移只允许条件编码器；这些模块仅用于在报告中说明为何
+# 未被迁移，绝不能被映射到 ConditionalUNet 的参数命名空间。
+_LEGACY_DENOISER_MODULES: Tuple[str, ...] = ("dit", "ref_dit")
 
 
 def load_compatible_weights(
@@ -1318,15 +1556,15 @@ def load_compatible_weights(
     *,
     include_ref: bool = False,
 ) -> Dict[str, Any]:
-    """显式迁移旧快照的形状兼容权重，并报告跳过/重新初始化的参数。
+    """显式迁移旧快照中形状兼容的**条件编码器**权重。
 
     迁移规则（不可用 ``--resume`` 替代）：
 
-    * ``sam`` 与 ``diffusion`` 一律不加载。冻结 SAM 应保持官方预训练权重，
-      旧快照中的 SAM 状态（尤其旧 SAM1/联合微调解码器）不能混入。
+    * ``sam`` 与 ``diffusion`` 一律不加载。冻结 SAM 应保持官方预训练权重；
+      ``diffusion`` 现在是 Flow Matching 容器，旧扩散状态/调度 buffer 不能混入。
     * ``condition_encoder`` 加载所有名称与形状匹配的参数。
-    * ``dit`` 只加载内部块（attention/MLP/adaLN 等）；``patch_embed.*`` 与
-      ``final_layer.*`` 因输入输出通道语义改变而始终跳过。
+    * ``unet`` / ``ref_unet`` **绝不迁移**：旧扩散 UNet 与连续时间 FM UNet
+      的时间语义不同，不能当作同一模型加载。目标始终保留当前初始化。
     * 形状不匹配、目标缺失或来源多余的键都记录在报告中；目标模块保留当前
       初始化值（即“重新初始化”）。
     * **不恢复优化器、GradScaler、调度器或 RNG 状态。**
@@ -1334,13 +1572,14 @@ def load_compatible_weights(
     Args:
         models: 已构建的目标模型集合。
         payload: 旧/新快照；只需包含 ``models``。
-        include_ref: 是否迁移 ``ref_dit``（若快照与目标模型都提供）。
+        include_ref: 保留以兼容旧调用签名；参考 UNet 永不从旧快照迁移。
 
     Returns:
         ``{"migration": True, "optimizer_restored": False, "loaded":
         {module: [key]}, "skipped": {module: {key: reason}}, "reinitialized":
         {module: [key]}, "skipped_modules": [...], ...}``。
     """
+    del include_ref  # 参考 UNet 同样不参与兼容迁移。
     if not isinstance(payload, Mapping) or not isinstance(
         payload.get("models"), Mapping
     ):
@@ -1351,6 +1590,7 @@ def load_compatible_weights(
         "optimizer_restored": False,
         "source_protocol": _checkpoint_metadata(payload)["training_protocol"],
         "target_protocol": SIGNED_RIDGE_PROTOCOL,
+        "target_architecture": DENOISER_ARCHITECTURE,
         "loaded": {},
         "skipped": {},
         "reinitialized": {},
@@ -1390,7 +1630,6 @@ def load_compatible_weights(
                 continue
             loaded.append(key)
 
-        loaded_set = set(loaded)
         loadable = {key: state[key] for key in loaded}
         result = module.load_state_dict(loadable, strict=False)
         reinitialized = [str(key) for key in result.missing_keys]
@@ -1419,7 +1658,7 @@ def load_compatible_weights(
             str(key): (
                 "frozen_sam_preserved"
                 if name == "sam"
-                else "protocol_buffer_not_migrated"
+                else "generative_process_not_migrated"
             )
             for key in source_state
         }
@@ -1429,18 +1668,44 @@ def load_compatible_weights(
         report["counts"]["skipped"] += len(report["skipped"][name])
         report["counts"]["reinitialized"] += len(report["reinitialized"][name])
 
+    # 旧 DiT：只报告、不迁移。目标集合没有 dit/ref_dit，因此不会误加载。
+    for name in _LEGACY_DENOISER_MODULES:
+        if name not in source:
+            continue
+        source_state = source[name]
+        report["skipped_modules"].append(name)
+        report["loaded"][name] = []
+        if isinstance(source_state, Mapping):
+            report["skipped"][name] = {
+                str(key): "legacy_dit_not_migrated" for key in source_state
+            }
+        else:
+            report["skipped"][name] = {"<module>": "legacy_dit_not_migrated"}
+        report["reinitialized"][name] = []
+        report["counts"]["skipped"] += len(report["skipped"][name])
+
+    # 目标 UNet/参考 UNet 永不从旧快照迁移，全部保留当前初始化。
+    for name in ("unet", "ref_unet"):
+        if name not in models:
+            continue
+        source_state = source.get(name)
+        if isinstance(source_state, Mapping):
+            report["skipped_modules"].append(name)
+            report["skipped"][name] = {
+                str(key): "not_migrated_by_policy" for key in source_state
+            }
+        else:
+            report["missing_modules"].append(name)
+            report["skipped"][name] = {}
+        report["loaded"][name] = []
+        report["reinitialized"][name] = [
+            str(key) for key in models[name].state_dict()
+        ]
+        report["counts"]["skipped"] += len(report["skipped"][name])
+        report["counts"]["reinitialized"] += len(report["reinitialized"][name])
+
     if "condition_encoder" in models:
         _migrate_module("condition_encoder", models["condition_encoder"])
-    if "dit" in models:
-        _migrate_module(
-            "dit", models["dit"], skip_prefixes=_DIT_MIGRATION_SKIP_PREFIXES
-        )
-    if include_ref and "ref_dit" in models and "ref_dit" in source:
-        _migrate_module(
-            "ref_dit",
-            models["ref_dit"],
-            skip_prefixes=_DIT_MIGRATION_SKIP_PREFIXES,
-        )
     return report
 
 
@@ -2042,7 +2307,7 @@ def load_labeled_split(
 class Predictor:
     """加载训练快照，执行“无标注影像 -> 有符号场 -> 道路掩码”的推理。
 
-    推理只读取影像，不读取掩码/骨架。主链路直接使用扩散采样的单通道有符号
+    推理只读取影像，不读取掩码/骨架。主链路直接使用随机 Flow Matching 采样的单通道有符号
     道路山脊场，并调用 ``RoadSAM.decode_heatmaps``；不构建或调用
     ``PeakExtractor``。生成器种子按 ``image_id`` 固定，因此同一影像的结果与
     目录遍历顺序、batch 划分无关。
@@ -2154,7 +2419,7 @@ class Predictor:
 
         self.sam = self.models["sam"]
         self.condition_encoder = self.models["condition_encoder"]
-        self.dit = self.models["dit"]
+        self.unet = self.models["unet"]
         self.diffusion = self.models["diffusion"]
         # 真实 RoadSAM 在 decode_heatmaps 内部执行 U = prompt_scale * H；
         # Predictor 只负责先 clamp(H)，由模型施加尺度。轻量测试替身没有
@@ -2171,7 +2436,7 @@ class Predictor:
         """构造 ``U = scale * clamp(H)``；先裁剪再由 SAM/预测器施加尺度。"""
         if field.ndim != 4 or int(field.shape[1]) != 1:
             raise ValueError(
-                "扩散输出必须是 B x 1 x H x W 的单通道有符号场，"
+                "生成输出必须是 B x 1 x H x W 的单通道有符号场，"
                 f"实际为 {tuple(field.shape)}"
             )
         prompt = apply_terminal_mapping(field, self.terminal_mapping)
@@ -2211,7 +2476,7 @@ class Predictor:
             conditions, _ = self.condition_encoder(tensor, embeddings)
             conditions = [item.detach() for item in conditions]
             field = self.diffusion.sample(
-                self.dit,
+                self.unet,
                 conditions,
                 generator=generator,
                 record=False,
@@ -2270,7 +2535,7 @@ class Predictor:
         path = Path(path)
         image = load_image_file(path)
         # 与训练验证/evaluate 使用同一 canonical id，避免 ``scene_sat.jpg``
-        # 和 ``scene.jpg`` 得到不同扩散种子。
+        # 和 ``scene.jpg`` 得到不同生成种子。
         identifier = (
             str(image_id) if image_id is not None else canonical_image_id(path.stem)
         )

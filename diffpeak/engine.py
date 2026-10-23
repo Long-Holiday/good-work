@@ -1,4 +1,4 @@
-"""Signed ridge diffusion training: ABC supervision and diffusion-only GRPO.
+"""Signed ridge Flow Matching training: ABC supervision and diffusion-only GRPO.
 
 SAM stays frozen and in eval mode while retaining derivatives with respect to fields.
 """
@@ -28,6 +28,9 @@ from diffpeak.diagnostics import (
     field_quality,
 )
 from diffpeak.inference import (
+    CHECKPOINT_FORMAT_VERSION,
+    DENOISER_ARCHITECTURE,
+    GENERATIVE_PROCESS,
     aggregate_metrics,
     build_models,
     compute_image_metrics,
@@ -161,7 +164,7 @@ class DiffPeakEngine:
         )
         self.sam = self.models["sam"]
         self.condition_encoder = self.models["condition_encoder"]
-        self.dit = self.models["dit"]
+        self.unet = self.models["unet"]
         self.diffusion = self.models["diffusion"]
         self.reward_config = make_reward_config(self.config)
         if self.reward_config.point_cost != 0:
@@ -230,7 +233,7 @@ class DiffPeakEngine:
         self.scheduler_epochs = 0
         self.scheduler_lr_schedule = "cosine"
         self.scaler: Optional[Any] = None
-        self.ref_dit: Optional[torch.nn.Module] = None
+        self.ref_unet: Optional[torch.nn.Module] = None
         self.ref_condition_encoder: Optional[torch.nn.Module] = None
         self.global_step = 0
         # 处理组数独立于优化器步数，常量奖励组也计入诊断。
@@ -376,26 +379,26 @@ class DiffPeakEngine:
             raise ValueError(f"未知阶段：{stage}")
         self.sam.requires_grad_(False).eval()
         self.condition_encoder.requires_grad_(True)
-        self.dit.requires_grad_(True)
+        self.unet.requires_grad_(True)
 
     def _set_train_modes(self, stage: str) -> None:
         self.sam.requires_grad_(False).eval()
         self.condition_encoder.train(stage == "ABC")
-        self.dit.train(stage == "ABC")
-        for reference in (self.ref_dit, self.ref_condition_encoder):
+        self.unet.train(stage == "ABC")
+        for reference in (self.ref_unet, self.ref_condition_encoder):
             if reference is not None:
                 reference.requires_grad_(False).eval()
 
     def _set_eval_all(self) -> None:
         for module in self.models.values():
             module.eval()
-        if self.ref_dit is not None:
-            self.ref_dit.eval()
+        if self.ref_unet is not None:
+            self.ref_unet.eval()
 
     def _trainable_parameters(self) -> List[torch.nn.Parameter]:
         parameters: List[torch.nn.Parameter] = []
         seen = set()
-        for module in (self.condition_encoder, self.dit):
+        for module in (self.condition_encoder, self.unet):
             for parameter in module.parameters():
                 if id(parameter) in seen:
                     continue
@@ -606,7 +609,7 @@ class DiffPeakEngine:
             embeddings = encode_images(self.sam, images, valid_sizes)
         conditions, auxiliary_logits = self.condition_encoder(images, embeddings)
         losses = self.diffusion.training_losses(
-            self.dit, conditions, batch["heatmaps"], return_prediction=True,
+            self.unet, conditions, batch["heatmaps"], return_prediction=True,
             valid_mask=batch.get("field_valid_mask"), field_regions=batch.get("field_regions"),
         )
         reconstructed = self.sam.decode_heatmaps(
@@ -614,7 +617,7 @@ class DiffPeakEngine:
             valid_sizes=valid_sizes,
         )
         generated_heatmaps = self.diffusion.sample_differentiable(
-            self.dit, conditions,
+            self.unet, conditions,
             generator=make_generator(stable_seed(self.seed, "ABC", epoch, *batch["ids"])),
         )
         generated = self.sam.decode_heatmaps(
@@ -633,12 +636,12 @@ class DiffPeakEngine:
         sampled_segmentation = seg_loss(generated)
         auxiliary = auxiliary_loss(auxiliary_logits, masks, batch["skeleton"], valid_sizes=valid_sizes)
         total = (
-            losses["diff"] + self.heat_weight * losses["heat"]
+            losses["flow"] + self.heat_weight * losses["heat"]
             + self.aux_weight * auxiliary
             + float(self.train_cfg.get("seg_weight", 1.0)) * segmentation
             + float(self.train_cfg.get("sampled_seg_weight", 1.0)) * sampled_segmentation
         )
-        return {"loss": total, "diff": losses["diff"], "heat": losses["heat"],
+        return {"loss": total, "flow": losses["flow"], "heat": losses["heat"],
                 "aux": auxiliary, "seg": segmentation, "sampled_seg": sampled_segmentation}
 
     # ------------------------------------------------------------------
@@ -684,7 +687,7 @@ class DiffPeakEngine:
                     "seg": _scalar(loss_dict.get("seg")),
                     "sampled_seg": _scalar(loss_dict.get("sampled_seg")),
                     "aux": _scalar(loss_dict.get("aux")),
-                    "diff": _scalar(loss_dict.get("diff")),
+                    "flow": _scalar(loss_dict.get("flow")),
                     "heat": _scalar(loss_dict.get("heat")),
                 }
                 records.append(record)
@@ -719,7 +722,7 @@ class DiffPeakEngine:
                 )
 
         stats: Dict[str, float] = {}
-        for key in ("loss", "seg", "sampled_seg", "aux", "diff", "heat"):
+        for key in ("loss", "seg", "sampled_seg", "aux", "flow", "heat"):
             values = [
                 record[key]
                 for record in records
@@ -772,8 +775,7 @@ class DiffPeakEngine:
             "grpo",
             "kl",
             "diffusion_grpo",
-            "diffusion_kl",
-            "anchor",
+            "diffusion_kl",            "anchor",
             "logratio_abs_mean",
             "logratio_abs_max",
             "clip_fraction",
@@ -812,7 +814,7 @@ class DiffPeakEngine:
 
     def _validate_resume_algorithm(self, payload: Mapping[str, Any]) -> None:
         validate_checkpoint_protocol(payload, self.config)
-        if int(payload.get("format_version", 0)) < 5:
+        if int(payload.get("format_version", 0)) < CHECKPOINT_FORMAT_VERSION:
             raise ValueError("旧快照不能 --resume；请显式 --init --migrate-legacy 迁移兼容权重")
         saved_train = payload.get("config", {}).get("train", {})
         for key in (("seg_weight", "sampled_seg_weight", "cldice_weight") if "config" in payload else ()):
@@ -828,7 +830,7 @@ class DiffPeakEngine:
         if str(payload.get("stage", "")).upper() == "D":
             algorithm = payload.get("algorithm", {})
             if self._payload_algorithm_name(payload) != "grpo" or algorithm.get("version") != 3:
-                raise ValueError("D 快照必须使用仅扩散轨迹的 Gaussian GRPO v3")
+                raise ValueError("D 快照必须使用随机 Flow Matching 积分的 GRPO v3")
 
     @staticmethod
     def _active_group_mask(reward_tensor: torch.Tensor) -> torch.Tensor:
@@ -864,7 +866,7 @@ class DiffPeakEngine:
                     embeddings = encode_images(self.sam, images, sizes)
                     conditions, _ = self.condition_encoder(images, embeddings)
                     fields = self.diffusion.sample(
-                        self.dit, conditions,
+                        self.unet, conditions,
                         generator=make_generator(evaluation_seed(self.seed, prepared["ids"][0])),
                     )
                     logits = self.sam.decode_heatmaps(
@@ -910,11 +912,11 @@ class DiffPeakEngine:
             # 避免同一输入在两次前向中产生非确定性差异。
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
-            if self.ref_dit is None:
-                self.ref_dit = copy.deepcopy(self.dit)
-            self.ref_dit = self.ref_dit.to(self.device)
-            self.ref_dit.eval()
-            for parameter in self.ref_dit.parameters():
+            if self.ref_unet is None:
+                self.ref_unet = copy.deepcopy(self.unet)
+            self.ref_unet = self.ref_unet.to(self.device)
+            self.ref_unet.eval()
+            for parameter in self.ref_unet.parameters():
                 parameter.requires_grad_(False)
             for name, module in (
                 ("ref_condition_encoder", self.condition_encoder),
@@ -925,7 +927,7 @@ class DiffPeakEngine:
                 reference.to(self.device).eval().requires_grad_(False)
                 setattr(self, name, reference)
         else:
-            self.ref_dit = None
+            self.ref_unet = None
             self.ref_condition_encoder = None
 
         self._set_train_modes(stage)
@@ -967,9 +969,9 @@ class DiffPeakEngine:
             )
         del probe_loader
         # run_stage 自身负责恢复模型权重，不能依赖 CLI 预加载；
-        # D 阶段的 ref_dit 也在这里严格恢复。
+        # D 阶段的 ref_unet 也在这里严格恢复。
         if resume_payload is not None:
-            # 先检查算法归属：旧 DDPO 的 D 阶段快照即使带有 ref_dit，也不能
+            # 先检查算法归属：旧 DDPO 的 D 阶段快照即使带有 ref_unet，也不能
             # 把其 optimizer/scheduler 状态直接接到 GRPO。
             self._validate_resume_algorithm(resume_payload)
             self.load_models_from_payload(
@@ -1156,13 +1158,14 @@ class DiffPeakEngine:
             "condition_encoder": self._to_cpu_tree(
                 self.condition_encoder.state_dict()
             ),
-            "dit": self._to_cpu_tree(self.dit.state_dict()),
+            "unet": self._to_cpu_tree(self.unet.state_dict()),
         }
-        # 始终写入 diffusion 字段（包含 beta/alpha 调度 buffer），
-        # 严格加载器要求四个必需模块齐全。
+        # 始终写入 diffusion 字段（Flow Matching 容器，包含 flow_signature /
+        # policy_std / time_scale 等元数据 buffer），严格加载器要求四个必需
+        # 模块齐全；旧 GaussianDiffusion 状态会因 buffer 不匹配被拒绝。
         states["diffusion"] = self._to_cpu_tree(self.diffusion.state_dict())
-        if self.ref_dit is not None:
-            states["ref_dit"] = self._to_cpu_tree(self.ref_dit.state_dict())
+        if self.ref_unet is not None:
+            states["ref_unet"] = self._to_cpu_tree(self.ref_unet.state_dict())
         for name in ("ref_condition_encoder",):
             reference = getattr(self, name, None)
             if reference is not None:
@@ -1210,9 +1213,12 @@ class DiffPeakEngine:
         self, stage: str, epoch: int, best_metric: Optional[float]
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
-            # v5：单通道有符号目标、SAM 全冻结及仅扩散轨迹 GRPO。
-            "format_version": 5,
+            # v7：连续时间 Flow Matching UNet + 随机积分策略；SAM 全冻结，
+            # D 阶段仍使用显式随机积分的 GRPO 轨迹。
+            "format_version": CHECKPOINT_FORMAT_VERSION,
             "training_protocol": self.config.get("training_protocol"),
+            "denoiser_architecture": DENOISER_ARCHITECTURE,
+            "generative_process": GENERATIVE_PROCESS,
             "target_representation": "signed_ridge_v1",
             "latent_channels": 1,
             "sam_frozen": True,
@@ -1406,7 +1412,7 @@ class DiffPeakEngine:
     ) -> Dict[str, Any]:
         """严格加载模型权重。
 
-        ``allow_missing_ref=True`` 时，D 快照缺少 ``ref_dit`` 也可只做
+        ``allow_missing_ref=True`` 时，D 快照缺少 ``ref_unet`` 也可只做
         ``--init``；真正的 ``--resume`` 由 :meth:`run_stage` 传 ``False``，
         以保持参考策略的严格恢复。
         """
@@ -1416,15 +1422,15 @@ class DiffPeakEngine:
         )
         source = payload["models"]
         payload_stage = str(payload.get("stage", "")).upper()
-        if include_ref and "ref_dit" in source:
-            if self.ref_dit is None:
-                self.ref_dit = copy.deepcopy(self.dit)
-            self.ref_dit.load_state_dict(source["ref_dit"], strict=True)
-            self.ref_dit = self.ref_dit.to(self.device).eval()
-            for parameter in self.ref_dit.parameters():
+        if include_ref and "ref_unet" in source:
+            if self.ref_unet is None:
+                self.ref_unet = copy.deepcopy(self.unet)
+            self.ref_unet.load_state_dict(source["ref_unet"], strict=True)
+            self.ref_unet = self.ref_unet.to(self.device).eval()
+            for parameter in self.ref_unet.parameters():
                 parameter.requires_grad_(False)
         elif include_ref and payload_stage == "D" and not allow_missing_ref:
-            raise ValueError("D 阶段 checkpoint 缺少 ref_dit，不能恢复 KL 参考策略")
+            raise ValueError("D 阶段 checkpoint 缺少 ref_unet，不能恢复 KL 参考策略")
         if include_ref:
             for name, module in (
                 ("ref_condition_encoder", self.condition_encoder),
@@ -1441,7 +1447,7 @@ class DiffPeakEngine:
     def load_init_weights(self, path: Union[str, Path]) -> Mapping[str, Any]:
         """``--init``：只加载模型权重，不恢复优化器/epoch/RNG。
 
-        只初始化当前策略。新 D 实验从已加载的条件编码器和 DiT
+        只初始化当前策略。新 D 实验从已加载的条件编码器和 UNet
         建立新的固定参考；恢复旧参考必须使用 --resume。
         """
         payload = read_checkpoint(path)

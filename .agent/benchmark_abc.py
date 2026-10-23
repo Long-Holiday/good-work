@@ -20,7 +20,7 @@ def candidate(args):
     torch.set_num_interop_threads(1)
     config = load_config(str(Path(args.repo) / 'configs/3090.yaml'))
     config['output_dir'] = str(Path(args.output) / args.name)
-    config['model']['dit']['gradient_checkpointing'] = bool(args.checkpoint)
+    config['model']['unet']['gradient_checkpointing'] = bool(args.checkpoint)
     config['stages']['ABC'].update(batch_size=args.batch, accumulation_steps=4 // args.batch, num_workers=args.workers)
     engine = DiffPeakEngine(config, config_dir=Path(args.repo) / 'configs')
     engine._apply_stage_config('ABC')
@@ -42,7 +42,7 @@ def candidate(args):
     seconds = time.perf_counter() - start
     finite = all(bool(torch.isfinite(p).all()) for p in engine._trainable_parameters())
     result = dict(name=args.name, batch=args.batch, accumulation=4 // args.batch, workers=args.workers, threads=args.threads, checkpoint=bool(args.checkpoint), seconds=seconds, images=args.updates * 4, images_per_second=args.updates * 4 / seconds, peak_allocated_mib=torch.cuda.max_memory_allocated() / 2**20, peak_reserved_mib=torch.cuda.max_memory_reserved() / 2**20, params_finite=finite, stats=stats)
-    result['healthy'] = finite and stats['optimizer_steps'] == args.updates and stats.get('skipped_groups', 0) == 0 and all(math.isfinite(stats[k]) for k in ('loss', 'diff', 'seg', 'sampled_seg', 'heat', 'aux'))
+    result['healthy'] = finite and stats['optimizer_steps'] == args.updates and stats.get('skipped_groups', 0) == 0 and all(math.isfinite(stats[k]) for k in ('loss', 'flow', 'seg', 'sampled_seg', 'heat', 'aux'))
     Path(args.result).write_text(json.dumps(result, indent=2))
     print(json.dumps(result), flush=True)
 

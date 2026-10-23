@@ -23,6 +23,8 @@ from diffpeak.inference import (  # noqa: E402
     CHECKPOINT_FORMAT_VERSION,
     CheckpointProtocolError,
     DEFAULT_CONFIG,
+    DENOISER_ARCHITECTURE,
+    GENERATIVE_PROCESS,
     JOINT_ABC_PROTOCOL,
     PROMPT_TERMINAL_MAPPINGS,
     SIGNED_RIDGE_PROTOCOL,
@@ -56,11 +58,14 @@ def _metadata(**overrides):
     prompt.update(overrides.pop("prompt", {}))
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["prompt"] = dict(prompt)
+    config["model"]["denoiser_architecture"] = DENOISER_ARCHITECTURE
     config.update(overrides.pop("config", {}))
     payload = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "training_protocol": SIGNED_RIDGE_PROTOCOL,
         "target_representation": TARGET_REPRESENTATION,
+        "denoiser_architecture": DENOISER_ARCHITECTURE,
+        "generative_process": GENERATIVE_PROCESS,
         "latent_channels": 1,
         "sam_frozen": True,
         "prompt": prompt,
@@ -165,9 +170,21 @@ class ProtocolConfigTest(unittest.TestCase):
         )
         self.assertTrue(config["sam_frozen"])
         self.assertTrue(config["model"]["sam_frozen"])
-        self.assertEqual(config["model"]["dit"]["in_channels"], 1)
-        self.assertEqual(config["model"]["dit"]["out_channels"], 1)
-        self.assertEqual(config["diffusion"]["latent_channels"], 1)
+        self.assertEqual(config["model"]["denoiser_architecture"], DENOISER_ARCHITECTURE)
+        self.assertEqual(config["model"]["unet"]["time_scale"], 1000.0)
+        self.assertEqual(config["generative_process"], GENERATIVE_PROCESS)
+        self.assertEqual(config["model"]["unet"]["in_channels"], 1)
+        self.assertEqual(config["model"]["unet"]["out_channels"], 1)
+        self.assertEqual(config["model"]["unet"]["base_channels"], 64)
+        self.assertEqual(config["model"]["unet"]["channel_mults"], (1, 2, 4, 4))
+        self.assertEqual(config["model"]["unet"]["attention_levels"], (3,))
+        self.assertNotIn("dit", config["model"])
+        self.assertNotIn("diffusion", config)
+        self.assertEqual(config["flow_matching"]["latent_channels"], 1)
+        self.assertEqual(config["flow_matching"]["sampling_steps"], 20)
+        self.assertEqual(config["flow_matching"]["policy_std"], 0.02)
+        self.assertEqual(config["flow_matching"]["solver"], "heun")
+        self.assertEqual(config["flow_matching"]["field_loss_min_time"], 0.5)
         self.assertEqual(config["prompt"], {"scale": 1.0, "terminal_mapping": "clamp"})
         self.assertEqual(config["reward"]["point_cost"], 0.0)
         self.assertEqual(config["rl"]["anchor_weight"], 0.01)
@@ -213,10 +230,19 @@ class ProtocolConfigTest(unittest.TestCase):
         # 显式迁移旧配置时可以关闭协议要求。
         validate_signed_ridge_config(bad, require_protocol=False)
 
+        legacy_diffusion = copy.deepcopy(DEFAULT_CONFIG)
+        legacy_diffusion["diffusion"] = {"latent_channels": 1}
+        with self.assertRaisesRegex(ValueError, "diffusion"):
+            validate_signed_ridge_config(legacy_diffusion)
+
         for path, value in (
-            (("model", "dit", "in_channels"), 2),
-            (("model", "dit", "out_channels"), 2),
-            (("diffusion", "latent_channels"), 2),
+            (("model", "unet", "in_channels"), 2),
+            (("model", "unet", "out_channels"), 2),
+            (("model", "unet", "time_scale"), 500.0),
+            (("flow_matching", "latent_channels"), 2),
+            (("flow_matching", "solver"), "ddim"),
+            (("flow_matching", "policy_std"), 0.0),
+            (("flow_matching", "field_loss_min_time"), 1.5),
             (("sam_frozen",), False),
             (("prompt", "scale"), 0.0),
         ):
@@ -248,13 +274,14 @@ class BuildModelsTest(unittest.TestCase):
 
     def _config(self, directory: Path) -> dict:
         config = copy.deepcopy(DEFAULT_CONFIG)
-        config["model"]["dit"].update(
+        config["model"]["unet"].update(
             {
-                "patch_size": 4,
-                "hidden_size": 32,
-                "depth": 1,
+                "base_channels": 8,
+                "channel_mults": (1, 2, 4, 4),
+                "num_res_blocks": 1,
+                "attention_levels": (3,),
                 "num_heads": 4,
-                "condition_channels": (4, 8, 8, 8),
+                "condition_channels": (8, 16, 32, 32),
                 "gradient_checkpointing": False,
             }
         )
@@ -272,17 +299,22 @@ class BuildModelsTest(unittest.TestCase):
 
         self.assertIsNone(second)
         self.assertEqual(
-            set(models), {"sam", "condition_encoder", "dit", "diffusion"}
+            set(models), {"sam", "condition_encoder", "unet", "diffusion"}
         )
-        self.assertEqual(models["dit"].in_channels, 1)
-        self.assertEqual(models["dit"].out_channels, 1)
+        self.assertEqual(models["unet"].in_channels, 1)
+        self.assertEqual(models["unet"].out_channels, 1)
+        self.assertEqual(models["unet"].condition_channels, (8, 16, 32, 32))
+        self.assertFalse(models["unet"].gradient_checkpointing)
         self.assertEqual(models["diffusion"].latent_channels, 1)
+        # diffusion 槽位现在是 Flow Matching 容器，且携带签名 buffer。
+        self.assertEqual(models["diffusion"].policy_std, 0.02)
+        self.assertIn("flow_signature", models["diffusion"].state_dict())
         self.assertEqual(models["sam"].prompt_scale, 2.5)
 
     def test_build_models_rejects_explicit_multi_channel(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(Path(directory))
-            config["diffusion"]["latent_channels"] = 2
+            config["flow_matching"]["latent_channels"] = 2
             with patch("diffpeak.inference.RoadSAM", self._DummySAM):
                 with self.assertRaises(ValueError):
                     build_models(config, "cpu")
@@ -295,6 +327,8 @@ class CheckpointProtocolTest(unittest.TestCase):
         self.assertEqual(meta["target_representation"], TARGET_REPRESENTATION)
         self.assertEqual(meta["latent_channels"], 1)
         self.assertTrue(meta["sam_frozen"])
+        self.assertEqual(meta["denoiser_architecture"], DENOISER_ARCHITECTURE)
+        self.assertEqual(meta["generative_process"], GENERATIVE_PROCESS)
         self.assertEqual(meta["prompt_scale"], 1.0)
         self.assertEqual(meta["terminal_mapping"], "clamp")
 
@@ -313,6 +347,18 @@ class CheckpointProtocolTest(unittest.TestCase):
         with self.assertRaisesRegex(CheckpointProtocolError, "target_representation"):
             validate_checkpoint_protocol(missing)
 
+        # 旧 DiT 快照即使其它协议字段齐全，也因缺少 UNet 架构标识被拒绝。
+        legacy_dit = _metadata(denoiser_architecture=None)
+        legacy_dit["config"]["model"].pop("denoiser_architecture", None)
+        with self.assertRaisesRegex(CheckpointProtocolError, "denoiser_architecture"):
+            validate_checkpoint_protocol(legacy_dit)
+
+        # 旧扩散快照缺 generative_process 同样拒绝。
+        legacy_diffusion = _metadata(generative_process=None)
+        legacy_diffusion["config"].pop("generative_process", None)
+        with self.assertRaisesRegex(CheckpointProtocolError, "generative_process"):
+            validate_checkpoint_protocol(legacy_diffusion)
+
     def test_root_and_config_contradictions_are_rejected(self) -> None:
         payload = _metadata()
         payload["config"]["training_protocol"] = "joint_abc_v1"
@@ -327,6 +373,16 @@ class CheckpointProtocolTest(unittest.TestCase):
         payload = _metadata()
         payload["config"]["sam_frozen"] = False
         with self.assertRaisesRegex(CheckpointProtocolError, "sam_frozen"):
+            validate_checkpoint_protocol(payload)
+
+        payload = _metadata()
+        payload["denoiser_architecture"] = "conditional_dit_v1"
+        with self.assertRaisesRegex(CheckpointProtocolError, "不一致"):
+            validate_checkpoint_protocol(payload)
+
+        payload = _metadata()
+        payload["generative_process"] = "ddpm_v1"
+        with self.assertRaisesRegex(CheckpointProtocolError, "不一致"):
             validate_checkpoint_protocol(payload)
 
     def test_channel_freeze_and_mapping_are_validated(self) -> None:
@@ -364,6 +420,10 @@ class CheckpointProtocolTest(unittest.TestCase):
         old = _payload_with_models({}, format_version=4)
         with self.assertRaises(CheckpointProtocolError):
             load_checkpoint_models({}, old)
+        # v6 扩散 UNet 快照同样低于 v7，不能加载到 Flow Matching。
+        diffusion_v6 = _payload_with_models({}, format_version=6)
+        with self.assertRaisesRegex(CheckpointProtocolError, "format_version"):
+            load_checkpoint_models({}, diffusion_v6)
 
 
 class CheckpointSAM2GuardTest(unittest.TestCase):
@@ -381,7 +441,7 @@ class CheckpointSAM2GuardTest(unittest.TestCase):
                     "sam.mask_decoder.iou_token.weight": torch.zeros(1),
                 },
                 "condition_encoder": {},
-                "dit": {},
+                "unet": {},
                 "diffusion": {},
             }
         )
@@ -403,7 +463,7 @@ class CheckpointSAM2GuardTest(unittest.TestCase):
             {
                 "sam": {"sam.sam_mask_decoder.conv_s0.weight": torch.zeros(1)},
                 "condition_encoder": {},
-                "dit": {},
+                "unet": {},
                 "diffusion": {},
             },
             config={"model": {"sam_architecture": "sam2.1_hiera_large"}},
@@ -424,24 +484,26 @@ class CheckpointSAM2GuardTest(unittest.TestCase):
 
 
 class MigrationTest(unittest.TestCase):
-    class _TinyDit(nn.Module):
+    class _TinyLegacyDit(nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.patch_embed = nn.Conv2d(1, 2, 3, padding=1)
             self.blocks = nn.Linear(2, 2)
             self.final_layer = nn.Linear(2, 1)
 
-    def test_migration_skips_sam_and_dit_heads_and_reports(self) -> None:
+    def test_migration_loads_only_condition_encoder_and_never_old_dit(self) -> None:
         condition = nn.Linear(2, 2)
-        dit = self._TinyDit()
+        unet = nn.Linear(2, 2)
+        legacy_dit = self._TinyLegacyDit()
         sam = nn.Linear(2, 2)
         models = {
             "condition_encoder": condition,
-            "dit": dit,
+            "unet": unet,
             "sam": sam,
             "diffusion": nn.Linear(1, 1),
         }
         sam_before = {key: value.clone() for key, value in sam.state_dict().items()}
+        unet_before = {key: value.clone() for key, value in unet.state_dict().items()}
         payload = {
             "models": {
                 "sam": {"weight": torch.full((2, 2), 9.0), "bias": torch.ones(2)},
@@ -450,13 +512,17 @@ class MigrationTest(unittest.TestCase):
                     "bias": torch.ones(2),
                     "legacy_only": torch.zeros(1),
                 },
+                # 旧 DiT 状态即使部分形状与目标 UNet 偶然匹配，也不得迁移。
                 "dit": {
-                    "patch_embed.weight": torch.zeros_like(dit.patch_embed.weight),
+                    "patch_embed.weight": torch.zeros_like(
+                        legacy_dit.patch_embed.weight
+                    ),
                     "blocks.weight": torch.full((2, 2), 4.0),
-                    "blocks.bias": torch.zeros(3),
-                    "final_layer.weight": torch.zeros_like(dit.final_layer.weight),
-                    "final_layer.bias": torch.zeros_like(dit.final_layer.bias),
+                    "final_layer.weight": torch.zeros_like(
+                        legacy_dit.final_layer.weight
+                    ),
                 },
+                "ref_dit": {"blocks.weight": torch.full((2, 2), 5.0)},
             }
         }
 
@@ -464,21 +530,30 @@ class MigrationTest(unittest.TestCase):
 
         self.assertTrue(report["migration"])
         self.assertFalse(report["optimizer_restored"])
-        self.assertIn("sam", report["skipped_modules"])
-        self.assertIn("diffusion", report["missing_modules"])
-        self.assertIn("blocks.weight", report["loaded"]["dit"])
+        self.assertEqual(report["target_architecture"], DENOISER_ARCHITECTURE)
+        # 只加载条件编码器兼容权重。
+        self.assertIn("weight", report["loaded"]["condition_encoder"])
+        self.assertEqual(report["loaded"]["dit"], [])
+        self.assertEqual(report["loaded"]["unet"], [])
+        self.assertEqual(report["loaded"]["ref_dit"], [])
+        self.assertIn("dit", report["skipped_modules"])
+        self.assertIn("ref_dit", report["skipped_modules"])
         self.assertEqual(
-            report["skipped"]["dit"]["patch_embed.weight"], "input_output_head"
+            report["skipped"]["dit"]["blocks.weight"],
+            "legacy_dit_not_migrated",
         )
         self.assertEqual(
-            report["skipped"]["dit"]["final_layer.weight"], "input_output_head"
+            report["skipped"]["ref_dit"]["blocks.weight"],
+            "legacy_dit_not_migrated",
         )
+        self.assertEqual(report["reinitialized"]["dit"], [])
         self.assertEqual(
-            report["skipped"]["dit"]["blocks.bias"], "shape_mismatch"
+            set(report["reinitialized"]["unet"]), set(unet_before)
         )
-        self.assertIn("blocks.bias", report["reinitialized"]["dit"])
         self.assertTrue(torch.all(condition.weight == 3.0))
-        self.assertTrue(torch.all(dit.blocks.weight == 4.0))
+        # 目标 UNet 保持构建时的初始化，绝不会接收旧 DiT 权重。
+        for key, value in unet.state_dict().items():
+            self.assertTrue(torch.equal(value, unet_before[key]))
         # 冻结 SAM 必须保持构建时的官方权重，不能被旧快照覆盖。
         for key, value in sam.state_dict().items():
             self.assertTrue(torch.equal(value, sam_before[key]))
@@ -536,7 +611,7 @@ class PredictorSignedRidgeTest(unittest.TestCase):
         predictor.sam = self._DummySam(prompt_scale=sam_prompt_scale)
         predictor.sam_applies_prompt_scale = sam_prompt_scale is not None
         predictor.condition_encoder = self._DummyConditionEncoder()
-        predictor.dit = object()
+        predictor.unet = object()
         if field is None:
             field = torch.zeros(1, 1, 4, 4)
             field[0, 0, 1:3, 1:3] = 0.75

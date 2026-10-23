@@ -1,13 +1,13 @@
 """扩散轨迹 GRPO（冻结 SAM、确定性评分）的单元/集成测试。
 
-测试不加载 SAM2 或 DeepGlobe 数据，只用微型条件编码器、DiT、扩散替身和
+测试不加载 SAM2 或 DeepGlobe 数据，只用微型条件编码器、UNet、扩散替身和
 可微密集热图解码器验证新协议：
 
 * 公共 API 只保留 ``joint_grpo_group``，不再导出 Bernoulli/终端采样；
 * 终端评分是确定性阈值 ``sigmoid(logits) >= threshold``，无 Bernoulli 动作；
 * 同一图像的 G 条扩散轨迹构成一组，优势逐图计算；
-* 只有 condition_encoder 与 DiT 收到梯度；SAM 被防御性冻结并保持 eval；
-* 参考 KL 只使用参考条件编码器与参考 DiT，不需要参考 SAM 解码器；
+* 只有 condition_encoder 与 UNet 收到梯度；SAM 被防御性冻结并保持 eval；
+* 参考 KL 只使用参考条件编码器与参考 UNet，不需要参考 SAM 解码器；
 * 固定路径奖励采样：每张图/每个候选使用稳定的 ``RewardConfig.seed``；
 * 扩散项按 ``G*T*B`` 归一，每轮只 step 一次，重放前 ratio 恰为 1；
 * 常量组在无 KL/anchor 时完全跳过 backward/optimizer；
@@ -35,6 +35,7 @@ if str(ROOT) not in sys.path:
 import diffpeak.joint_rl as joint_rl  # noqa: E402
 from diffpeak.inference import compute_image_metrics, stable_seed  # noqa: E402
 from diffpeak.joint_rl import joint_grpo_group  # noqa: E402
+from diffpeak.models import ConditionalFlowMatching, ConditionalUNet  # noqa: E402
 from diffpeak.rewards import RewardConfig  # noqa: E402
 
 
@@ -47,7 +48,7 @@ class _EngineHarness:
     def _trainable_parameters(self):
         parameters = []
         seen = set()
-        for module in (self.sam, self.condition_encoder, self.dit):
+        for module in (self.sam, self.condition_encoder, self.unet):
             for parameter in module.parameters():
                 if id(parameter) in seen:
                     continue
@@ -183,7 +184,7 @@ class _TinyDiffusion:
             dtype=torch.float32,
         )
 
-    def sample(self, dit, conditions, generator=None, record: bool = False):
+    def sample(self, unet, conditions, generator=None, record: bool = False):
         self.sample_seeds.append(
             int(generator.initial_seed()) if generator is not None else None
         )
@@ -199,7 +200,7 @@ class _TinyDiffusion:
         records: list[dict[str, object]] = []
         for timestep in range(self.steps, 0, -1):
             mean, std = self.transition(
-                dit, state, timestep, timestep - 1, conditions
+                unet, state, timestep, timestep - 1, conditions
             )
             action = mean
             records.append(
@@ -217,7 +218,7 @@ class _TinyDiffusion:
             return heatmaps, records
         return heatmaps
 
-    def transition(self, dit, state, timestep, previous_timestep, conditions):
+    def transition(self, unet, state, timestep, previous_timestep, conditions):
         self.transitions.append(
             {
                 "grad_enabled": torch.is_grad_enabled(),
@@ -225,8 +226,8 @@ class _TinyDiffusion:
                 "conditions_grad_fn": conditions[0].grad_fn is not None,
             }
         )
-        # 同时依赖 DiT 与条件编码器，便于检查两条梯度路径。
-        mean = state * 0.5 + conditions[0] * dit.weight * 0.01
+        # 同时依赖 UNet 与条件编码器，便于检查两条梯度路径。
+        mean = state * 0.5 + conditions[0] * unet.weight * 0.01
         std = torch.ones_like(state) * 0.5
         return mean, std
 
@@ -325,12 +326,12 @@ def _make_engine(
     if freeze_sam:
         _freeze(engine.sam)
     engine.condition_encoder = _TinyConditionEncoder(0.5)
-    engine.dit = _TinyDit(1.0)
-    # 参考 DiT 与当前策略不同，KL 才有非零信号。
-    engine.ref_dit = copy.deepcopy(engine.dit)
+    engine.unet = _TinyDit(1.0)
+    # 参考 UNet 与当前策略不同，KL 才有非零信号。
+    engine.ref_unet = copy.deepcopy(engine.unet)
     with torch.no_grad():
-        engine.ref_dit.weight.fill_(2.0)
-    _freeze(engine.ref_dit)
+        engine.ref_unet.weight.fill_(2.0)
+    _freeze(engine.ref_unet)
     engine.ref_condition_encoder = _freeze(copy.deepcopy(engine.condition_encoder))
     engine.ref_sam_decoder = (
         _freeze(copy.deepcopy(engine.sam.decoder))
@@ -348,7 +349,7 @@ def _make_engine(
 
     def supervised(stage, batch, epoch):
         engine.anchor_calls.append((str(stage), int(epoch)))
-        return {"loss": 0.5 * engine.dit.weight.pow(2)}
+        return {"loss": 0.5 * engine.unet.weight.pow(2)}
 
     engine._supervised_loss = supervised  # type: ignore[method-assign]
     return engine
@@ -473,10 +474,10 @@ class DiffusionGroupTest(unittest.TestCase):
         batch = _batch(1)
         before = {
             "condition": engine.condition_encoder.weight.detach().clone(),
-            "dit": engine.dit.weight.detach().clone(),
+            "unet": engine.unet.weight.detach().clone(),
             "decoder": engine.sam.decoder.weight.detach().clone(),
             "encoder": engine.sam.encoder_scale.detach().clone(),
-            "ref_dit": engine.ref_dit.weight.detach().clone(),
+            "ref_unet": engine.ref_unet.weight.detach().clone(),
             "ref_condition": engine.ref_condition_encoder.weight.detach().clone(),
         }
 
@@ -503,11 +504,11 @@ class DiffusionGroupTest(unittest.TestCase):
         self.assertIn("diffusion_grpo", record)
         self.assertIn("diffusion_kl", record)
 
-        # 只有条件编码器与 DiT 被更新。
+        # 只有条件编码器与 UNet 被更新。
         self.assertFalse(
             torch.equal(before["condition"], engine.condition_encoder.weight.detach())
         )
-        self.assertFalse(torch.equal(before["dit"], engine.dit.weight.detach()))
+        self.assertFalse(torch.equal(before["unet"], engine.unet.weight.detach()))
         self.assertTrue(
             torch.equal(before["decoder"], engine.sam.decoder.weight.detach())
         )
@@ -515,7 +516,7 @@ class DiffusionGroupTest(unittest.TestCase):
             torch.equal(before["encoder"], engine.sam.encoder_scale.detach())
         )
         self.assertTrue(
-            torch.equal(before["ref_dit"], engine.ref_dit.weight.detach())
+            torch.equal(before["ref_unet"], engine.ref_unet.weight.detach())
         )
         self.assertTrue(
             torch.equal(
@@ -588,7 +589,7 @@ class DiffusionGroupTest(unittest.TestCase):
             observed["condition"] = [
                 p.grad is not None for p in engine.condition_encoder.parameters()
             ]
-            observed["dit"] = [p.grad is not None for p in engine.dit.parameters()]
+            observed["unet"] = [p.grad is not None for p in engine.unet.parameters()]
             observed["sam"] = [p.grad is not None for p in engine.sam.parameters()]
             return original_step()
 
@@ -596,7 +597,7 @@ class DiffusionGroupTest(unittest.TestCase):
         joint_grpo_group(engine, _batch(1), 0)
 
         self.assertTrue(any(observed["condition"]))
-        self.assertTrue(any(observed["dit"]))
+        self.assertTrue(any(observed["unet"]))
         self.assertFalse(any(observed["sam"]))
         self.assertFalse(engine.sam.training)
         self.assertTrue(all(not p.requires_grad for p in engine.sam.parameters()))
@@ -664,7 +665,7 @@ class DiffusionGroupTest(unittest.TestCase):
         batch = _batch(1)
         before_condition = engine.condition_encoder.weight.detach().clone()
         before_decoder = engine.sam.decoder.weight.detach().clone()
-        before_dit = engine.dit.weight.detach().clone()
+        before_dit = engine.unet.weight.detach().clone()
 
         record = joint_grpo_group(engine, batch, epoch=3)
 
@@ -679,7 +680,7 @@ class DiffusionGroupTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(before_decoder, engine.sam.decoder.weight.detach())
         )
-        self.assertFalse(torch.equal(before_dit, engine.dit.weight.detach()))
+        self.assertFalse(torch.equal(before_dit, engine.unet.weight.detach()))
 
     def test_anchor_is_backwarded_before_policy_terms(self) -> None:
         engine = _make_engine(
@@ -845,6 +846,170 @@ class RewardSamplingTest(unittest.TestCase):
         )
         self.assertIsNone(engine.ref_sam_decoder.weight.grad)
         self.assertNotIn("terminal_kl", record)
+
+
+class _FlowConditionEncoder(nn.Module):
+    """四尺度、U-Net 兼容的条件编码器（真实参数，驱动 FM UNet）。"""
+
+    def __init__(self, channels=(4, 8, 8, 8), size: int = 16) -> None:
+        super().__init__()
+        self.channels = tuple(int(item) for item in channels)
+        self.size = int(size)
+        self.scale = nn.Parameter(torch.tensor(1.0))
+        self.calls = 0
+
+    def forward(self, images: torch.Tensor, embeddings: torch.Tensor):
+        self.calls += 1
+        batch = int(images.shape[0])
+        conditions = []
+        for index, channel in enumerate(self.channels):
+            side = max(1, self.size // (2**index))
+            base = torch.ones(
+                batch, channel, side, side,
+                device=images.device, dtype=images.dtype,
+            )
+            conditions.append(base * self.scale)
+        auxiliary = torch.zeros(
+            batch, 1, self.size, self.size,
+            device=images.device, dtype=images.dtype,
+        )
+        return conditions, auxiliary
+
+
+def _make_flow_engine(*, kl_weight: float = 0.01) -> _EngineHarness:
+    """真实 ConditionalUNet + ConditionalFlowMatching 的 D 集成引擎。"""
+    engine = _EngineHarness()
+    engine.device = torch.device("cpu")
+    engine.amp = False
+    engine.image_size = 16
+    engine.heatmap_size = 16
+    engine.seed = 1234
+    engine.threshold = 0.5
+    engine.group_size = 2
+    engine.ppo_clip = 0.2
+    engine.kl_weight = float(kl_weight)
+    engine.anchor_weight = 0.0
+    engine.update_epochs = 1
+    engine.advantage_std_delta = 1e-4
+    engine.grad_clip = 0.0
+    engine.global_step = 0
+    engine.grpo_groups_processed = 0
+    engine._stage = "D"
+    engine.reward_config = RewardConfig(
+        iou_weight=0.5, cldice_weight=0.5, path_weight=0.0
+    )
+
+    engine.sam = _freeze(_TinySam(decoder_weight=4.0))
+    engine.condition_encoder = _FlowConditionEncoder()
+    engine.unet = ConditionalUNet(
+        in_channels=1, out_channels=1, base_channels=4,
+        channel_mults=(1, 2, 2, 4), num_res_blocks=1,
+        attention_levels=(3,), num_heads=2,
+        condition_channels=(4, 8, 8, 8), gradient_checkpointing=False,
+        time_scale=1000.0,
+    )
+    # U-Net 输出头默认零初始化会阻断通往条件编码器的首步梯度；GRPO 集成
+    # 测试需要同时检查 UNet 与条件编码器更新。
+    with torch.no_grad():
+        if hasattr(engine.unet, "output_conv"):
+            engine.unet.output_conv.weight.normal_(0.0, 0.01)
+            engine.unet.output_conv.bias.normal_(0.0, 0.01)
+    engine.ref_unet = _freeze(copy.deepcopy(engine.unet))
+    # 参考策略与当前策略不同，KL 才有非零信号。
+    with torch.no_grad():
+        for parameter in engine.ref_unet.parameters():
+            parameter.add_(0.01)
+    engine.ref_condition_encoder = _freeze(copy.deepcopy(engine.condition_encoder))
+    engine.diffusion = ConditionalFlowMatching(
+        sampling_steps=2, policy_std=0.02, latent_channels=1,
+        heatmap_size=16, time_scale=1000.0, field_loss_min_time=0.5,
+        solver="heun",
+    )
+    engine.optimizer = torch.optim.AdamW(engine._trainable_parameters(), lr=1e-2)
+    engine.scheduler = _RecordingScheduler()
+    engine.scaler = _RecordingScaler()
+    return engine
+
+
+class FlowMatchingGRPOIntegrationTest(unittest.TestCase):
+    def test_record_replay_uses_float_time_and_unit_ratio(self) -> None:
+        engine = _make_flow_engine()
+        batch = _batch(1)
+        conditions = [
+            condition.detach()
+            for condition in engine.condition_encoder(
+                batch["image"], torch.zeros(1, 1, 1, 1)
+            )[0]
+        ]
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(7)
+
+        engine.unet.eval()
+        with torch.no_grad():
+            _, records = engine.diffusion.sample(
+                engine.unet, conditions, generator=generator, record=True
+            )
+            self.assertEqual(len(records), engine.diffusion.sampling_steps)
+            previous = -1.0
+            for record in records:
+                timestep = record["timestep"]
+                previous_timestep = record["previous_timestep"]
+                # 连续时间必须是 float 且升序：t -> s，s > t。
+                self.assertIsInstance(timestep, float)
+                self.assertIsInstance(previous_timestep, float)
+                self.assertGreaterEqual(float(timestep), previous)
+                self.assertGreater(float(previous_timestep), float(timestep))
+                previous = float(previous_timestep)
+                mean, std = engine.diffusion.transition(
+                    engine.unet, record["state"], timestep,
+                    previous_timestep, conditions,
+                )
+                log_prob = engine.diffusion.log_prob(
+                    record["action"], mean, std
+                )
+                ratio = torch.exp(
+                    log_prob.double() - record["old_log_prob"].double()
+                )
+                torch.testing.assert_close(
+                    ratio, torch.ones_like(ratio), rtol=1e-5, atol=1e-5
+                )
+
+    def test_fm_grpo_kl_updates_policy_and_keeps_reference_frozen(self) -> None:
+        engine = _make_flow_engine(kl_weight=0.01)
+        unet_before = {
+            name: value.detach().clone()
+            for name, value in engine.unet.state_dict().items()
+        }
+        encoder_before = engine.condition_encoder.scale.detach().clone()
+        reference_before = {
+            name: value.detach().clone()
+            for name, value in engine.ref_unet.state_dict().items()
+        }
+        sam_before = {
+            name: value.detach().clone()
+            for name, value in engine.sam.state_dict().items()
+        }
+
+        record = joint_grpo_group(engine, _batch(1), 0)
+
+        self.assertTrue(math.isfinite(record["kl"]))
+        self.assertEqual(record["updates"], 1.0)
+        self.assertEqual(engine.global_step, 1)
+        self.assertTrue(
+            any(
+                not torch.equal(value, engine.unet.state_dict()[name])
+                for name, value in unet_before.items()
+            )
+        )
+        self.assertFalse(
+            torch.equal(encoder_before, engine.condition_encoder.scale.detach())
+        )
+        for name, value in reference_before.items():
+            self.assertTrue(
+                torch.equal(value, engine.ref_unet.state_dict()[name])
+            )
+        for name, value in sam_before.items():
+            self.assertTrue(torch.equal(value, engine.sam.state_dict()[name]))
 
 
 if __name__ == "__main__":

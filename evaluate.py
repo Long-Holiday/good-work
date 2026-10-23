@@ -1,7 +1,7 @@
 """DiffPeak-SAM 有标注划分评估入口（signed_ridge_v1）。
 
 只接受带掩码的划分（通常为 ``splits/val.json`` 或 ``splits/train.json``）。
-每张图独立推理：影像 -> 条件编码 -> 扩散采样单通道有符号场 -> 冻结 SAM
+每张图独立推理：影像 -> 条件编码 -> 随机 Flow Matching 积分单通道有符号场 -> 冻结 SAM
 解码，之后才读取掩码计算指标。预测过程不接触掩码或骨架；不提取峰值点。
 
 指标同时报告：
@@ -10,8 +10,8 @@
 * 有符号场分布、前景/背景响应与 collapse 诊断；
 * 空预测/空标注比例。
 
-本脚本总是使用**生成场提示**。旧双通道 checkpoint 会被协议校验拒绝；
-显式 ``--migrate-weights`` 只迁移形状兼容权重（不恢复优化器）。
+本脚本总是使用**生成场提示**。旧 DiT/旧双通道 checkpoint 会被协议校验拒绝；
+显式 ``--migrate-weights`` 只迁移条件编码器兼容权重（不恢复优化器）。
 
 分辨率说明：``engine`` 验证在 1024² 画布上按缩放后的有效区域计算指标，本脚本
 则先把预测恢复到原图尺寸再读取同尺寸标注。当前 DeepGlobe 影像均为 1024²，
@@ -176,7 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--migrate-weights",
         action="store_true",
-        help="显式迁移旧快照的形状兼容权重（跳过 SAM/输入输出头，不恢复优化器）。",
+        help="显式迁移旧快照的条件编码器兼容权重（不迁移旧 DiT/UNet，不恢复优化器）。",
     )
     parser.add_argument("--limit", type=int, default=None, help="最多评估的影像数。")
     return parser

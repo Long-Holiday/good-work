@@ -318,7 +318,7 @@ class GaussianDiffusion(nn.Module):
         """计算扩散损失与单通道山脊场重建损失。
 
         Args:
-            dit: 条件去噪器（默认 DiT）。
+            dit: 条件去噪器（默认多尺度 U-Net；保留参数名以兼容调用）。
             conditions: 四个尺度的条件特征。
             target_heatmaps: 目标有符号场 ``B x 1 x H x W``，范围 ``[-1, 1]``；
                 直接作为扩散目标，不做仿射变换。
@@ -395,7 +395,7 @@ class GaussianDiffusion(nn.Module):
         """一次 DDIM 随机转移的高斯均值与标准差。
 
         Args:
-            dit: 条件去噪器（默认 DiT）。
+            dit: 条件去噪器（默认多尺度 U-Net；保留参数名以兼容调用）。
             state: 当前带噪场 ``z_t``，不限制在 ``[-1, 1]``。
             timestep: 当前时间步 ``t``（标量或长度 B 的张量）。
             previous_timestep: 上一时间步；允许 -1，此时视为 ``alpha_bar=1``。
@@ -534,7 +534,7 @@ class GaussianDiffusion(nn.Module):
         """DDIM 随机采样单通道有符号场（不构建计算图）。
 
         Args:
-            dit: 条件去噪器（默认 DiT）。
+            dit: 条件去噪器（默认多尺度 U-Net；保留参数名以兼容调用）。
             conditions: 四个尺度的条件特征。
             generator: 可选随机数生成器；允许 CPU 生成器配合 GPU 条件。
             record: 是否记录每步的 GRPO 轨迹信息。

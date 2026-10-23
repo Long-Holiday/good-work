@@ -8,8 +8,8 @@ joint-RL test suite); here we verify the engine boundary:
 * frozen SAM parameters still pass input gradients from the signed field;
 * ``_grpo_group`` delegates to the diffusion-only ``joint_grpo_group``;
 * the D group/epoch aggregation and group-relative activity mask stay correct;
-* an integrated D run updates only the condition encoder and DiT, records no
-  terminal-policy fields and creates only ``ref_dit``/``ref_condition_encoder``.
+* an integrated D run updates only the condition encoder and UNet, records no
+  terminal-policy fields and creates only ``ref_unet``/``ref_condition_encoder``.
 """
 from __future__ import annotations
 
@@ -66,8 +66,8 @@ def _bare_engine() -> DiffPeakEngine:
     engine.amp = False
     engine.sam = _TinySam()
     engine.condition_encoder = _TinyModule(3.0)
-    engine.dit = _TinyModule(4.0)
-    engine.ref_dit = None
+    engine.unet = _TinyModule(4.0)
+    engine.ref_unet = None
     engine.ref_condition_encoder = None
     return engine
 
@@ -95,30 +95,30 @@ class FreezingTest(unittest.TestCase):
                 self.assertTrue(
                     all(
                         parameter.requires_grad
-                        for parameter in engine.dit.parameters()
+                        for parameter in engine.unet.parameters()
                     )
                 )
 
     def test_train_modes_keep_sam_eval_and_use_eval_replay_in_d(self) -> None:
         expected = {
-            # ABC: SAM 始终 eval；条件编码器与 DiT 训练。
+            # ABC: SAM 始终 eval；条件编码器与 UNet 训练。
             "ABC": (True, True),
             # D: rollout/replay 对策略使用 eval 保证两次前向一致；梯度仍开启。
             "D": (False, False),
         }
-        for stage, (condition, dit) in expected.items():
+        for stage, (condition, unet) in expected.items():
             with self.subTest(stage=stage):
                 engine = _bare_engine()
-                engine.ref_dit = nn.Module()
-                engine.ref_dit.train()
+                engine.ref_unet = nn.Module()
+                engine.ref_unet.train()
                 engine.ref_condition_encoder = nn.Module()
                 engine.ref_condition_encoder.train()
                 engine._set_train_modes(stage)
 
                 self.assertFalse(engine.sam.training)
                 self.assertEqual(engine.condition_encoder.training, condition)
-                self.assertEqual(engine.dit.training, dit)
-                self.assertFalse(engine.ref_dit.training)
+                self.assertEqual(engine.unet.training, unet)
+                self.assertFalse(engine.ref_unet.training)
                 self.assertFalse(engine.ref_condition_encoder.training)
 
     def test_frozen_sam_passes_field_gradients_without_parameter_updates(self) -> None:
@@ -212,7 +212,7 @@ class DiffusionOnlyIntegrationTest(unittest.TestCase):
             }
             dit_before = {
                 name: value.detach().clone()
-                for name, value in engine.dit.state_dict().items()
+                for name, value in engine.unet.state_dict().items()
             }
 
             metrics = engine.run_stage("D")
@@ -224,7 +224,7 @@ class DiffusionOnlyIntegrationTest(unittest.TestCase):
             self.assertNotIn("terminal_grpo", train_stats)
             self.assertNotIn("terminal_kl", train_stats)
 
-            # SAM 状态完全不变；只有条件编码器与 DiT 更新。
+            # SAM 状态完全不变；只有条件编码器与 UNet 更新。
             self.assertFalse(engine.sam.training)
             self.assertTrue(all(not p.requires_grad for p in engine.sam.parameters()))
             for name, value in engine.sam.state_dict().items():
@@ -235,16 +235,16 @@ class DiffusionOnlyIntegrationTest(unittest.TestCase):
             )
             dit_changed = any(
                 not torch.equal(dit_before[name], value)
-                for name, value in engine.dit.state_dict().items()
+                for name, value in engine.unet.state_dict().items()
             )
             self.assertTrue(condition_changed)
             self.assertTrue(dit_changed)
 
-            # 固定参考只有条件编码器与 DiT；不存在参考 SAM 解码器。
-            self.assertIsNotNone(engine.ref_dit)
+            # 固定参考只有条件编码器与 UNet；不存在参考 SAM 解码器。
+            self.assertIsNotNone(engine.ref_unet)
             self.assertIsNotNone(engine.ref_condition_encoder)
             self.assertIsNone(getattr(engine, "ref_sam_decoder", None))
-            for reference in (engine.ref_dit, engine.ref_condition_encoder):
+            for reference in (engine.ref_unet, engine.ref_condition_encoder):
                 self.assertFalse(reference.training)
                 self.assertTrue(
                     all(not p.requires_grad for p in reference.parameters())

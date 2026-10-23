@@ -17,13 +17,15 @@ from tests.test_engine_pipeline import PROTOCOL, _build_tiny_models
 def _valid_payload(stage="ABC"):
     payload = {
         "stage": stage,
-        "format_version": 5,
+        "format_version": 7,
         "training_protocol": PROTOCOL,
         "target_representation": PROTOCOL,
+        "denoiser_architecture": "conditional_unet_flow_v1",
+        "generative_process": "conditional_flow_matching_v1",
         "sam_frozen": True,
         "latent_channels": 1,
         "prompt": {"scale": 1.0, "terminal_mapping": "clamp"},
-        # 仅扩散轨迹的 Gaussian GRPO 快照版本。
+        # 随机 Flow Matching 积分的 GRPO 快照版本。
         "algorithm": {"name": "grpo", "version": 3},
     }
     return payload
@@ -107,11 +109,11 @@ class JointTrainingTest(unittest.TestCase):
                 tuple(kwargs["field_regions"].shape),
                 tuple(batch["field_regions"].shape),
             )
-            # sampled_seg 与分段重建损失的键名保持不变。
-            for key in ("loss", "diff", "heat", "aux", "seg", "sampled_seg"):
+            # sampled_seg 与分段重建损失的键名保持不变；扩散 diff 改为 flow。
+            for key in ("loss", "flow", "heat", "aux", "seg", "sampled_seg"):
                 self.assertIn(key, losses)
             expected = (
-                losses["diff"]
+                losses["flow"]
                 + engine.heat_weight * losses["heat"]
                 + engine.aux_weight * losses["aux"]
                 + float(config["train"].get("seg_weight", 1.0)) * losses["seg"]
@@ -132,7 +134,7 @@ class JointTrainingTest(unittest.TestCase):
             batch = engine._prepare_batch(
                 next(iter(engine._build_train_loader(0)))
             )
-            # DiT's zero output head blocks upstream derivatives on the very first
+            # UNet's zero output head blocks upstream derivatives on the very first
             # forward. Take one ordinary joint update before testing the pathway.
             sam_before = {k: v.clone() for k, v in engine.sam.state_dict().items()}
             self.assertFalse(engine.sam.training)
@@ -149,7 +151,7 @@ class JointTrainingTest(unittest.TestCase):
             losses = engine._supervised_loss("ABC", batch, 1)
             # Check cross-module coupling, not just gradients from independent losses.
             (losses["seg"] + losses["sampled_seg"]).backward()
-            for module in (engine.condition_encoder, engine.dit):
+            for module in (engine.condition_encoder, engine.unet):
                 gradients = [p.grad for p in module.parameters() if p.grad is not None]
                 self.assertTrue(gradients)
                 self.assertTrue(all(torch.isfinite(g).all() for g in gradients))

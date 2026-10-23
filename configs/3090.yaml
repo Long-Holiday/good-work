@@ -1,6 +1,7 @@
 # 单通道有符号道路山脊场；旧双通道快照禁止直接 resume。
 training_protocol: signed_ridge_v1
 target_representation: signed_ridge_v1
+generative_process: conditional_flow_matching_v1
 sam_frozen: true
 seed: 42
 output_dir: runs/diffpeak
@@ -23,22 +24,31 @@ model:
   sam_config: configs/sam2.1/sam2.1_hiera_b+.yaml
   sam_architecture: sam2.1_hiera_base_plus
   sam_apply_postprocessing: false
-  dit:
+  # 连续时间四尺度 ConditionalUNet；旧 model.dit/扩散配置会被显式拒绝。
+  denoiser_architecture: conditional_unet_flow_v1
+  unet:
     in_channels: 1
-    patch_size: 8
-    hidden_size: 256
-    depth: 6
+    out_channels: 1
+    base_channels: 64
+    channel_mults: [1, 2, 4, 4]
+    num_res_blocks: 2
+    # 仅在 level3（默认 32x32）启用注意力。
+    attention_levels: [3]
     num_heads: 8
-    mlp_ratio: 4.0
     condition_channels: [64, 128, 256, 256]
-    # ABC 恢复完整采样分割反传；显存/吞吐需按当前损失重新核验。
-    gradient_checkpointing: false
+    # ABC 仍需对完整采样分割反传；按显存/吞吐实测量调整。
+    gradient_checkpointing: true
+    # UNet 内部把连续时间 [0,1] 映射到时间嵌入尺度。
+    time_scale: 1000.0
 
-diffusion:
+flow_matching:
   latent_channels: 1
-  timesteps: 1000
   sampling_steps: 20
-  min_std: 0.02
+  # 所有步（含末步）的随机积分策略方差系数；std=policy_std*sqrt(dt)。
+  policy_std: 0.02
+  solver: heun
+  time_scale: 1000.0
+  field_loss_min_time: 0.5
 
 # 对终端场裁剪后以 U=scale*H 输入冻结 SAM，padding 固定为0。
 # scale=1 是待验证初值，需先用标注场接口诊断在验证集选择。
@@ -71,10 +81,10 @@ stages:
 rl:
   algorithm: grpo
   group_size: 4
-  # 单通道联合 SUM log-prob 尺度改变；以下为待校准初值。
+  # 随机 Flow Matching 积分的 GRPO 裁剪半径；以下为待校准初值。
   ppo_clip: 0.0001
   kl_weight: 0.01
-  # 完整 ABC 监督锚定（扩散 + 场重建 + 辅助 + 两条分割监督）；设0关闭。
+  # 完整 ABC 监督锚定（flow + 场重建 + 辅助 + 两条分割监督）；设0关闭。
   anchor_weight: 0.01
   update_epochs: 1
   advantage_std_delta: 0.0001

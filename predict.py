@@ -10,12 +10,12 @@
     python predict.py --checkpoint runs/diffpeak/best.pt \
         --input DeepGlobe_Road/valid --output predictions/valid --save-field
 
-预测流程固定为：等比 resize + 右下 pad 到 1024 -> 条件编码 -> 20 步扩散采样
+预测流程固定为：等比 resize + 右下 pad 到 1024 -> 条件编码 -> 20 步随机 Flow Matching 积分
 单通道有符号道路山脊场 -> 固定尺度/终端映射 -> 冻结 SAM decode_heatmaps ->
 裁 padding -> 恢复原图尺寸。不再提取峰值点。
 
-旧双通道 checkpoint 不能直接用于推理（协议严格拒绝）；如需只迁移形状兼容
-权重，显式使用 ``--migrate-weights``（不恢复优化器状态）。
+旧 DiT checkpoint 不能直接用于推理（协议严格拒绝）；如需只迁移条件编码器
+兼容权重，显式使用 ``--migrate-weights``（不恢复优化器状态）。
 
 分辨率说明：``engine`` 验证在 1024² 画布上按缩放后有效区域计算指标，而本脚本
 把概率图恢复到原图尺寸后再保存/评估。当前 DeepGlobe 影像均为 1024²，两者等价；
@@ -184,7 +184,7 @@ def _predict_directory(
         )
         try:
             # 用相对路径作为 image_id；canonical_image_id 会剥离目录与 _sat，
-            # 与验证/评估对同一张图的扩散种子保持一致。
+            # 与验证/评估对同一张图的生成种子保持一致。
             result = predictor.predict_file(
                 image_path, image_id=str(relative), return_field=save_field
             )
@@ -218,7 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--migrate-weights",
         action="store_true",
-        help="显式迁移旧快照的形状兼容权重（跳过 SAM/输入输出头，不恢复优化器）。",
+        help="显式迁移旧快照的条件编码器兼容权重（不迁移旧 DiT/UNet，不恢复优化器）。",
     )
     parser.add_argument("--limit", type=int, default=None, help="目录模式下最多处理的影像数。")
     return parser

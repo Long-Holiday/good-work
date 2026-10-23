@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from .conditioning import ConditionEncoder
 from .diffusion import GaussianDiffusion
-from .dit import ConditionalDiT
+from .flow_matching import ConditionalFlowMatching
+from .unet import ConditionalUNet
 from .sam import RoadSAM, SAM2ImageFeatures, low_res_features
 
 __all__ = [
@@ -12,6 +13,7 @@ __all__ = [
     "SAM2ImageFeatures",
     "low_res_features",
     "ConditionEncoder",
-    "ConditionalDiT",
+    "ConditionalUNet",
+    "ConditionalFlowMatching",
     "GaussianDiffusion",
 ]

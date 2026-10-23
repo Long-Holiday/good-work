@@ -119,7 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--resume", type=str, default=None, help="完整快照，用于阶段内恢复。")
     parser.add_argument("--init", type=str, default=None, help="仅加载新协议模型权重的上一阶段快照。")
-    parser.add_argument("--migrate-legacy", action="store_true", help="配合 --init 和 --config 显式迁移旧模型的兼容扩散权重；不加载 SAM、输入输出头或优化器。")
+    parser.add_argument("--migrate-legacy", action="store_true", help="配合 --init 和 --config 显式迁移旧条件编码器的兼容权重；不加载 SAM、旧 DiT/UNet 权重或优化器。")
     parser.add_argument("--device", type=str, default=None, help="例如 cuda、cuda:0、cpu。")
     parser.add_argument(
         "--seed",
@@ -217,7 +217,7 @@ def _run_training(parser, args, config, preloaded, engine, experiment) -> None:
             raise ValueError("--resume 必须指向本项目生成的完整训练快照")
         # Also validate already-completed stages, which bypass run_stage below.
         engine._validate_resume_algorithm(resume_payload)
-        # run_stage 自身会严格加载模型权重（含 D 的 ref_dit）；
+        # run_stage 自身会严格加载模型权重（含 D 的 ref_unet）；
         # 这里不要预加载或删除 payload.models，避免重复加载/破坏严格恢复。
         resume_stage = str(resume_payload.get("stage", "")).upper()
         resume_epoch = int(resume_payload.get("epoch", 0))
