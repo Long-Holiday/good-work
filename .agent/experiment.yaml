@@ -24,8 +24,8 @@
   "plan": {
     "schema_version": 3,
     "name": "DiffPeak-SAM 模型训练",
-    "revision": 166,
-    "updated_at": "2026-10-23T06:47:47+00:00",
+    "revision": 170,
+    "updated_at": "2026-10-23T09:09:03+00:00",
     "next_instance": 4,
     "next_flow": 4,
     "instances": [
@@ -311,11 +311,11 @@
         "duration_minutes": 540,
         "not_before": null,
         "status": "running",
-        "progress": 3.4404283801874165,
+        "progress": 2.603748326639893,
         "started_at": "2026-10-23T05:55:45+00:00",
         "finished_at": null,
-        "checked_at": "2026-10-23T06:47:47+00:00",
-        "progress_at": "2026-10-23T06:47:47+00:00",
+        "checked_at": "2026-10-23T09:09:03+00:00",
+        "progress_at": "2026-10-23T09:09:03+00:00",
         "note": ""
       },
       {
@@ -522,10 +522,10 @@
         "instance": "I02",
         "flow": "F03",
         "task": "阶段ABC:联合预训练",
-        "status": "running",
+        "status": "cancelled",
         "started_at": "2026-10-23T05:55:55+00:00",
-        "finished_at": null,
-        "version": 4,
+        "finished_at": "2026-10-23T07:59:56+00:00",
+        "version": 5,
         "metric_name": "IoU",
         "direction": "max",
         "dataset_version": "protocol_v1",
@@ -535,17 +535,17 @@
         "git_commit": "4ada54e",
         "config_path": "configs/3090.yaml",
         "artifacts": "runs/diffpeak/experiments/20261023T055530.784297Z_edd976db",
-        "evidence": "seetacloud1:2266 [ABC] Epoch 2 completed, Val IoU=0.1785 (+22.1% vs ep1 0.1461), clDice=0.2922 (+22.4%), F1=0.2674, train_loss=2.6401, empty_pred=0.0%",
-        "checked_at": "2026-10-23T06:47:52+00:00",
+        "evidence": "seetacloud1:2266 [ABC] cancelled at epoch 5 due to model architecture update",
+        "checked_at": "2026-10-23T07:59:56+00:00",
         "sync": {
           "target": {
             "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
             "table_id": "tblb4w3LcaUO1w0A"
           },
-          "sent_version": 4,
+          "sent_version": 5,
           "record_id": "reczz28QkCH2Ltqv",
-          "fingerprint": "8fa93b8d69e7c3c0d2d41e8c13b1f89b0e1751057a71f917950c1583f6e97672",
-          "synced_at": "2026-10-23T06:47:55+00:00"
+          "fingerprint": "13bbe50c18f71e62a5bc055851cebf10d69bbae69eda9e989ba038d7fdeebabf",
+          "synced_at": "2026-10-23T08:00:00+00:00"
         },
         "extra_metrics": {
           "loss": 2.6401,
@@ -553,7 +553,83 @@
           "F1": 0.2674,
           "reward": 0.224
         },
-        "metric_value": 0.1785
+        "metric_value": 0.1785,
+        "suggestion": "模型架构更新（ABC 移除 SAM 分割监督），启动新 Run"
+      },
+      "diffpeak-sam-ridge-run02": {
+        "run_id": "diffpeak-sam-ridge-run02",
+        "task_id": "F03-T02",
+        "instance": "I02",
+        "flow": "F03",
+        "task": "阶段ABC:联合预训练",
+        "status": "cancelled",
+        "started_at": "2026-10-23T08:01:24+00:00",
+        "finished_at": "2026-10-23T09:08:31+00:00",
+        "version": 3,
+        "metric_name": "IoU",
+        "direction": "max",
+        "dataset_version": "protocol_v1",
+        "eval_protocol": "protocol_v1",
+        "intent": "DiffPeak-SAM 重构新架构训练（ABC阶段移除SAM分割监督，保留扩散+场重建+辅助，SAM仅供评估与D阶段强化学习）",
+        "change": "最新提交 622fd99：L_ABC = L_diff + 0.1*L_heat + 0.2*L_aux，移除 seg/sampled_seg 密集反传",
+        "git_commit": "622fd99",
+        "config_path": "configs/3090.yaml",
+        "artifacts": "runs/diffpeak/experiments/20261023T080007.249187Z_72b127a5",
+        "evidence": "已完成 Epoch 1 全量评估 (IoU 0.0251, Loss 0.276)；因探针筛选出最优超参，由 diffpeak-sam-ridge-run03 接替并归档",
+        "checked_at": "2026-10-23T09:08:31+00:00",
+        "sync": {
+          "target": {
+            "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
+            "table_id": "tblb4w3LcaUO1w0A"
+          },
+          "sent_version": 3,
+          "record_id": "reczz28QmKpFiI88",
+          "fingerprint": "e8c04152d318f73c2d8f1966875e1171a1080d588e01cf8239101ac1e0aa8e9e",
+          "synced_at": "2026-10-23T09:08:35+00:00"
+        },
+        "extra_metrics": {
+          "loss": 0.276
+        },
+        "suggestion": "已由最优超参 Run 03 接替"
+      },
+      "diffpeak-sam-ridge-run03": {
+        "run_id": "diffpeak-sam-ridge-run03",
+        "task_id": "F03-T02",
+        "instance": "I02",
+        "flow": "F03",
+        "task": "阶段ABC:联合预训练",
+        "status": "running",
+        "started_at": "2026-10-23T09:08:42+00:00",
+        "finished_at": null,
+        "version": 1,
+        "metric_name": "IoU",
+        "direction": "max",
+        "dataset_version": "protocol_v1",
+        "eval_protocol": "protocol_v1",
+        "intent": "探针选定最优超参 (lr=3e-5, batch=4, workers=8, val_every=1) 正式训练",
+        "change": "锁定单通道山脊场超参，workers 扩展至 8，val_every=1，清理旧日志与重定向 TensorBoard",
+        "git_commit": "622fd99",
+        "config_path": "configs/3090.yaml",
+        "artifacts": "runs/diffpeak_selected_20261023T085600",
+        "metric_value": 0.02857,
+        "evidence": "seetacloud1:17196 Epoch 1 完成，Val IoU=0.02857，clDice=0.04870，空预测率 4.33%，当前推进至 Epoch 2 step 640，Loss=0.248~0.309",
+        "extra_metrics": {
+          "loss": 0.292,
+          "cldice": 0.0487,
+          "f1": 0.0457,
+          "empty_pred": 0.0433
+        },
+        "checked_at": "2026-10-23T09:08:42+00:00",
+        "sync": {
+          "target": {
+            "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
+            "table_id": "tblb4w3LcaUO1w0A"
+          },
+          "sent_version": 1,
+          "record_id": "reczz28QnTyZnqPn",
+          "fingerprint": "4b54929771db927f3f2860fd8ca75abcf06ec2d790eb91f198c100f2540408f2",
+          "synced_at": "2026-10-23T09:08:50+00:00"
+        }
       }
     }
   }

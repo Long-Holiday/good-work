@@ -31,7 +31,7 @@ model:
     num_heads: 8
     mlp_ratio: 4.0
     condition_channels: [64, 128, 256, 256]
-    # 延续旧吞吐配置作为起点；新协议尚需重新实测显存和吞吐。
+    # 2026-10-23 seetacloud1 单通道探针选择；证据见 docs/probe_3090.md。
     gradient_checkpointing: false
 
 diffusion:
@@ -56,12 +56,13 @@ train:
   heat_weight: 0.1
   aux_weight: 0.2
   save_every: 1
+  val_every: 1
   warmup_steps: 0
   warmup_ratio: 0.05
   min_lr_ratio: 0.05
 
 stages:
-  ABC: {epochs: 60, lr: 0.0001, batch_size: 4, accumulation_steps: 1, num_workers: 4}
+  ABC: {epochs: 60, lr: 0.00003, batch_size: 4, accumulation_steps: 1, num_workers: 8}
   D: {epochs: 10, lr: 0.0000003, batch_size: 1, accumulation_steps: 1, warmup_ratio: 0.1, min_lr_ratio: 0.1}
 
 rl:
