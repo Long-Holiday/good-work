@@ -24,8 +24,8 @@
   "plan": {
     "schema_version": 3,
     "name": "DiffPeak-SAM 模型训练",
-    "revision": 173,
-    "updated_at": "2026-10-23T10:10:41+00:00",
+    "revision": 174,
+    "updated_at": "2026-10-23T10:39:54+00:00",
     "next_instance": 4,
     "next_flow": 4,
     "instances": [
@@ -311,11 +311,11 @@
         "duration_minutes": 540,
         "not_before": null,
         "status": "running",
-        "progress": 1.6666666666666667,
+        "progress": 3.3467202141900936,
         "started_at": "2026-10-23T05:55:45+00:00",
         "finished_at": null,
-        "checked_at": "2026-10-23T10:10:41+00:00",
-        "progress_at": "2026-10-23T10:10:41+00:00",
+        "checked_at": "2026-10-23T10:39:54+00:00",
+        "progress_at": "2026-10-23T10:39:54+00:00",
         "note": ""
       },
       {
@@ -646,7 +646,7 @@
         "status": "running",
         "started_at": "2026-10-23T09:57:53+00:00",
         "finished_at": null,
-        "version": 2,
+        "version": 3,
         "metric_name": "IoU",
         "direction": "max",
         "dataset_version": "protocol_v1",
@@ -656,25 +656,31 @@
         "git_commit": "master",
         "config_path": "configs/3090.yaml",
         "artifacts": "runs/diffpeak_seg_restored_20261023T094816",
-        "evidence": "seetacloud1:21375 [ABC] Epoch 1 完成 (Step 1245/74700)，正在执行全量623张验证集评估。Train Loss收敛至2.188 (seg=1.016, sampled_seg=0.979, diff=0.029, aux=0.617)，VRAM 16.7GB稳定",
+        "evidence": "seetacloud1:21375 [ABC] Epoch 2 完成，Val IoU=0.2350 (+19.2% vs Ep1 0.1971), clDice=0.3760, F1=0.3468, 空预测率 0.0%；已进入 Epoch 3，VRAM 16.7GB，GPU 100% 满载稳定",
         "extra_metrics": {
-          "loss": 2.1885,
+          "loss": 2.3715,
           "seg_loss": 1.0163,
           "sampled_seg_loss": 0.9789,
           "diff_loss": 0.0291,
-          "aux_loss": 0.6169
+          "aux_loss": 0.6169,
+          "val_iou": 0.235,
+          "val_cldice": 0.376,
+          "val_f1": 0.3468,
+          "empty_pred": 0.0,
+          "reward": 0.2914
         },
-        "checked_at": "2026-10-23T10:10:48+00:00",
+        "checked_at": "2026-10-23T10:40:00+00:00",
         "sync": {
           "target": {
             "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
             "table_id": "tblb4w3LcaUO1w0A"
           },
-          "sent_version": 2,
+          "sent_version": 3,
           "record_id": "reczz28QoJrm7isA",
-          "fingerprint": "3f8bb41ab515833746cd3393b415f1f9dba1a3ecd3f16b1bb560a7079e8efb9d",
-          "synced_at": "2026-10-23T10:10:53+00:00"
-        }
+          "fingerprint": "86253b4238161b9854062af079dc4c45fd2d9bb99452031a0cf9dacc39dd0e24",
+          "synced_at": "2026-10-23T10:40:04+00:00"
+        },
+        "metric_value": 0.23503
       }
     }
   }
