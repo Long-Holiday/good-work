@@ -438,7 +438,13 @@ def phase_d(
     ref_generator.manual_seed(SEED + 1)
     with torch.no_grad():
         for param in ref_dit.parameters():
-            param.add_(torch.randn_like(param, generator=ref_generator) * 1e-4)
+            noise = torch.randn(
+                param.shape,
+                device=param.device,
+                dtype=param.dtype,
+                generator=ref_generator,
+            )
+            param.add_(noise * 1e-4)
             param.requires_grad_(False)
 
     ref_mean_stats: List[float] = []
