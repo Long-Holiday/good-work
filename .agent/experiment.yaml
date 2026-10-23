@@ -24,8 +24,8 @@
   "plan": {
     "schema_version": 3,
     "name": "DiffPeak-SAM 模型训练",
-    "revision": 181,
-    "updated_at": "2026-10-23T12:48:55+00:00",
+    "revision": 194,
+    "updated_at": "2026-10-23T16:50:23+00:00",
     "next_instance": 4,
     "next_flow": 4,
     "instances": [
@@ -54,9 +54,9 @@
         "name": "3090训练机(seetacloud1)",
         "autodl_id": "5ab641bae4-71bb2ef0",
         "ssh_alias": "seetacloud1",
-        "status": "on",
-        "observed_at": "2026-10-23T12:47:52+00:00",
-        "note": "",
+        "status": "off",
+        "observed_at": "2026-10-23T16:50:23+00:00",
+        "note": "用户指令取消任务，已关机止付",
         "price": null,
         "mode": "gpu",
         "no_gpu_price": 0.1,
@@ -310,13 +310,13 @@
         ],
         "duration_minutes": 540,
         "not_before": null,
-        "status": "pending",
-        "progress": null,
-        "started_at": null,
-        "finished_at": null,
-        "checked_at": null,
-        "progress_at": null,
-        "note": "使用Flow Matching与多尺度UNet新模型"
+        "status": "cancelled",
+        "progress": 1.6666666666666667,
+        "started_at": "2026-10-23T12:52:17+00:00",
+        "finished_at": "2026-10-23T16:48:45+00:00",
+        "checked_at": "2026-10-23T16:48:45+00:00",
+        "progress_at": "2026-10-23T16:39:20+00:00",
+        "note": "用户指令取消任务并关机；产物与检查点已完整保存"
       },
       {
         "id": "F03-T03",
@@ -686,6 +686,95 @@
         },
         "metric_value": 0.23503,
         "suggestion": "已落盘最优检查点，可直接用于下游评估或离线测试"
+      },
+      "diffpeak-sam-ridge-run05": {
+        "run_id": "diffpeak-sam-ridge-run05",
+        "task_id": "F03-T02",
+        "instance": "I02",
+        "flow": "F03",
+        "task": "阶段ABC:联合预训练",
+        "status": "cancelled",
+        "started_at": "2026-10-23T12:52:30+00:00",
+        "finished_at": "2026-10-23T15:07:24+00:00",
+        "version": 7,
+        "metric_name": "IoU",
+        "direction": "max",
+        "dataset_version": "protocol_v1",
+        "eval_protocol": "protocol_v1",
+        "intent": "新模型训练：条件 Flow Matching 速度监督与四尺度条件 U-Net 架构单通道有符号山脊场联合预训练",
+        "change": "骨干迁移为多尺度 U-Net + 连续时间 Flow Matching (f2e3eb3)；全冻结 SAM2.1；ABC batch=2, accum=2，20步可微Heun积分采样反传",
+        "git_commit": "f2e3eb3",
+        "config_path": "configs/3090.yaml",
+        "artifacts": "runs/diffpeak/experiments/20261023T125143.718367Z_85b72481",
+        "baseline": "diffpeak-sam-ridge-run04",
+        "checked_at": "2026-10-23T15:07:24+00:00",
+        "sync": {
+          "target": {
+            "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
+            "table_id": "tblb4w3LcaUO1w0A"
+          },
+          "sent_version": 7,
+          "record_id": "reczz28QrIK5q9Av",
+          "fingerprint": "f337dda79ca9ddaa9372b8445203ff6f6c14fb48d7ca92ef3368e87dd838f168",
+          "synced_at": "2026-10-23T15:07:26+00:00"
+        },
+        "evidence": "seetacloud1:/root/autodl-tmp/runs/diffpeak/console.log (Epoch 1 Step 1630 Loss=3.9116, flow=0.9938, seg=1.3168, sampled_seg=1.3583, aux=1.1833)",
+        "extra_metrics": {
+          "loss": 4.2447,
+          "flow": 1.2517,
+          "seg": 1.3533,
+          "sampled_seg": 1.3837,
+          "aux": 1.2147,
+          "heat": 0.1303
+        },
+        "suggestion": "推进至 Step 1630 (Flow Loss 破 1.0 达 0.9938，Total Loss 3.9116)；由 8 步 Heun 分层时间采样优化版本 Run 06 接替"
+      },
+      "diffpeak-sam-ridge-run06": {
+        "run_id": "diffpeak-sam-ridge-run06",
+        "task_id": "F03-T02",
+        "instance": "I02",
+        "flow": "F03",
+        "task": "阶段ABC:联合预训练",
+        "status": "cancelled",
+        "started_at": "2026-10-23T15:09:03+00:00",
+        "finished_at": "2026-10-23T16:47:30+00:00",
+        "version": 7,
+        "metric_name": "IoU",
+        "direction": "max",
+        "dataset_version": "protocol_v1",
+        "eval_protocol": "protocol_v1",
+        "intent": "8步分层Heun采样优化：分层时间采样保证批次包含t>=0.5场监督，采样步数由20缩短至8加速2.4倍，heat_weight校正为0.075",
+        "change": "batch_size=4, accum=1；sampling_steps=8, time_sampling=stratified, heat_weight=0.075；U-Net + Flow Matching (be237a8)",
+        "git_commit": "be237a8",
+        "config_path": "configs/3090.yaml",
+        "artifacts": "runs/diffpeak_flow8_b4_stratified_20261023/experiments/20261023T151733.455961Z_161fd38e",
+        "baseline": "diffpeak-sam-ridge-run05",
+        "checked_at": "2026-10-23T16:47:47+00:00",
+        "sync": {
+          "target": {
+            "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
+            "table_id": "tblb4w3LcaUO1w0A"
+          },
+          "sent_version": 7,
+          "record_id": "reczz28QtcYfK55z",
+          "fingerprint": "3086359abeb41f41c8a3ea40f97676ef359fbf6d53bdfc1ae37766e00549f241",
+          "synced_at": "2026-10-23T16:47:51+00:00"
+        },
+        "evidence": "seetacloud1:/root/autodl-tmp/runs/diffpeak_flow8_b4_stratified_20261023/ (用户指令取消任务并关机；进程已终止，检查点 best.pt 完整保留)",
+        "extra_metrics": {
+          "loss": 4.2502,
+          "flow": 0.7032,
+          "seg": 1.1441,
+          "sampled_seg": 1.1822,
+          "aux": 1.1447,
+          "heat": 0.0869,
+          "clDice": 0.0697,
+          "F1": 0.061,
+          "reward": 0.0513,
+          "sign_agreement": 0.8754,
+          "empty_rate": 0.0883
+        },
+        "metric_value": 0.0389
       }
     }
   }
