@@ -94,6 +94,31 @@ class TestFlowMatching(unittest.TestCase):
             with self.subTest(start=start, end=end), self.assertRaises(ValueError):
                 flow.transition(ConstantVelocity(), state, start, end, self.features())
 
+    def test_stratified_time_covers_each_bin_and_randomizes_images(self):
+        flow = ConditionalFlowMatching(time_sampling="stratified")
+        torch.manual_seed(42)
+        times = torch.stack([flow._sample_training_time(2, torch.device("cpu")) for _ in range(128)])
+        self.assertTrue(((times >= 0) & (times < 1)).all())
+        self.assertTrue(((times >= 0.5).sum(dim=1) == 1).all())
+        for column in times.T:
+            self.assertTrue((column < 0.5).any())
+            self.assertTrue((column >= 0.5).any())
+        for batch in (1, 3, 4):
+            time = flow._sample_training_time(batch, torch.device("cpu"))
+            torch.testing.assert_close((time * batch).long().sort().values, torch.arange(batch))
+
+    def test_stratified_field_supervision_keeps_gradients(self):
+        flow = ConditionalFlowMatching(time_sampling="stratified")
+        model = ConstantVelocity()
+        target = torch.zeros(2, 1, 8, 8)
+        losses = flow.training_losses(model, self.features(), target)
+        self.assertGreater(losses["heat"].item(), 0)
+        losses["heat"].backward()
+        self.assertTrue(torch.isfinite(model.value.grad))
+        self.assertNotEqual(model.value.grad.item(), 0)
+        with self.assertRaises(ValueError):
+            ConditionalFlowMatching(time_sampling="invalid")
+
     def test_invalid_config(self):
         for kwargs in ({"policy_std": 0}, {"solver": "ddim"}, {"sampling_steps": 0}, {"time_scale": 0}, {"field_loss_min_time": 2}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):

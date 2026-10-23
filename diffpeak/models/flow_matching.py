@@ -37,7 +37,7 @@ class ConditionalFlowMatching(nn.Module):
         self, sampling_steps: int = 20, policy_std: float = 0.02,
         latent_channels: int = 1, heatmap_size: int = 256,
         time_scale: float = 1000.0, field_loss_min_time: float = 0.5,
-        solver: str = "heun",
+        solver: str = "heun", time_sampling: str = "uniform",
     ) -> None:
         super().__init__()
         if isinstance(sampling_steps, bool) or not isinstance(sampling_steps, int) or sampling_steps <= 0:
@@ -52,6 +52,9 @@ class ConditionalFlowMatching(nn.Module):
             raise ValueError("field_loss_min_time 必须在[0,1]内")
         if solver not in ("euler", "heun"):
             raise ValueError("solver 只支持 euler 或 heun")
+        if time_sampling not in ("uniform", "stratified"):
+            raise ValueError("time_sampling 只支持 uniform 或 stratified")
+        self.time_sampling = time_sampling
         self.sampling_steps = int(sampling_steps)
         self.policy_std = float(policy_std)
         self.latent_channels = 1
@@ -78,6 +81,15 @@ class ConditionalFlowMatching(nn.Module):
             raise ValueError("Flow Matching 时间必须为[0,1]内有限浮点数")
         return result
 
+    def _sample_training_time(self, batch: int, device: torch.device) -> Tensor:
+        time = torch.rand(batch, device=device, dtype=torch.float32)
+        if self.time_sampling == "stratified":
+            # 每个等宽时间层取一个样本，再随机分配到图像，保持各图像的均匀边缘分布。
+            # batch=1 自然退化为均匀采样；batch=2 确保一张位于 [0.5, 1)。
+            time = (torch.arange(batch, device=device) + time) / batch
+            time = time[torch.randperm(batch, device=device)]
+        return time
+
     def training_losses(
         self, unet: nn.Module, conditions: Sequence[Tensor], target_heatmaps: Tensor,
         return_prediction: bool = False, valid_mask: Optional[Tensor] = None,
@@ -87,7 +99,7 @@ class ConditionalFlowMatching(nn.Module):
             raise ValueError("target_heatmaps 必须为 B x 1 x H x W")
         target = target_heatmaps.float()
         valid = self._prepare_valid_mask(valid_mask, target)
-        time = torch.rand(target.shape[0], device=target.device, dtype=torch.float32)
+        time = self._sample_training_time(target.shape[0], target.device)
         blend = time[:, None, None, None]
         noise = torch.randn_like(target)
         state = (1 - blend) * noise + blend * target

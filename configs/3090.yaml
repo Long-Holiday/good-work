@@ -43,7 +43,8 @@ model:
 
 flow_matching:
   latent_channels: 1
-  sampling_steps: 20
+  sampling_steps: 8
+  time_sampling: stratified
   # 所有步（含末步）的随机积分策略方差系数；std=policy_std*sqrt(dt)。
   policy_std: 0.02
   solver: heun
@@ -65,7 +66,8 @@ train:
   grad_clip: 1.0
   seg_weight: 1.0
   sampled_seg_weight: 1.0
-  heat_weight: 0.1
+  # batch=2、t>=0.5：分层后每批均有场监督，以 0.75 校正原先空批带来的期望差异。
+  heat_weight: 0.075
   aux_weight: 0.2
   cldice_weight: 0.2
   save_every: 1

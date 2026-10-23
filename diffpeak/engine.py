@@ -816,6 +816,10 @@ class DiffPeakEngine:
         validate_checkpoint_protocol(payload, self.config)
         if int(payload.get("format_version", 0)) < CHECKPOINT_FORMAT_VERSION:
             raise ValueError("旧快照不能 --resume；请显式 --init --migrate-legacy 迁移兼容权重")
+        saved_sampling = payload.get("config", {}).get("flow_matching", {}).get("time_sampling", "uniform")
+        current_sampling = self.config.get("flow_matching", {}).get("time_sampling", "uniform")
+        if saved_sampling != current_sampling:
+            raise ValueError("时间采样策略改变，不能 --resume；请开始新实验")
         saved_train = payload.get("config", {}).get("train", {})
         for key in (("seg_weight", "sampled_seg_weight", "cldice_weight") if "config" in payload else ()):
             default = 0.2 if key == "cldice_weight" else 1.0

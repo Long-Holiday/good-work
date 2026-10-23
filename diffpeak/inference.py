@@ -1006,6 +1006,7 @@ def build_models(
                 flow_cfg.get("field_loss_min_time", 0.5)
             ),
             solver=str(flow_cfg.get("solver", "heun")),
+            time_sampling=str(flow_cfg.get("time_sampling", "uniform")),
             policy_std=float(flow_cfg.get("policy_std", 0.02)),
         ),
     }

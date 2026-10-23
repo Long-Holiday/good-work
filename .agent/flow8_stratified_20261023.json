@@ -1,0 +1,23 @@
+{
+  "host": "seetacloud1",
+  "status": "running",
+  "started_at": "2026-10-23T15:05:32Z",
+  "pid": 6208,
+  "tmux_session": "train_flow8_stratified",
+  "output_dir": "/root/autodl-tmp/runs/diffpeak_flow8_stratified_20261023",
+  "experiment_id": "20261023T150532.158144Z_43e25968",
+  "backup_dir": "/root/autodl-tmp/flow8_stratified_20261023/before",
+  "previous_pid": 1986,
+  "previous_stop": "User-authorized SIGINT; no completed-epoch checkpoint existed. Old logs retained. New run starts from fresh trainable weights and official SAM weights.",
+  "changes": {
+    "sampling_steps": 8,
+    "solver": "heun",
+    "time_sampling": "stratified",
+    "heat_weight": 0.075,
+    "seg_weight": 1.0,
+    "sampled_seg_weight": 1.0
+  },
+  "unchanged": {"batch_size": 2, "accumulation_steps": 2, "gradient_checkpointing": true, "warmup_steps": 3735},
+  "validation": "Remote deployed tests: 33 passed, 19 subtests passed; first 10 microbatches have finite logged losses. Local tests could not collect because torch is not installed.",
+  "code_state": "Uncommitted modifications deployed; existing .agent/experiment.yaml modifications untouched."
+}
