@@ -2,7 +2,7 @@
 
 **单通道有符号山脊场 → 全冻结 SAM → 道路分割**：ABC 监督预训练与 D 扩散轨迹 GRPO 只更新条件编码器和 DiT。SAM2.1 的图像、提示、掩码模块与高分辨率投影全阶段冻结；不再提取离散正负点。当前协议为 `signed_ridge_v1`。当前协议见 [`docs/joint_training.md`](docs/joint_training.md)；旧四阶段实验与 `docs/model_grpo.md` 作为历史记录。
 
-> 旧四阶段的 GPU 探针与测试结果不代表新联合训练已收敛；新协议需要重新测量训练显存、吞吐及验证集完整 SAM 分割质量。历史实测见 [`docs/probe_3090.md`](docs/probe_3090.md)，日志使用见 [`docs/experiments.md`](docs/experiments.md)。
+> 旧四阶段的 GPU 探针与测试结果不代表新联合训练已收敛；新协议需要重新测量完整采样反传的显存、吞吐及验证集质量。历史实测见 [`docs/probe_3090.md`](docs/probe_3090.md)，日志使用见 [`docs/experiments.md`](docs/experiments.md)。
 
 ## 1. 环境与权重（自行安装）
 
@@ -110,7 +110,7 @@ diffpeak/
   data/                    数据读取、增强、有符号山脊场与有效区域
   data/ridge.py            山脊场构造、分区与细道路投影
   models/
-    sam.py                 SAM2.1 封装：全冻结模型、高分辨率图像特征与保留的可微密集提示接口
+    sam.py                 SAM2.1 封装：全冻结模型、高分辨率特征与可微密集提示
     conditioning.py        细节 CNN、多尺度条件与辅助头
     dit.py                 条件 DiT 去噪器（默认）
     diffusion.py           噪声监督、随机采样、轨迹对数概率
@@ -128,10 +128,10 @@ train.py / predict.py / evaluate.py
 
 | 阶段 | 更新参数 | 目标 |
 |---|---|---|
-| ABC | 条件编码器、DiT | 扩散、四区域场重建、辅助道路/骨架；SAM 图像编码器仅提供特征，不计算 SAM 分割损失 |
-| D | 条件编码器、DiT | 扩散轨迹 GRPO、固定参考 KL、可配置新 ABC 监督锚定 |
+| ABC | 条件编码器、DiT | 扩散、四区域场重建、辅助道路/骨架、一步重建与纯噪声完整采样分割 |
+| D | 条件编码器、DiT | 扩散轨迹 GRPO、固定参考 KL、可配置完整 ABC 锚定 |
 
-SAM 始终冻结且 eval。ABC 仅在 `no_grad` 下使用 SAM 图像编码器特征，不进行 SAM 最终分割监督，也不在训练中执行完整可微采样；SAM 的可微提示→分割接口保留供验证、推理与诊断，但不是训练需求。验证与推理直接将单通道场按固定尺度送入完整 SAM，再对概率阈值化。D 使用相同的确定性分割评分，随机性来自扩散轨迹；不采样终端 Bernoulli 掩码。
+SAM 始终冻结且 eval，分割监督仍保留场输入的梯度。验证与推理直接将单通道场按固定尺度送入 SAM，再对概率阈值化。D 使用相同的确定性分割评分，随机性来自扩散轨迹；不采样终端 Bernoulli 掩码。
 
 ```bash
 # 无需 SAM 权重：检查场、padding 和细道路保留
@@ -198,7 +198,7 @@ tensorboard --logdir runs/diffpeak --port 6006
 - 随机转移包括末步均保持正标准差；记录原始高斯动作后再裁剪终端输出，轨迹概率按原始动作重放。
 - 每图 G 条轨迹独立形成奖励组，优势为 `(R-mean(R))/max(std(R),delta)`；常量组优势为0，低方差非零组仍学习。高斯联合 log-prob 与 KL 对动作维求和，再按样本、轨迹和时间步平均。
 - 默认奖励 `0.6*IoU+0.4*clDice`，路径代理默认关闭，候选之间固定奖励随机种子。不奖励点数、峰谷、高频或幅度对比。
-- D 固定参考条件编码器与 DiT，不创建参考 SAM。`anchor_weight=0.01` 保留新 ABC 监督锚定（`L_diff + heat_weight*L_field + aux_weight*L_aux`），设0消融。单通道改变概率尺度，裁剪、KL 与更新幅度需重新校准。
+- D 固定参考条件编码器与 DiT，不创建参考 SAM。`anchor_weight=0.01` 保留完整 ABC 监督锚定，设0消融。单通道改变概率尺度，裁剪、KL 与更新幅度需重新校准。
 
 ## 6. 实验边界
 

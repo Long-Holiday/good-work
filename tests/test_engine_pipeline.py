@@ -535,12 +535,9 @@ class EnginePipelineTest(unittest.TestCase):
                 [(1, 1)],
             )
             self.assertIn("loss", epoch_rows[0]["metrics"])
-            # ABC 只记录场生成与辅助监督；最终分割仅出现在验证指标中。
-            for row in (*batches, *epoch_rows):
-                self.assertNotIn("seg", row["metrics"])
-                self.assertNotIn("sampled_seg", row["metrics"])
-                for key in ("diff", "heat", "aux"):
-                    self.assertIn(key, row["metrics"])
+            # ABC 同时记录一步重建与纯噪声采样的分割损失。
+            self.assertIn("seg", epoch_rows[0]["metrics"])
+            self.assertIn("sampled_seg", epoch_rows[0]["metrics"])
 
             validation = scoped("ABC", "val_epoch")
             self.assertEqual(

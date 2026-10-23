@@ -1,6 +1,6 @@
 """Signed ridge diffusion training: ABC supervision and diffusion-only GRPO.
 
-ABC uses frozen SAM image features; SAM segmentation supplies D rewards and validation.
+SAM stays frozen and in eval mode while retaining derivatives with respect to fields.
 """
 
 from __future__ import annotations
@@ -47,8 +47,9 @@ from diffpeak.inference import (
     resolve_sam_checkpoint,
     resolve_split_file,
     seed_everything,
+    stable_seed,
 )
-from diffpeak.losses import auxiliary_loss
+from diffpeak.losses import auxiliary_loss, segmentation_loss
 from diffpeak.schedules import resolve_warmup_steps, warmup_cosine_factor
 
 __all__ = ["DiffPeakEngine", "STAGE_ORDER"]
@@ -133,15 +134,6 @@ class DiffPeakEngine:
 
         self.data_cfg = dict(self.config.get("data", {}))
         self.train_cfg = dict(self.config.get("train", {}))
-        legacy_seg_keys = {"seg_weight", "sampled_seg_weight", "cldice_weight"} & self.train_cfg.keys()
-        if legacy_seg_keys:
-            warnings.warn(
-                "ABC 已移除 SAM 分割监督，忽略旧 train 配置：" + ", ".join(sorted(legacy_seg_keys)),
-                RuntimeWarning,
-            )
-            for key in legacy_seg_keys:
-                self.train_cfg.pop(key)
-            self.config["train"] = dict(self.train_cfg)
         self.stage_cfgs = dict(self.config.get("stages", {}))
         self.rl_cfg = dict(self.config.get("rl", {}))
         self.model_cfg = dict(self.config.get("model", {}))
@@ -192,6 +184,7 @@ class DiffPeakEngine:
         self.num_workers = max(0, int(self.data_cfg.get("num_workers", 0)))
         self.heat_weight = float(self.train_cfg.get("heat_weight", 0.1))
         self.aux_weight = float(self.train_cfg.get("aux_weight", 0.2))
+        self.cldice_weight = float(self.train_cfg.get("cldice_weight", 0.2))
         self.weight_decay = float(self.train_cfg.get("weight_decay", 0.01))
         self.grad_clip = float(self.train_cfg.get("grad_clip", 1.0))
         self.save_every = max(1, int(self.train_cfg.get("save_every", 1)))
@@ -613,16 +606,40 @@ class DiffPeakEngine:
             embeddings = encode_images(self.sam, images, valid_sizes)
         conditions, auxiliary_logits = self.condition_encoder(images, embeddings)
         losses = self.diffusion.training_losses(
-            self.dit, conditions, batch["heatmaps"],
+            self.dit, conditions, batch["heatmaps"], return_prediction=True,
             valid_mask=batch.get("field_valid_mask"), field_regions=batch.get("field_regions"),
         )
+        reconstructed = self.sam.decode_heatmaps(
+            embeddings, losses["heat_pred"], output_size=tuple(masks.shape[-2:]),
+            valid_sizes=valid_sizes,
+        )
+        generated_heatmaps = self.diffusion.sample_differentiable(
+            self.dit, conditions,
+            generator=make_generator(stable_seed(self.seed, "ABC", epoch, *batch["ids"])),
+        )
+        generated = self.sam.decode_heatmaps(
+            embeddings, generated_heatmaps, output_size=tuple(masks.shape[-2:]),
+            valid_sizes=valid_sizes,
+        )
+        def seg_loss(logits):
+            return torch.stack([
+                segmentation_loss(
+                    logits[i:i + 1, :, :h, :w], masks[i:i + 1, :, :h, :w],
+                    cldice_weight=self.cldice_weight,
+                )
+                for i, (h, w) in enumerate(valid_sizes)
+            ]).mean()
+        segmentation = seg_loss(reconstructed)
+        sampled_segmentation = seg_loss(generated)
         auxiliary = auxiliary_loss(auxiliary_logits, masks, batch["skeleton"], valid_sizes=valid_sizes)
         total = (
             losses["diff"] + self.heat_weight * losses["heat"]
             + self.aux_weight * auxiliary
+            + float(self.train_cfg.get("seg_weight", 1.0)) * segmentation
+            + float(self.train_cfg.get("sampled_seg_weight", 1.0)) * sampled_segmentation
         )
         return {"loss": total, "diff": losses["diff"], "heat": losses["heat"],
-                "aux": auxiliary}
+                "aux": auxiliary, "seg": segmentation, "sampled_seg": sampled_segmentation}
 
     # ------------------------------------------------------------------
     # 训练循环
@@ -664,6 +681,8 @@ class DiffPeakEngine:
                     had_gradient = True
                 record = {
                     "loss": _scalar(loss),
+                    "seg": _scalar(loss_dict.get("seg")),
+                    "sampled_seg": _scalar(loss_dict.get("sampled_seg")),
                     "aux": _scalar(loss_dict.get("aux")),
                     "diff": _scalar(loss_dict.get("diff")),
                     "heat": _scalar(loss_dict.get("heat")),
@@ -700,7 +719,7 @@ class DiffPeakEngine:
                 )
 
         stats: Dict[str, float] = {}
-        for key in ("loss", "aux", "diff", "heat"):
+        for key in ("loss", "seg", "sampled_seg", "aux", "diff", "heat"):
             values = [
                 record[key]
                 for record in records
@@ -796,11 +815,16 @@ class DiffPeakEngine:
         if int(payload.get("format_version", 0)) < 5:
             raise ValueError("旧快照不能 --resume；请显式 --init --migrate-legacy 迁移兼容权重")
         saved_train = payload.get("config", {}).get("train", {})
-        if any(float(saved_train.get(key, 0.0)) != 0.0 for key in ("seg_weight", "sampled_seg_weight")):
-            raise ValueError(
-                "checkpoint 使用旧 ABC 分割监督目标，不能按场生成目标 --resume；"
-                "请用 --config 和 --init 复用权重并开始新实验"
-            )
+        for key in (("seg_weight", "sampled_seg_weight", "cldice_weight") if "config" in payload else ()):
+            default = 0.2 if key == "cldice_weight" else 1.0
+            # Missing segmentation weights identify the field-only objective.
+            saved = float(saved_train.get(key, 0.0 if key != "cldice_weight" else default))
+            current = float(self.config.get("train", {}).get(key, default))
+            if saved != current:
+                raise ValueError(
+                    "checkpoint 的 ABC 分割监督目标与当前配置不同，不能 --resume；"
+                    "请用 --config 和 --init 复用权重并开始新实验"
+                )
         if str(payload.get("stage", "")).upper() == "D":
             algorithm = payload.get("algorithm", {})
             if self._payload_algorithm_name(payload) != "grpo" or algorithm.get("version") != 3:

@@ -31,7 +31,7 @@ model:
     num_heads: 8
     mlp_ratio: 4.0
     condition_channels: [64, 128, 256, 256]
-    # 2026-10-23 seetacloud1 单通道探针选择；证据见 docs/probe_3090.md。
+    # ABC 恢复完整采样分割反传；显存/吞吐需按当前损失重新核验。
     gradient_checkpointing: false
 
 diffusion:
@@ -53,8 +53,11 @@ train:
   amp_init_scale: 1024.0
   weight_decay: 0.01
   grad_clip: 1.0
+  seg_weight: 1.0
+  sampled_seg_weight: 1.0
   heat_weight: 0.1
   aux_weight: 0.2
+  cldice_weight: 0.2
   save_every: 1
   val_every: 1
   warmup_steps: 0
@@ -71,7 +74,7 @@ rl:
   # 单通道联合 SUM log-prob 尺度改变；以下为待校准初值。
   ppo_clip: 0.0001
   kl_weight: 0.01
-  # ABC 场生成锚定（扩散 + 场重建 + 辅助），不含 SAM 分割损失；设0关闭。
+  # 完整 ABC 监督锚定（扩散 + 场重建 + 辅助 + 两条分割监督）；设0关闭。
   anchor_weight: 0.01
   update_epochs: 1
   advantage_std_delta: 0.0001

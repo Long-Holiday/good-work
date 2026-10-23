@@ -602,7 +602,7 @@ def _joint_update(
     for _ in range(update_epochs):
         optimizer.zero_grad(set_to_none=True)
 
-        # 可选监督锚定：ABC 场生成损失（扩散 + 场 + 辅助），不调用 SAM 分割解码。
+        # 可选监督锚定：ABC 单阶段总损失（扩散 + 场 + 辅助 + 分割）。
         # SAM 已整体冻结，锚定只能更新条件编码器/DiT。
         if has_anchor:
             supervised = getattr(engine, "_supervised_loss", None)
