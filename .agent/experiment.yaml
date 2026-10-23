@@ -24,8 +24,8 @@
   "plan": {
     "schema_version": 3,
     "name": "DiffPeak-SAM 模型训练",
-    "revision": 174,
-    "updated_at": "2026-10-23T10:39:54+00:00",
+    "revision": 175,
+    "updated_at": "2026-10-23T11:09:52+00:00",
     "next_instance": 4,
     "next_flow": 4,
     "instances": [
@@ -311,11 +311,11 @@
         "duration_minutes": 540,
         "not_before": null,
         "status": "running",
-        "progress": 3.3467202141900936,
+        "progress": 5.4417670682730925,
         "started_at": "2026-10-23T05:55:45+00:00",
         "finished_at": null,
-        "checked_at": "2026-10-23T10:39:54+00:00",
-        "progress_at": "2026-10-23T10:39:54+00:00",
+        "checked_at": "2026-10-23T11:09:52+00:00",
+        "progress_at": "2026-10-23T11:09:52+00:00",
         "note": ""
       },
       {
@@ -646,7 +646,7 @@
         "status": "running",
         "started_at": "2026-10-23T09:57:53+00:00",
         "finished_at": null,
-        "version": 3,
+        "version": 4,
         "metric_name": "IoU",
         "direction": "max",
         "dataset_version": "protocol_v1",
@@ -656,9 +656,9 @@
         "git_commit": "master",
         "config_path": "configs/3090.yaml",
         "artifacts": "runs/diffpeak_seg_restored_20261023T094816",
-        "evidence": "seetacloud1:21375 [ABC] Epoch 2 完成，Val IoU=0.2350 (+19.2% vs Ep1 0.1971), clDice=0.3760, F1=0.3468, 空预测率 0.0%；已进入 Epoch 3，VRAM 16.7GB，GPU 100% 满载稳定",
+        "evidence": "seetacloud1:21375 [ABC] Epoch 3 完成 (Val IoU=0.2038, clDice=0.3343, 符号对齐率 89.62%, 空预测率 0.0%)，best.pt 维持在 Ep2 (0.2350)；当前已进至 Epoch 4 step 330/74700，Train Loss 继续降至 2.04~2.24，VRAM 16.7GB 稳定",
         "extra_metrics": {
-          "loss": 2.3715,
+          "loss": 2.358,
           "seg_loss": 1.0163,
           "sampled_seg_loss": 0.9789,
           "diff_loss": 0.0291,
@@ -667,18 +667,22 @@
           "val_cldice": 0.376,
           "val_f1": 0.3468,
           "empty_pred": 0.0,
-          "reward": 0.2914
+          "reward": 0.2914,
+          "best_val_iou": 0.23503,
+          "val_iou_ep3": 0.2038,
+          "val_cldice_ep3": 0.3343,
+          "sign_agreement": 0.8962
         },
-        "checked_at": "2026-10-23T10:40:00+00:00",
+        "checked_at": "2026-10-23T11:10:00+00:00",
         "sync": {
           "target": {
             "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
             "table_id": "tblb4w3LcaUO1w0A"
           },
-          "sent_version": 3,
+          "sent_version": 4,
           "record_id": "reczz28QoJrm7isA",
-          "fingerprint": "86253b4238161b9854062af079dc4c45fd2d9bb99452031a0cf9dacc39dd0e24",
-          "synced_at": "2026-10-23T10:40:04+00:00"
+          "fingerprint": "45f84d7504f5789c2f8b387e4aebcc10b6e7003b4149810cf39e238e6994af22",
+          "synced_at": "2026-10-23T11:10:06+00:00"
         },
         "metric_value": 0.23503
       }
