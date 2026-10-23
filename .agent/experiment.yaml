@@ -24,10 +24,10 @@
   "plan": {
     "schema_version": 3,
     "name": "DiffPeak-SAM 模型训练",
-    "revision": 154,
-    "updated_at": "2026-10-22T14:20:14+00:00",
+    "revision": 166,
+    "updated_at": "2026-10-23T06:47:47+00:00",
     "next_instance": 4,
-    "next_flow": 3,
+    "next_flow": 4,
     "instances": [
       {
         "id": "I01",
@@ -54,18 +54,18 @@
         "name": "3090训练机(seetacloud1)",
         "autodl_id": "5ab641bae4-71bb2ef0",
         "ssh_alias": "seetacloud1",
-        "status": "off",
-        "observed_at": "2026-10-22T08:23:46+00:00",
+        "status": "on",
+        "observed_at": "2026-10-23T05:51:48+00:00",
         "note": "",
         "price": null,
-        "mode": "no-gpu",
+        "mode": "gpu",
         "no_gpu_price": 0.1,
         "disk": {
-          "system_used_gb": 0.1,
+          "system_used_gb": 0.6,
           "system_total_gb": 30.0,
-          "data_used_gb": 0.0,
+          "data_used_gb": 4.2,
           "data_total_gb": 50.0,
-          "fs_used_gb": 9.2,
+          "fs_used_gb": 11.0,
           "fs_total_gb": 200.0
         }
       },
@@ -99,6 +99,11 @@
       {
         "id": "F02",
         "name": "DiffPeak-SAM 联合训练与强化学习",
+        "next_task": 5
+      },
+      {
+        "id": "F03",
+        "name": "DiffPeak-SAM 单通道山脊场重构训练",
         "next_task": 5
       }
     ],
@@ -278,6 +283,76 @@
         "checked_at": null,
         "progress_at": null,
         "note": "前序任务取消"
+      },
+      {
+        "id": "F03-T01",
+        "flow": "F03",
+        "name": "环境检查与历史数据清理",
+        "instance": "I02",
+        "deps": [],
+        "duration_minutes": 15,
+        "not_before": null,
+        "status": "done",
+        "progress": 100,
+        "started_at": "2026-10-23T05:43:34+00:00",
+        "finished_at": "2026-10-23T05:50:57+00:00",
+        "checked_at": "2026-10-23T05:50:57+00:00",
+        "progress_at": "2026-10-23T05:50:57+00:00",
+        "note": ""
+      },
+      {
+        "id": "F03-T02",
+        "flow": "F03",
+        "name": "阶段ABC:联合预训练",
+        "instance": "I02",
+        "deps": [
+          "F03-T01"
+        ],
+        "duration_minutes": 540,
+        "not_before": null,
+        "status": "running",
+        "progress": 3.4404283801874165,
+        "started_at": "2026-10-23T05:55:45+00:00",
+        "finished_at": null,
+        "checked_at": "2026-10-23T06:47:47+00:00",
+        "progress_at": "2026-10-23T06:47:47+00:00",
+        "note": ""
+      },
+      {
+        "id": "F03-T03",
+        "flow": "F03",
+        "name": "阶段D:GRPO强化学习后训练",
+        "instance": "I02",
+        "deps": [
+          "F03-T02"
+        ],
+        "duration_minutes": 240,
+        "not_before": null,
+        "status": "pending",
+        "progress": null,
+        "started_at": null,
+        "finished_at": null,
+        "checked_at": null,
+        "progress_at": null,
+        "note": ""
+      },
+      {
+        "id": "F03-T04",
+        "flow": "F03",
+        "name": "模型全面评估",
+        "instance": "I02",
+        "deps": [
+          "F03-T03"
+        ],
+        "duration_minutes": 30,
+        "not_before": null,
+        "status": "pending",
+        "progress": null,
+        "started_at": null,
+        "finished_at": null,
+        "checked_at": null,
+        "progress_at": null,
+        "note": ""
       }
     ],
     "monitor": {
@@ -440,6 +515,45 @@
         },
         "metric_value": 0.2397,
         "suggestion": "用户指令主动结束任务并关机，最新权重已备份至持久化存储"
+      },
+      "diffpeak-sam-ridge-run01": {
+        "run_id": "diffpeak-sam-ridge-run01",
+        "task_id": "F03-T02",
+        "instance": "I02",
+        "flow": "F03",
+        "task": "阶段ABC:联合预训练",
+        "status": "running",
+        "started_at": "2026-10-23T05:55:55+00:00",
+        "finished_at": null,
+        "version": 4,
+        "metric_name": "IoU",
+        "direction": "max",
+        "dataset_version": "protocol_v1",
+        "eval_protocol": "protocol_v1",
+        "intent": "DiffPeak-SAM 重构模型单通道山脊场联合预训练与GRPO后训练",
+        "change": "signed_ridge_v1协议：全冻结SAM2.1，训练条件编码器与DiT，单通道有符号山脊场生成与可微反传分割监督",
+        "git_commit": "4ada54e",
+        "config_path": "configs/3090.yaml",
+        "artifacts": "runs/diffpeak/experiments/20261023T055530.784297Z_edd976db",
+        "evidence": "seetacloud1:2266 [ABC] Epoch 2 completed, Val IoU=0.1785 (+22.1% vs ep1 0.1461), clDice=0.2922 (+22.4%), F1=0.2674, train_loss=2.6401, empty_pred=0.0%",
+        "checked_at": "2026-10-23T06:47:52+00:00",
+        "sync": {
+          "target": {
+            "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
+            "table_id": "tblb4w3LcaUO1w0A"
+          },
+          "sent_version": 4,
+          "record_id": "reczz28QkCH2Ltqv",
+          "fingerprint": "8fa93b8d69e7c3c0d2d41e8c13b1f89b0e1751057a71f917950c1583f6e97672",
+          "synced_at": "2026-10-23T06:47:55+00:00"
+        },
+        "extra_metrics": {
+          "loss": 2.6401,
+          "clDice": 0.2922,
+          "F1": 0.2674,
+          "reward": 0.224
+        },
+        "metric_value": 0.1785
       }
     }
   }

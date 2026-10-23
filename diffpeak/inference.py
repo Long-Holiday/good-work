@@ -201,10 +201,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # 否则会被静默忽略并造成配置歧义。
         "heat_weight": 0.1,
         "aux_weight": 0.2,
-        "cldice_weight": 0.2,
-        # ABC：目标山脊场（teacher forcing）与采样场两条分割路径。
-        "seg_weight": 1.0,
-        "sampled_seg_weight": 1.0,
         "save_every": 1,
         # 线性 warmup + cosine 退火；显式 warmup_steps 优先于 warmup_ratio。
         "warmup_steps": 0,

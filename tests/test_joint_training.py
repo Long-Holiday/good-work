@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import torch
 
-from diffpeak.engine import DiffPeakEngine
+from diffpeak.engine import DiffPeakEngine, encode_images
 from train import _parse_stages
 from tests import test_engine_pipeline as pipeline
 from tests.test_engine_pipeline import PROTOCOL, _build_tiny_models
@@ -107,20 +107,16 @@ class JointTrainingTest(unittest.TestCase):
                 tuple(kwargs["field_regions"].shape),
                 tuple(batch["field_regions"].shape),
             )
-            # sampled_seg 与分段重建损失的键名保持不变。
-            for key in ("loss", "diff", "heat", "aux", "seg", "sampled_seg"):
-                self.assertIn(key, losses)
+            self.assertEqual(set(losses), {"loss", "diff", "heat", "aux"})
+            self.assertFalse(kwargs.get("return_prediction", False))
             expected = (
                 losses["diff"]
                 + engine.heat_weight * losses["heat"]
                 + engine.aux_weight * losses["aux"]
-                + float(config["train"].get("seg_weight", 1.0)) * losses["seg"]
-                + float(config["train"].get("sampled_seg_weight", 1.0))
-                * losses["sampled_seg"]
             )
             torch.testing.assert_close(losses["loss"], expected)
 
-    def test_segmentation_alone_reaches_all_trainable_modules(self):
+    def test_field_loss_reaches_trainable_modules_without_sam_decoding(self):
         fixture = pipeline.EnginePipelineTest()
         with tempfile.TemporaryDirectory() as temporary, patch(
             "diffpeak.engine.build_models", side_effect=_build_tiny_models
@@ -143,12 +139,23 @@ class JointTrainingTest(unittest.TestCase):
                 & {id(p) for p in trainable}
             )
             optimizer = torch.optim.AdamW(trainable, lr=1e-3)
-            engine._supervised_loss("ABC", batch, 0)["loss"].backward()
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            losses = engine._supervised_loss("ABC", batch, 1)
-            # Check cross-module coupling, not just gradients from independent losses.
-            (losses["seg"] + losses["sampled_seg"]).backward()
+            def frozen_encode(*args, **kwargs):
+                self.assertFalse(torch.is_grad_enabled())
+                return encode_images(*args, **kwargs)
+
+            with patch("diffpeak.engine.encode_images", side_effect=frozen_encode) as encode, patch.object(
+                engine.sam, "decode_heatmaps", side_effect=AssertionError("ABC must not decode SAM masks")
+            ), patch.object(
+                engine.diffusion, "sample_differentiable",
+                side_effect=AssertionError("ABC must not sample full trajectories"),
+            ):
+                engine._supervised_loss("ABC", batch, 0)["loss"].backward()
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                losses = engine._supervised_loss("ABC", batch, 1)
+                # Diffusion supervision alone must reach the condition encoder too.
+                (losses["diff"] + engine.heat_weight * losses["heat"]).backward()
+                self.assertEqual(encode.call_count, 2)
             for module in (engine.condition_encoder, engine.dit):
                 gradients = [p.grad for p in module.parameters() if p.grad is not None]
                 self.assertTrue(gradients)
@@ -158,6 +165,31 @@ class JointTrainingTest(unittest.TestCase):
             self.assertTrue(all(p.grad is None for p in engine.sam.parameters()))
             for name, value in engine.sam.state_dict().items():
                 torch.testing.assert_close(value, sam_before[name], rtol=0, atol=0)
+
+    def test_old_segmentation_objective_cannot_resume(self):
+        engine = object.__new__(DiffPeakEngine)
+        engine.config = {"training_protocol": PROTOCOL, "target_representation": PROTOCOL}
+        for stage in ("ABC", "D"):
+            for key in ("seg_weight", "sampled_seg_weight"):
+                payload = _valid_payload(stage)
+                payload["config"] = {"train": {key: 1.0}}
+                with self.assertRaisesRegex(ValueError, "旧 ABC 分割监督目标"):
+                    engine._validate_resume_algorithm(payload)
+
+    def test_old_loss_options_are_removed_from_saved_config(self):
+        fixture = pipeline.EnginePipelineTest()
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "diffpeak.engine.build_models", side_effect=_build_tiny_models
+        ):
+            config = fixture._make_config(Path(temporary))
+            legacy = {"seg_weight": 1.0, "sampled_seg_weight": 1.0, "cldice_weight": 0.2}
+            config["train"].update(legacy)
+            with self.assertWarnsRegex(RuntimeWarning, "ABC 已移除 SAM 分割监督"):
+                engine = fixture._engine(config)
+            for key in legacy:
+                self.assertNotIn(key, engine.train_cfg)
+                self.assertNotIn(key, engine._resolved_config()["train"])
+                self.assertIn(key, config["train"])
 
     def test_legacy_protocols_are_rejected_before_optimizer_loading(self):
         engine = object.__new__(DiffPeakEngine)
