@@ -47,8 +47,8 @@ model:
     mlp_ratio: 4.0
     # 与 ConditionEncoder 的 256/128/64/32 四尺度输出保持一致。
     condition_channels: [64, 128, 256, 256]
-    # DiT 默认开启激活检查点；实测显存/吞吐后可在本实验登记中调整。
-    gradient_checkpointing: true
+    # seetacloud3 ABC 短测：关闭检查点、batch4 峰值 reserved 16.03 GiB。
+    gradient_checkpointing: false
 
 diffusion:
   timesteps: 1000
@@ -82,9 +82,9 @@ train:
   warmup_ratio: 0.05
   min_lr_ratio: 0.05
 
-# 新联合训练预算与显存尚待实测；不沿用旧分模块吞吐结论。
+# ABC 吞吐选择见 docs/probe_3090.md；D 联合版本尚未单独测速。
 stages:
-  ABC: {epochs: 60, lr: 0.0001, batch_size: 1, accumulation_steps: 4}
+  ABC: {epochs: 60, lr: 0.0001, batch_size: 4, accumulation_steps: 1, num_workers: 4}
   D: {epochs: 10, lr: 0.0000003, batch_size: 1, accumulation_steps: 1, warmup_ratio: 0.1, min_lr_ratio: 0.1}
 
 rl:

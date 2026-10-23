@@ -1,0 +1,446 @@
+{
+  "schema_version": 1,
+  "config": {
+    "schema_version": 1,
+    "project": "DiffPeak-SAM 模型训练",
+    "lark": {
+      "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
+      "table_id": "tblb4w3LcaUO1w0A",
+      "url": "https://gcn0i0lz3js9.feishu.cn/base/KBtmbwFgta1h0AsRakVcu8AFnWg"
+    },
+    "defaults": {
+      "metric_name": "IoU",
+      "direction": "max",
+      "dataset_version": "protocol_v1",
+      "eval_protocol": "protocol_v1"
+    },
+    "extra_metrics": {
+      "loss": null,
+      "clDice": null,
+      "F1": null,
+      "reward": null
+    }
+  },
+  "plan": {
+    "schema_version": 3,
+    "name": "DiffPeak-SAM 模型训练",
+    "revision": 154,
+    "updated_at": "2026-10-22T14:20:14+00:00",
+    "next_instance": 4,
+    "next_flow": 3,
+    "instances": [
+      {
+        "id": "I01",
+        "name": "3090训练机",
+        "autodl_id": "1ed547be43-8bd7bf53",
+        "ssh_alias": "seetacloud2",
+        "status": "off",
+        "observed_at": "2026-10-21T15:09:13+00:00",
+        "note": "",
+        "price": 1.48,
+        "mode": "gpu",
+        "no_gpu_price": 0.1,
+        "disk": {
+          "system_used_gb": 11.0,
+          "system_total_gb": 30.0,
+          "data_used_gb": 5.0,
+          "data_total_gb": 50.0,
+          "fs_used_gb": 5.0,
+          "fs_total_gb": 200.0
+        }
+      },
+      {
+        "id": "I02",
+        "name": "3090训练机(seetacloud1)",
+        "autodl_id": "5ab641bae4-71bb2ef0",
+        "ssh_alias": "seetacloud1",
+        "status": "off",
+        "observed_at": "2026-10-22T08:23:46+00:00",
+        "note": "",
+        "price": null,
+        "mode": "no-gpu",
+        "no_gpu_price": 0.1,
+        "disk": {
+          "system_used_gb": 0.1,
+          "system_total_gb": 30.0,
+          "data_used_gb": 0.0,
+          "data_total_gb": 50.0,
+          "fs_used_gb": 9.2,
+          "fs_total_gb": 200.0
+        }
+      },
+      {
+        "id": "I03",
+        "name": "3090训练机(seetacloud3)",
+        "autodl_id": "22a94c9991-da84c9ea",
+        "ssh_alias": "seetacloud3",
+        "status": "off",
+        "observed_at": "2026-10-22T13:05:12+00:00",
+        "note": "",
+        "price": 1.48,
+        "mode": "gpu",
+        "no_gpu_price": 0.1,
+        "disk": {
+          "system_used_gb": 0.1,
+          "system_total_gb": 30.0,
+          "data_used_gb": 0.0,
+          "data_total_gb": 50.0,
+          "fs_used_gb": 9.2,
+          "fs_total_gb": 200.0
+        }
+      }
+    ],
+    "flows": [
+      {
+        "id": "F01",
+        "name": "DiffPeak-SAM 训练流程",
+        "next_task": 7
+      },
+      {
+        "id": "F02",
+        "name": "DiffPeak-SAM 联合训练与强化学习",
+        "next_task": 5
+      }
+    ],
+    "tasks": [
+      {
+        "id": "F01-T01",
+        "flow": "F01",
+        "name": "环境依赖与权重准备",
+        "instance": "I01",
+        "deps": [],
+        "duration_minutes": 10,
+        "not_before": null,
+        "status": "done",
+        "progress": 100,
+        "started_at": "2026-10-21T06:43:58+00:00",
+        "finished_at": "2026-10-21T06:45:10+00:00",
+        "checked_at": "2026-10-21T06:45:10+00:00",
+        "progress_at": "2026-10-21T06:45:10+00:00",
+        "note": ""
+      },
+      {
+        "id": "F01-T02",
+        "flow": "F01",
+        "name": "阶段A:SAM2解码器微调",
+        "instance": "I03",
+        "deps": [
+          "F01-T01"
+        ],
+        "duration_minutes": 195,
+        "not_before": null,
+        "status": "done",
+        "progress": 100,
+        "started_at": "2026-10-21T15:33:36+00:00",
+        "finished_at": "2026-10-21T19:00:35+00:00",
+        "checked_at": "2026-10-21T19:00:35+00:00",
+        "progress_at": "2026-10-21T19:00:35+00:00",
+        "note": ""
+      },
+      {
+        "id": "F01-T03",
+        "flow": "F01",
+        "name": "阶段B:扩散去噪U-Net训练",
+        "instance": "I03",
+        "deps": [
+          "F01-T02"
+        ],
+        "duration_minutes": 510,
+        "not_before": null,
+        "status": "done",
+        "progress": 100,
+        "started_at": "2026-10-21T19:01:35+00:00",
+        "finished_at": "2026-10-22T05:29:39+00:00",
+        "checked_at": "2026-10-22T05:29:39+00:00",
+        "progress_at": "2026-10-22T05:29:39+00:00",
+        "note": "阶段B圆满完成，Val IoU达0.4026，clDice达0.5827，产物已保存为stage_B.pth"
+      },
+      {
+        "id": "F01-T04",
+        "flow": "F01",
+        "name": "阶段C:生成提示SAM2适配",
+        "instance": "I03",
+        "deps": [
+          "F01-T03"
+        ],
+        "duration_minutes": 130,
+        "not_before": null,
+        "status": "cancelled",
+        "progress": null,
+        "started_at": null,
+        "finished_at": "2026-10-22T05:29:44+00:00",
+        "checked_at": null,
+        "progress_at": null,
+        "note": "用户指令结束所有任务并关机"
+      },
+      {
+        "id": "F01-T05",
+        "flow": "F01",
+        "name": "阶段D:GRPO强化学习后训练",
+        "instance": "I03",
+        "deps": [
+          "F01-T04"
+        ],
+        "duration_minutes": 300,
+        "not_before": null,
+        "status": "cancelled",
+        "progress": null,
+        "started_at": null,
+        "finished_at": "2026-10-22T05:29:44+00:00",
+        "checked_at": null,
+        "progress_at": null,
+        "note": "用户指令结束所有任务并关机"
+      },
+      {
+        "id": "F01-T06",
+        "flow": "F01",
+        "name": "模型全面评估",
+        "instance": "I03",
+        "deps": [
+          "F01-T05"
+        ],
+        "duration_minutes": 30,
+        "not_before": null,
+        "status": "cancelled",
+        "progress": null,
+        "started_at": null,
+        "finished_at": "2026-10-22T05:29:44+00:00",
+        "checked_at": null,
+        "progress_at": null,
+        "note": "用户指令结束所有任务并关机"
+      },
+      {
+        "id": "F02-T01",
+        "flow": "F02",
+        "name": "环境依赖与权重核实",
+        "instance": "I03",
+        "deps": [],
+        "duration_minutes": 10,
+        "not_before": null,
+        "status": "done",
+        "progress": 100,
+        "started_at": "2026-10-22T08:26:25+00:00",
+        "finished_at": "2026-10-22T08:37:01+00:00",
+        "checked_at": "2026-10-22T08:37:01+00:00",
+        "progress_at": "2026-10-22T08:37:01+00:00",
+        "note": ""
+      },
+      {
+        "id": "F02-T02",
+        "flow": "F02",
+        "name": "阶段ABC:联合预训练",
+        "instance": "I03",
+        "deps": [
+          "F02-T01"
+        ],
+        "duration_minutes": 360,
+        "not_before": null,
+        "status": "cancelled",
+        "progress": 15.455153949129851,
+        "started_at": "2026-10-22T08:38:13+00:00",
+        "finished_at": "2026-10-22T13:04:45+00:00",
+        "checked_at": "2026-10-22T13:01:04+00:00",
+        "progress_at": "2026-10-22T13:01:04+00:00",
+        "note": "用户指令结束任务并关机（产物已归档至持久化存储）"
+      },
+      {
+        "id": "F02-T03",
+        "flow": "F02",
+        "name": "阶段D:GRPO强化学习后训练",
+        "instance": "I03",
+        "deps": [
+          "F02-T02"
+        ],
+        "duration_minutes": 180,
+        "not_before": null,
+        "status": "cancelled",
+        "progress": null,
+        "started_at": null,
+        "finished_at": "2026-10-22T13:04:49+00:00",
+        "checked_at": null,
+        "progress_at": null,
+        "note": "前序任务取消"
+      },
+      {
+        "id": "F02-T04",
+        "flow": "F02",
+        "name": "模型全面评估",
+        "instance": "I03",
+        "deps": [
+          "F02-T03"
+        ],
+        "duration_minutes": 30,
+        "not_before": null,
+        "status": "cancelled",
+        "progress": null,
+        "started_at": null,
+        "finished_at": "2026-10-22T13:04:49+00:00",
+        "checked_at": null,
+        "progress_at": null,
+        "note": "前序任务取消"
+      }
+    ],
+    "monitor": {
+      "interval_minutes": 30,
+      "last_run": "2026-10-22T14:20:14+00:00",
+      "last_ok": "2026-10-22T14:20:14+00:00",
+      "last_error": "",
+      "token_ready": false,
+      "expires_at": null,
+      "estimate": {
+        "computed_at": "2026-10-22T14:20:14+00:00",
+        "revision": 154,
+        "plan_hash": "9fefb48bf9ab6c01"
+      }
+    },
+    "wallet": {
+      "assets": 32.12,
+      "voucher": 0.0,
+      "observed_at": "2026-10-21T08:13:18+00:00"
+    }
+  },
+  "experiments": {
+    "schema_version": 1,
+    "runs": {
+      "diffpeak-sam-stage-a-run01": {
+        "run_id": "diffpeak-sam-stage-a-run01",
+        "task_id": "F01-T02",
+        "instance": "I01",
+        "flow": "F01",
+        "task": "阶段A:SAM2解码器微调",
+        "status": "cancelled",
+        "started_at": "2026-10-21T06:50:00+00:00",
+        "finished_at": "2026-10-21T06:55:42+00:00",
+        "version": 2,
+        "metric_name": "IoU",
+        "direction": "max",
+        "dataset_version": "protocol_v1",
+        "eval_protocol": "protocol_v1",
+        "intent": "阶段A:SAM2.1掩码解码器在真值提示下的微调",
+        "change": "SAM2.1 Hiera-B+骨干微调掩码解码器",
+        "git_commit": "d5b998a",
+        "config_path": "configs/3090.yaml",
+        "artifacts": "runs/diffpeak/experiments/20261021T064934.248465Z_28794217",
+        "checked_at": "2026-10-21T06:55:42+00:00",
+        "sync": {
+          "target": {
+            "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
+            "table_id": "tblb4w3LcaUO1w0A"
+          },
+          "sent_version": 2,
+          "record_id": "reczz28Py38HLlWx",
+          "fingerprint": "fce99a880c503f01043576ab68b09d85a94713ea27b62c691b4621ccad515636",
+          "synced_at": "2026-10-21T06:55:45+00:00"
+        },
+        "evidence": "seetacloud2:/root/good-work/stage_A.log",
+        "suggestion": "用户指令主动取消所有任务并关机"
+      },
+      "diffpeak-sam-stage-a-run03": {
+        "run_id": "diffpeak-sam-stage-a-run03",
+        "task_id": "F01-T02",
+        "instance": "I03",
+        "flow": "F01",
+        "task": "阶段A:SAM2解码器微调",
+        "status": "done",
+        "started_at": "2026-10-21T15:33:51+00:00",
+        "finished_at": "2026-10-21T19:00:41+00:00",
+        "version": 11,
+        "metric_name": "IoU",
+        "direction": "max",
+        "dataset_version": "protocol_v1",
+        "eval_protocol": "protocol_v1",
+        "intent": "阶段A:SAM2.1掩码解码器在真值提示下的微调",
+        "change": "使用seetacloud3(RTX 3090 24GB)，迁移SAM2.1 Hiera-B+骨干微调掩码解码器",
+        "config_path": "configs/3090.yaml",
+        "git_commit": "d08a776",
+        "artifacts": "runs/diffpeak/experiments/20261021T153258.150575Z_62a76565",
+        "evidence": "seetacloud3:/root/good-work/stage_A.log (Epoch 15 Val IoU=0.7278, clDice=0.9460)",
+        "suggestion": "阶段A圆满跑满15轮，产物已保存为stage_A.pth，已满足下游依赖，按计划接续阶段B",
+        "checked_at": "2026-10-21T19:00:41+00:00",
+        "sync": {
+          "target": {
+            "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
+            "table_id": "tblb4w3LcaUO1w0A"
+          },
+          "sent_version": 11,
+          "record_id": "reczz28Q6yWLEubu",
+          "fingerprint": "77f1a3a7602b8ccc86bc284aab2924421b99ece892bea62a7cbbbd0bf06e3799",
+          "synced_at": "2026-10-21T19:00:44+00:00"
+        },
+        "metric_value": 0.7278
+      },
+      "diffpeak-sam-stage-b-run01": {
+        "run_id": "diffpeak-sam-stage-b-run01",
+        "task_id": "F01-T03",
+        "instance": "I03",
+        "flow": "F01",
+        "task": "阶段B:扩散去噪U-Net训练",
+        "status": "done",
+        "started_at": "2026-10-21T19:01:42+00:00",
+        "finished_at": "2026-10-22T05:29:00+00:00",
+        "version": 22,
+        "metric_name": "IoU",
+        "direction": "max",
+        "dataset_version": "protocol_v1",
+        "eval_protocol": "protocol_v1",
+        "intent": "阶段B:扩散去噪U-Net与条件编码器训练（扩散MSE+热图重建+辅助损失）",
+        "change": "以阶段A微调得到的SAM2.1掩码解码器权重(stage_A.pth)为初始化，训练条件编码器与扩散去噪U-Net",
+        "config_path": "configs/3090.yaml",
+        "git_commit": "d08a776",
+        "baseline": "diffpeak-sam-stage-a-run03",
+        "artifacts": "runs/diffpeak/experiments/20261021T190111.023962Z_a46c0ead",
+        "evidence": "seetacloud3:stage_B.pth (Val IoU=0.4026, clDice=0.5827, F1=0.5421, on_road=47.92%, penalty=0.847)",
+        "suggestion": "阶段B训练圆满完成，产物已备份至持久化存储/autodl-fs/data/diffpeak_checkpoints/stage_B.pth，用户指令结束所有任务并关机",
+        "checked_at": "2026-10-22T05:29:00+00:00",
+        "sync": {
+          "target": {
+            "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
+            "table_id": "tblb4w3LcaUO1w0A"
+          },
+          "sent_version": 22,
+          "record_id": "reczz28QAW49eG5E",
+          "fingerprint": "d615c756a54d1f9c811ed898efb468f2eb3a8fc526116356e55404ec4bb85457",
+          "synced_at": "2026-10-22T05:30:03+00:00"
+        },
+        "metric_value": 0.4026
+      },
+      "diffpeak-sam-joint-abc-run01": {
+        "run_id": "diffpeak-sam-joint-abc-run01",
+        "task_id": "F02-T02",
+        "instance": "I03",
+        "flow": "F02",
+        "task": "阶段ABC:联合预训练",
+        "status": "cancelled",
+        "started_at": "2026-10-22T08:38:18+00:00",
+        "finished_at": "2026-10-22T13:04:54+00:00",
+        "version": 12,
+        "metric_name": "IoU",
+        "direction": "max",
+        "dataset_version": "protocol_v1",
+        "eval_protocol": "protocol_v1",
+        "intent": "阶段ABC:条件编码器与DiT联合预训练（扩散MSE+热图重建+辅助损失+密集提示分割损失）",
+        "change": "采用joint_abc_v1新协议，冻结SAM2.1骨干，联合训练条件DiT与条件编码器",
+        "config_path": "configs/3090.yaml",
+        "git_commit": "11ce916",
+        "checked_at": "2026-10-22T13:04:54+00:00",
+        "sync": {
+          "target": {
+            "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
+            "table_id": "tblb4w3LcaUO1w0A"
+          },
+          "sent_version": 12,
+          "record_id": "reczz28QOQgDRM9S",
+          "fingerprint": "a2939ad47cd37f6006e923d039ad342da71f74554b83450476a0a6338c571989",
+          "synced_at": "2026-10-22T13:04:57+00:00"
+        },
+        "artifacts": "runs/diffpeak/throughput_selected_20261022T165607/experiments/20261022T085608.927635Z_297321cd",
+        "evidence": "seetacloud3:15078 [ABC] cancelled at epoch 10 step 11545, best Val IoU=0.2397. Checkpoint: /autodl-fs/data/diffpeak_checkpoints/joint_abc_20261022/best.pt",
+        "extra_metrics": {
+          "loss": 2.0332
+        },
+        "metric_value": 0.2397,
+        "suggestion": "用户指令主动结束任务并关机，最新权重已备份至持久化存储"
+      }
+    }
+  }
+}

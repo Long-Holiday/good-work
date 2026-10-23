@@ -6,7 +6,30 @@
 
 可执行参数集中于 `configs/3090.yaml`，比较规则见 [实验协议](experimental_protocol.md)。短程筛选不替代完整验证、多种子比较或收敛实验；未实测项保持未确认，不用猜测补齐。
 
-## 综合运行建议（2026-10-21）
+## ABC 联合训练短测（2026-10-22，seetacloud3）
+
+代码 `11ce916`，SAM 全冻结、真实 SAM2.1 Hiera-B+，RTX 3090 24 GiB，Python 3.12.3 / PyTorch 2.8.0+cu128，容器 15 vCPU / 90 GiB。独占 GPU，输入 1024、热图 256、FP16、20 步可微采样、全部 ABC 损失保留；读取完整 train manifest、开启增强，不读取 val/test 内容。训练种子 42，各候选从相同初始化独立开始。有效 batch 固定 4，学习率和 60 epoch 调度一致，不比较质量或收敛。
+
+各候选使用正式 `_train_epoch_supervised`，先预热 3 次更新，再测量 10 次更新 / 40 张；最快两组额外独立复测 30 次更新 / 120 张。CUDA 同步划定计时，包含测量段的数据获取、准备、前后向、损失同步和优化器更新；不含初始化、预热、验证、保存和末尾参数有限检查。预热批次预先获取，测量段为流式读取。
+
+| batch×累积 | 检查点 | workers | CPU线程 | 张/秒 | 峰值 reserved MiB |
+|---|---|---:|---:|---:|---:|
+| 1×4 | 开 | 4 | 2 | 1.394 | 3244 |
+| 2×2 | 开 | 4 | 2 | 2.516 | 5716 |
+| 4×1 | 开 | 4 | 2 | 3.594 | 10872 |
+| 1×4 | 关 | 4 | 2 | 2.390 | 4710 |
+| 2×2 | 关 | 4 | 2 | 3.407 | 8678 |
+| 4×1 | 关 | 4 | 2 | 4.106 | 16414 |
+| 4×1 | 关 | 8 | 2 | 4.075 | 16414 |
+| 4×1 | 关 | 4 | 4 | 4.062 | 16414 |
+
+复测：workers4 为 **4.095 张/秒**，workers8 为 **4.077 张/秒**；差异约 0.5%，按实测较快且资源较少的 workers4 选取。所有 10 个候选均完成计划更新，无 AMP 跳步，有效损失和更新后可训练参数有限；未使用的 points 指标为 NaN，不作为损失有限检查项。复测峰值 allocated 16396.37 MiB / reserved 16414 MiB（16.03 GiB），保留约 8 GiB 容量余量。此为所测范围内的吞吐选择，不是全局最优、长程无 OOM 或分割质量保证。batch/worker 调整影响训练随机流，不能声称与旧训练逐步等价。D 联合版本未单独测速，仍 batch1；关闭检查点为共享 DiT 配置，也会作用于后续 D。
+
+胜出配置：ABC batch4×累积1、workers4、关闭检查点、CPU intra/inter-op=2/1、OMP/MKL=2、OPENBLAS=1。相对原配置短测提速约 **2.94 倍**。正式训练已从头启动，种子42、ABC60轮→D10轮；学习率、损失权重和采样预算保持原值。启动后 8 秒 GPU 采样为 75%～100%，功耗 321～326 W，nvidia-smi 显存约 16.37 GiB。
+
+远端证据：`/root/autodl-tmp/abc_probe_20261022/` 内含逐候选 JSON/log、`suite.json`、`winner.json`、`restart.json`、配置前后副本与 `evidence/` 下脚本、代码提交、运行时、GPU 和 manifest/权重 SHA-256；本地副本位于忽略的 `runs/seetacloud3_abc_probe_20261022/`。正式输出：`/root/autodl-tmp/runs/diffpeak/throughput_selected_20261022T165607`；日志：`/root/good-work/train_session_20261022T165607.log`；tmux：`diffpeak_optimized_20261022T165607`。原日志保留为 `/root/good-work/train_session_before_probe_20261022.log`，原实验目录保留；短测权重未用于正式训练。
+
+## 综合运行建议（2026-10-21，旧独立阶段历史）
 
 已只读核验 `seetacloud2` 原始 C/D JSON 与 suite，33个小文件复制到 `runs/seetacloud2_review_20261021/` 并核对SHA256；综合本次 Vast.ai 126次候选，默认参数更新如下。这是现有预算内的推荐起点，不是全局最优或完整收敛结论。
 
