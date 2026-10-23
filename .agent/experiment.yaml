@@ -24,8 +24,8 @@
   "plan": {
     "schema_version": 3,
     "name": "DiffPeak-SAM 模型训练",
-    "revision": 170,
-    "updated_at": "2026-10-23T09:09:03+00:00",
+    "revision": 171,
+    "updated_at": "2026-10-23T09:40:03+00:00",
     "next_instance": 4,
     "next_flow": 4,
     "instances": [
@@ -311,11 +311,11 @@
         "duration_minutes": 540,
         "not_before": null,
         "status": "running",
-        "progress": 2.603748326639893,
+        "progress": 8.326639892904954,
         "started_at": "2026-10-23T05:55:45+00:00",
         "finished_at": null,
-        "checked_at": "2026-10-23T09:09:03+00:00",
-        "progress_at": "2026-10-23T09:09:03+00:00",
+        "checked_at": "2026-10-23T09:40:03+00:00",
+        "progress_at": "2026-10-23T09:40:03+00:00",
         "note": ""
       },
       {
@@ -601,7 +601,7 @@
         "status": "running",
         "started_at": "2026-10-23T09:08:42+00:00",
         "finished_at": null,
-        "version": 1,
+        "version": 2,
         "metric_name": "IoU",
         "direction": "max",
         "dataset_version": "protocol_v1",
@@ -612,23 +612,28 @@
         "config_path": "configs/3090.yaml",
         "artifacts": "runs/diffpeak_selected_20261023T085600",
         "metric_value": 0.02857,
-        "evidence": "seetacloud1:17196 Epoch 1 完成，Val IoU=0.02857，clDice=0.04870，空预测率 4.33%，当前推进至 Epoch 2 step 640，Loss=0.248~0.309",
+        "evidence": "seetacloud1:17196 Epoch 4 完成，Val IoU=0.02832, clDice=0.04803, 空预测率降至 3.69%（历史最低）；当前已进至 Epoch 5 step 1240/74700，Train Loss 稳降至 0.15~0.19，VRAM 4.88GB 稳定",
         "extra_metrics": {
-          "loss": 0.292,
+          "loss": 0.2332,
           "cldice": 0.0487,
           "f1": 0.0457,
-          "empty_pred": 0.0433
+          "empty_pred": 0.0369,
+          "diff_loss": 0.0499,
+          "heat_loss": 0.1537,
+          "aux_loss": 0.8396,
+          "val_iou": 0.02832,
+          "val_cldice": 0.04803
         },
-        "checked_at": "2026-10-23T09:08:42+00:00",
+        "checked_at": "2026-10-23T09:40:09+00:00",
         "sync": {
           "target": {
             "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
             "table_id": "tblb4w3LcaUO1w0A"
           },
-          "sent_version": 1,
+          "sent_version": 2,
           "record_id": "reczz28QnTyZnqPn",
-          "fingerprint": "4b54929771db927f3f2860fd8ca75abcf06ec2d790eb91f198c100f2540408f2",
-          "synced_at": "2026-10-23T09:08:50+00:00"
+          "fingerprint": "265b0888e5b11e153b73a7df2d0d7475d846ebfd4dabcf199e2021e213c13fbb",
+          "synced_at": "2026-10-23T09:40:17+00:00"
         }
       }
     }
