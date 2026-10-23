@@ -1,0 +1,39 @@
+{
+  "host": "seetacloud1",
+  "status": "running",
+  "started_at": "2026-10-23T15:17:33Z",
+  "pid": 7364,
+  "tmux_session": "train_flow8_b4",
+  "output_dir": "/root/autodl-tmp/runs/diffpeak_flow8_b4_stratified_20261023",
+  "experiment_id": "20261023T151733.455961Z_161fd38e",
+  "initialization": "Fresh trainable weights, official pretrained frozen SAM; no resume/init checkpoint.",
+  "config": {
+    "batch_size": 4,
+    "accumulation_steps": 1,
+    "sampling_steps": 8,
+    "solver": "heun",
+    "time_sampling": "stratified",
+    "heat_weight": 0.075,
+    "seg_weight": 1.0,
+    "sampled_seg_weight": 1.0,
+    "gradient_checkpointing": true,
+    "warmup_steps": 3735,
+    "stages": ["ABC", "D"]
+  },
+  "benchmark": {
+    "result": "/root/autodl-tmp/flow8_batch_probe_20261023/b4.json",
+    "warmup_updates": 3,
+    "measured_updates": 30,
+    "optimizer_steps": 30,
+    "skipped_groups": 0,
+    "seconds": 108.99353603400232,
+    "images_per_second": 1.1009827221548627,
+    "peak_allocated_mib": 14762.8828125,
+    "peak_reserved_mib": 15752.0,
+    "params_finite": true,
+    "healthy": true,
+    "baseline": "batch2 benchmark interrupted at user request; prior formal run approximately 2.08 seconds/microbatch, two microbatches/update. Not a completed controlled comparison."
+  },
+  "validation": "Remote deployed regression tests: 33 passed, 19 subtests passed. New formal run has finite component losses at steps 1 and 10; GPU 100%, observed memory 16098 MiB.",
+  "code_state": "Uncommitted modifications deployed; existing .agent/experiment.yaml modifications untouched."
+}

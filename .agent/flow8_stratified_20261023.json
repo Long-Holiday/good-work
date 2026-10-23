@@ -1,6 +1,8 @@
 {
   "host": "seetacloud1",
-  "status": "running",
+  "status": "stopped_for_batch4_benchmark",
+  "replacement_output_dir": "/root/autodl-tmp/runs/diffpeak_flow8_b4_stratified_20261023",
+  "stop_reason": "User explicitly authorized discarding partial progress and testing batch4; after healthy benchmark, fresh batch4 training was authorized.",
   "started_at": "2026-10-23T15:05:32Z",
   "pid": 6208,
   "tmux_session": "train_flow8_stratified",
