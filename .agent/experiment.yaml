@@ -24,8 +24,8 @@
   "plan": {
     "schema_version": 3,
     "name": "DiffPeak-SAM 模型训练",
-    "revision": 171,
-    "updated_at": "2026-10-23T09:40:03+00:00",
+    "revision": 173,
+    "updated_at": "2026-10-23T10:10:41+00:00",
     "next_instance": 4,
     "next_flow": 4,
     "instances": [
@@ -311,11 +311,11 @@
         "duration_minutes": 540,
         "not_before": null,
         "status": "running",
-        "progress": 8.326639892904954,
+        "progress": 1.6666666666666667,
         "started_at": "2026-10-23T05:55:45+00:00",
         "finished_at": null,
-        "checked_at": "2026-10-23T09:40:03+00:00",
-        "progress_at": "2026-10-23T09:40:03+00:00",
+        "checked_at": "2026-10-23T10:10:41+00:00",
+        "progress_at": "2026-10-23T10:10:41+00:00",
         "note": ""
       },
       {
@@ -598,10 +598,10 @@
         "instance": "I02",
         "flow": "F03",
         "task": "阶段ABC:联合预训练",
-        "status": "running",
+        "status": "cancelled",
         "started_at": "2026-10-23T09:08:42+00:00",
-        "finished_at": null,
-        "version": 2,
+        "finished_at": "2026-10-23T09:57:43+00:00",
+        "version": 3,
         "metric_name": "IoU",
         "direction": "max",
         "dataset_version": "protocol_v1",
@@ -612,7 +612,7 @@
         "config_path": "configs/3090.yaml",
         "artifacts": "runs/diffpeak_selected_20261023T085600",
         "metric_value": 0.02857,
-        "evidence": "seetacloud1:17196 Epoch 4 完成，Val IoU=0.02832, clDice=0.04803, 空预测率降至 3.69%（历史最低）；当前已进至 Epoch 5 step 1240/74700，Train Loss 稳降至 0.15~0.19，VRAM 4.88GB 稳定",
+        "evidence": "ABC阶段无SAM分割监督导致验证IoU停滞在0.028，无法有效指导SAM解码道路掩码；已废弃并由用户切回上一版本（恢复SAM分割监督与采样反传）",
         "extra_metrics": {
           "loss": 0.2332,
           "cldice": 0.0487,
@@ -624,16 +624,56 @@
           "val_iou": 0.02832,
           "val_cldice": 0.04803
         },
-        "checked_at": "2026-10-23T09:40:09+00:00",
+        "checked_at": "2026-10-23T09:57:43+00:00",
+        "sync": {
+          "target": {
+            "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
+            "table_id": "tblb4w3LcaUO1w0A"
+          },
+          "sent_version": 3,
+          "record_id": "reczz28QnTyZnqPn",
+          "fingerprint": "4b91d487668e34406433a3350673f8d3e367db0e50acea8df24ec63070177000",
+          "synced_at": "2026-10-23T09:57:47+00:00"
+        },
+        "suggestion": "已由恢复分割监督版本 Run 04 接替"
+      },
+      "diffpeak-sam-ridge-run04": {
+        "run_id": "diffpeak-sam-ridge-run04",
+        "task_id": "F03-T02",
+        "instance": "I02",
+        "flow": "F03",
+        "task": "阶段ABC:联合预训练",
+        "status": "running",
+        "started_at": "2026-10-23T09:57:53+00:00",
+        "finished_at": null,
+        "version": 2,
+        "metric_name": "IoU",
+        "direction": "max",
+        "dataset_version": "protocol_v1",
+        "eval_protocol": "protocol_v1",
+        "intent": "切回上一版本：恢复 ABC 阶段 SAM 掩码分割反传与 20 步可微采样监督，从 Run 01 最佳权重继续训练",
+        "change": "恢复 seg_weight=1.0, sampled_seg_weight=1.0, cldice_weight=0.2，从 runs/diffpeak_archived_run01/best.pt 恢复初始化",
+        "git_commit": "master",
+        "config_path": "configs/3090.yaml",
+        "artifacts": "runs/diffpeak_seg_restored_20261023T094816",
+        "evidence": "seetacloud1:21375 [ABC] Epoch 1 完成 (Step 1245/74700)，正在执行全量623张验证集评估。Train Loss收敛至2.188 (seg=1.016, sampled_seg=0.979, diff=0.029, aux=0.617)，VRAM 16.7GB稳定",
+        "extra_metrics": {
+          "loss": 2.1885,
+          "seg_loss": 1.0163,
+          "sampled_seg_loss": 0.9789,
+          "diff_loss": 0.0291,
+          "aux_loss": 0.6169
+        },
+        "checked_at": "2026-10-23T10:10:48+00:00",
         "sync": {
           "target": {
             "base_token": "KBtmbwFgta1h0AsRakVcu8AFnWg",
             "table_id": "tblb4w3LcaUO1w0A"
           },
           "sent_version": 2,
-          "record_id": "reczz28QnTyZnqPn",
-          "fingerprint": "265b0888e5b11e153b73a7df2d0d7475d846ebfd4dabcf199e2021e213c13fbb",
-          "synced_at": "2026-10-23T09:40:17+00:00"
+          "record_id": "reczz28QoJrm7isA",
+          "fingerprint": "3f8bb41ab515833746cd3393b415f1f9dba1a3ecd3f16b1bb560a7079e8efb9d",
+          "synced_at": "2026-10-23T10:10:53+00:00"
         }
       }
     }
